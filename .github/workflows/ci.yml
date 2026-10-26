@@ -18,9 +18,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      CHATLOG_KEEPER_DATA_DIR: ${{ runner.temp }}/wekeeper-private-state
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
+      - name: Configure private test state
+        run: printf 'CHATLOG_KEEPER_DATA_DIR=%s/wekeeper-private-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
