@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatlog-keeper"
+version = "0.5.0"
+description = "WeKeeper: local Linux WeChat archives, cached media and MCP access"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "labazhou2024" }]
+maintainers = [{ name = "RethinkCraft" }]
+classifiers = ["Operating System :: POSIX :: Linux", "Programming Language :: Python :: 3"]
+dependencies = [
+    "pycryptodome==3.23.0",
+    "numpy==2.4.6",
+    "zstandard==0.25.0",
+    "Pillow==13.0.0",
+    "imageio-ffmpeg==0.6.0",
+    "pypdf==6.21.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+mcp = ["mcp==1.26.0"]
+
+[project.scripts]
+chatlog-keeper = "chatlog_keeper.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/RethinkCraft/WeKeeper"
+Repository = "https://github.com/RethinkCraft/WeKeeper"
+Issues = "https://github.com/RethinkCraft/WeKeeper/issues"
+
+[tool.setuptools.packages.find]
+include = ["chatlog_keeper*"]
+
+[tool.setuptools.package-data]
+chatlog_keeper = ["scripts/*.c", "scripts/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

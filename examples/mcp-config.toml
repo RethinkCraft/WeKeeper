@@ -1,0 +1,10 @@
+# Merge this section into your MCP client's configuration.
+# Replace @PYTHON@ and @STATE_DIR@ with absolute paths.
+# Keep state outside the repository and reload MCP after changing this entry.
+[mcp_servers.wechat-archive]
+command = "@PYTHON@"
+args = ["-m", "chatlog_keeper.mcp_server", "--state-dir", "@STATE_DIR@"]
+
+[mcp_servers.wechat-archive.env]
+CHATLOG_KEEPER_DATA_DIR = "@STATE_DIR@"
+CHATLOG_KEEPER_RUNTIME_VERSION = "0.5.0"

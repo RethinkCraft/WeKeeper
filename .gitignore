@@ -1,0 +1,74 @@
+# ============================================================================
+#  NEVER commit your own chat data, keys, or database copies.
+#  This .gitignore is deliberately strict so a clone of this repo can never
+#  accidentally publish someone's private messages.
+# ============================================================================
+
+# --- decrypted output / exported chat data ---
+/out/
+/output/
+*_messages.json
+*_messages.html
+
+# --- decryption keys & secrets ---
+*.key
+/secrets/
+/data/
+/state/
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+/private/
+/results/
+/archive/
+/wechat/
+/tools/
+/downloads/
+*.log
+
+# --- copies of chat databases / encrypted media ---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.dat
+nt_msg.db
+message_*.db
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# PyInstaller build artifacts — NEVER commit (build_pyi .toc / dist_exe carry build-host path)
+build_pyi/
+dist_exe/
+build_pyi*/
+dist_exe*/
+dist_macos*/
+dist_linux*/
+dist_source*/
+dist_metadata*/
+
+# Local cross-device acceptance harnesses can contain machine-specific paths.
+.tmp_windows_chat_acceptance.py

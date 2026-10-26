@@ -1,0 +1,7 @@
+# Same runtime dependencies as pyproject.toml; source package is local-only.
+pycryptodome==3.23.0
+numpy==2.4.6
+zstandard==0.25.0
+Pillow==13.0.0
+imageio-ffmpeg==0.6.0
+pypdf==6.21.2

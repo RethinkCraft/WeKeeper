@@ -1,0 +1,21 @@
+# Replace all three placeholders with absolute paths before installing.
+# @PROJECT_ROOT@: the WeKeeper checkout
+# @PYTHON@: the checkout's .venv/bin/python
+# @STATE_DIR@: a private directory outside the checkout
+[Unit]
+Description=WeKeeper local Linux WeChat group archive
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+Environment="CHATLOG_KEEPER_DATA_DIR=@STATE_DIR@"
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStart="@PYTHON@" -m chatlog_keeper.cli collect --state-dir "@STATE_DIR@" --interval 30 --page-size 500
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+Nice=5
+
+[Install]
+WantedBy=default.target
