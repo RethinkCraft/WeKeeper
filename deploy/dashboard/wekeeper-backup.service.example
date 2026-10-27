@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up WeKeeper dashboard and verify SQLite integrity
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/wekeeper/deploy/dashboard
+ExecStart=/bin/sh /opt/wekeeper/deploy/dashboard/backup.sh

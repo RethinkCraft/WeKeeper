@@ -108,6 +108,7 @@ codex mcp add wechat-archive \
 - [架构说明](docs/architecture.md)：采集、存储、解析及隔离任务进程。
 - [验证说明](docs/validation.md)：实测环境、证据范围和剩余缺口。
 - [路线图](ROADMAP.md)：已交付能力和后续优先级。
+- [自托管网页看板](docs/dashboard.md)：所选群文字同步、独立账号、实时统计、站内告警与本机订阅摘要。
 
 ## 隐私与操作边界
 
@@ -115,12 +116,13 @@ WeKeeper 不发送微信消息或文件，不自动登录，不下载未缓存�
 唯一的客户端操作例外是明确请求且通过本机验收的微信原生语音转字。
 归档包含明文消息和媒体，应保护整个私有状态目录及其备份。
 选中内容会进入 Agent 的模型上下文；聊天和文档中的指令始终作为不可信的待分析数据。
-不需要额外模型服务、向量数据库或公网 HTTP 服务。
+基础归档与 MCP 不需要额外模型服务、向量数据库或公网 HTTP 服务。
+可选网页看板使用独立 HTTP 服务；自动摘要需要单独授权的 ChatGPT 订阅能力。
 
 ## 开发与上游来源
 
 ```bash
-python -m pip install -e '.[dev,mcp]'
+python -m pip install -e '.[dev,mcp,web]'
 python -m pytest -q
 ```
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=WeKeeper outgoing dashboard sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/WeKeeper
+ExecStart=%h/Desktop/WeKeeper/.venv/bin/python -m chatlog_keeper.dashboard.cli --archive-state %h/Desktop/wechat-linux-poc/state sync
+EnvironmentFile=-%h/.config/wekeeper/environment
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=70
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,6 @@
+# Use with compose.yaml when a host Nginx already owns the public ports.
+# Start only api: docker compose -f compose.yaml -f compose.host-nginx.yaml up -d api
+services:
+  api:
+    ports:
+      - "127.0.0.1:18880:8000"

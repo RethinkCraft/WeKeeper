@@ -25,9 +25,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest==9.1.1"]
 mcp = ["mcp==1.26.0"]
+web = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "httpx>=0.28,<1",
+    "PyJWT[crypto]>=2.10,<3",
+]
 
 [project.scripts]
 chatlog-keeper = "chatlog_keeper.cli:main"
+wekeeper-dashboard = "chatlog_keeper.dashboard.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/RethinkCraft/WeKeeper"

@@ -1,0 +1,15 @@
+.git
+.venv
+private
+state
+data
+archive
+secrets
+results
+dist
+**/__pycache__
+frontend/node_modules
+*.sqlite*
+*.db*
+.env*
+deploy/dashboard/runtime

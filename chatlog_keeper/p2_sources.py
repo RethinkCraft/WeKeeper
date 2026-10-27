@@ -313,6 +313,16 @@ class P2Sources:
         state["complete"] = not interrupted and checked < MAX_ROWS
 
     def collect(self, reader, contact_names, *, contacts_changed=False, time_budget=5.0):
+        # Group senders need not be contacts. Match cached usernames to exact
+        # observed identities, never to a nickname or a guessed identifier.
+        contact_names = dict(contact_names)
+        if getattr(self.store, "conn", None) is not None:
+            with self.store._lock:
+                for row in self.store.conn.execute("SELECT sender_id,sender_name FROM messages WHERE account_id=? AND sender_id<>'' ORDER BY create_time,message_ref", (self.collector.account_id,)):
+                    contact_names.setdefault(row[0], row[1] or row[0])
+                for row in self.store.conn.execute("SELECT group_id,name FROM groups WHERE account_id=?", (self.collector.account_id,)):
+                    contact_names.setdefault(row[0], row[1] or row[0])
+        subject_version = hashlib.sha256("\0".join(sorted(contact_names)).encode()).hexdigest()
         deadline = time.monotonic() + time_budget
         summary = {"voice_rows_checked": 0, "voices_linked": 0, "voice_empty": 0,
                    "voice_over_limit": 0, "voice_unknown_format": 0, "voice_ambiguous": 0, "avatar_rows_checked": 0,
@@ -349,9 +359,10 @@ class P2Sources:
                 fingerprint = self.collector._fingerprint(path)
                 is_avatar = path.name == "head_image.db"
                 changed = state.get("fingerprint") != fingerprint
-                if changed or (is_avatar and contacts_changed):
+                mapping_changed = is_avatar and state.get("subject_version") != subject_version
+                if changed or (is_avatar and contacts_changed) or mapping_changed:
                     state.update(after=0, complete=False, fingerprint=fingerprint)
-                if not changed and state.get("complete") and not (is_avatar and contacts_changed):
+                if not changed and state.get("complete") and not (is_avatar and contacts_changed) and not mapping_changed:
                     self._save_state(path, state)
                     summary["sources_unchanged"] += 1
                     self.collector._discard_snapshot(path)
@@ -362,6 +373,7 @@ class P2Sources:
                     connection.execute("PRAGMA query_only=ON")
                     if is_avatar:
                         self._profiles(connection, path, state, contact_names, summary, deadline)
+                        state["subject_version"] = subject_version
                     else:
                         self._voice(connection, path, state, summary, deadline)
                 state.update(last_success_at=time.time(), error=None)

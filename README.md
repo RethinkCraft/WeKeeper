@@ -124,7 +124,7 @@ No additional model service, vector database or public HTTP server is required.
 ## Development and upstream
 
 ```bash
-python -m pip install -e '.[dev,mcp]'
+python -m pip install -e '.[dev,mcp,web]'
 python -m pytest -q
 ```
 

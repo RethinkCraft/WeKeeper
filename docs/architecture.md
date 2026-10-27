@@ -1,8 +1,10 @@
 # Architecture
 
 WeKeeper keeps one collector, one private SQLite archive and one local stdio MCP
-layer. There is no HTTP server, separate AI analysis service, vector database or
-distributed job system. Codex performs analysis after requesting scoped evidence.
+layer. The base archive has no HTTP server, vector database or distributed job
+system. Codex performs analysis after requesting scoped evidence. The optional
+[self-hosted dashboard](dashboard.md) adds an outgoing text projection service,
+a separate cloud read model and an independently authorized local summary worker.
 
 ```mermaid
 flowchart LR
