@@ -7,4 +7,4 @@ args = ["-m", "chatlog_keeper.mcp_server", "--state-dir", "@STATE_DIR@"]
 
 [mcp_servers.wechat-archive.env]
 CHATLOG_KEEPER_DATA_DIR = "@STATE_DIR@"
-CHATLOG_KEEPER_RUNTIME_VERSION = "0.5.0"
+CHATLOG_KEEPER_RUNTIME_VERSION = "0.6.0"

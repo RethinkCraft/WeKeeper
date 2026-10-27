@@ -1,0 +1,4 @@
+services:
+  api:
+    build:
+      dockerfile: deploy/dashboard/Dockerfile.prebuilt

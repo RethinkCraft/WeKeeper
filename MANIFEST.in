@@ -1,14 +1,27 @@
-include LICENSE README.md README_zh.md UPSTREAM.md ROADMAP.md
-include pyproject.toml requirements.txt
+include LICENSE README.md README_zh.md UPSTREAM.md ROADMAP.md CHANGELOG.md
+include pyproject.toml requirements.txt .dockerignore
 recursive-include chatlog_keeper *.py *.c
 recursive-include tests *.py *.json
 recursive-include docs *.md
-recursive-include deploy *.example
+recursive-include deploy *.example Dockerfile* *.yaml *.conf *.template *.sh *.lock
+include frontend/package.json frontend/package-lock.json frontend/index.html frontend/tsconfig.json frontend/vite.config.ts
+recursive-include frontend/src *.ts *.tsx *.css
+recursive-include frontend/tests *.test.mjs
+recursive-include frontend/public *.svg *.png *.jpg *.jpeg *.webp *.ico
 recursive-include examples *.toml
 recursive-include scripts *.py
 recursive-include .github/workflows *.yml
-global-exclude *.py[cod] *.so *.key *.pem *.db *.sqlite *.dat *.log
+global-exclude *.py[cod] *.so *.key *.pem *.p12 *.pfx *.db* *.sqlite* *.dat *.log *.tsbuildinfo .env .env.*
+global-exclude */node_modules/* */dist/* */runtime/* */private/*
+prune frontend/node_modules
+prune frontend/dist
+prune deploy/dashboard/runtime
 prune .venv
+prune build
+prune dist
+prune data
+prune secrets
+prune downloads
 prune state
 prune private
 prune results

@@ -1,6 +1,7 @@
 # Validation and known limits
 
-This document records the 0.5.0 baseline on **2026-10-26**. Counts describe a
+This document preserves the 0.5.0 baseline on **2026-10-26** and appends
+0.6.0 dashboard verification on **2026-10-27**. Counts describe a
 specific verification snapshot, not advertised capacities or a guarantee that
 another local account contains the same data. No private account IDs, group names,
 message bodies, screenshots, media or acceptance reports are distributed here.
@@ -8,9 +9,11 @@ message bodies, screenshots, media or acceptance reports are distributed here.
 ## Reproducible repository checks
 
 ```bash
-python -m pip install -e '.[dev,mcp]'
+python -m pip install -e '.[dev,mcp,web]'
 python -m pytest -q
 python -m chatlog_keeper.cli --help
+wekeeper-dashboard --help
+(cd frontend && npm ci && npm test && npm run build)
 ```
 
 The pre-publication package baseline passed **655 tests**. An additional **15
@@ -39,7 +42,8 @@ need access to an actual account. Coverage includes:
 
 CI runs on Ubuntu 24.04 and Python 3.11 with tests and package-build verification.
 That environment validates the library and mocked boundaries, not a real WeChat
-desktop session.
+desktop session. The 0.6.0 workflow also verifies the frontend from the source
+distribution and the installed wheel's MCP and dashboard entry points.
 
 ## Real-client baseline
 
@@ -113,10 +117,40 @@ before collection cannot be reconstructed.
 ## Product boundaries
 
 Only data actually synchronized to this device and still available when collected
-can be preserved. Full remote history and uncached media cannot be recovered.
+can be preserved. Full remote history and ordinary uncached chat media cannot be recovered.
 Full-cache image quality is distinguished from proven sender-original quality.
 Quiet groups can lead to `sync_unverified`; the state is not a definite logout.
 
-OCR, video processing, Moments reading, external page-body fetching, active media
-downloads and a generic desktop automation API are outside this release. The
+OCR, video processing, Moments reading, external page-body fetching, ordinary chat-media
+downloads and a generic desktop automation API are outside this release. The optional
+avatar-backfill worker is a specific exception for saved member-avatar URLs. The
 next work is prioritized in [ROADMAP.md](../ROADMAP.md).
+
+## 0.6.0 dashboard verification
+
+The local release-preparation snapshot passed **877 Python tests**, with two
+dependency warnings (Starlette/httpx deprecation and a Pydantic forward reference).
+The frontend test file covers **12 behavior cases** for Shanghai ranges, saved
+preferences, chat replay/citations and avatar recovery; the installed Node test
+runner reports that file as one passing test unit. TypeScript checking and the
+production build passed. The PR's CI result is authoritative for its final revision.
+
+New synthetic tests cover partition retry/replay and historical correction,
+source/user authorization, private conversation ownership, leases and crash recovery,
+usage on failed validation, missing quota freshness, incremental-summary cursors and
+retry budgets, and exact-identity avatar fetch/validation limits. They use fake
+provider responses and avatar bytes and require no live account or chat archive.
+
+Separate deployment checks exercised login-protected HTTPS access, an authorized
+real summary and a real tool-assisted analysis answer, known usage recording,
+source-labelled Codex quota, missing-avatar backfill and protected image delivery.
+Cloud backup restoration passed SQLite integrity and retained the expected data.
+Headless Chrome checks exercised desktop/mobile views, advancing versus fixed
+ranges, pagination and avatar recovery. Private URLs, screenshots, chat text,
+credentials and deployment backups are not included in the repository.
+
+These checks do not establish every account's SIWC eligibility, complete historical
+summary coverage, arbitrary model-answer accuracy, all multi-user deployment
+conditions or a complete current/historical member roster. An incomplete summary
+baseline and unavailable avatar URLs remain explicit states. Existing native-client
+and media gaps above still apply.

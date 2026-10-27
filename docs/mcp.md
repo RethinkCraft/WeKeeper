@@ -1,6 +1,6 @@
 # MCP usage
 
-WeKeeper 0.5.0 exposes fifteen local stdio tools under `wechat-archive`.
+WeKeeper 0.6.0 exposes fifteen local stdio tools under `wechat-archive`.
 Fourteen tools query the archive read-only. `request_voice_transcription` is an
 explicit, side-effecting queue operation guarded by real-client acceptance; it
 is marked `readOnlyHint=false`, `idempotentHint=false` and `openWorldHint=true`.
@@ -124,7 +124,9 @@ display result uses a static first frame and reports animation metadata.
 `get_profile` returns group details when `sender_id` is omitted. Members must be
 locally associated with that group. Only `include_avatar=true` requests actual
 cached avatar pixels. Avatar versions are preserved rather than overwritten;
-uncached avatars are explicit and no avatar URL is downloaded.
+uncached avatars are explicit and MCP queries never download an avatar URL.
+If the separate, optional [avatar-backfill worker](dashboard.md#automatically-fill-missing-member-avatars)
+has populated the local archive, these queries can read the resulting cached pixels.
 
 `get_voice` reports SILK availability and verifies the archived raw blob's size,
 hash and existence. Preserving SILK is not a guarantee of direct audio playback.

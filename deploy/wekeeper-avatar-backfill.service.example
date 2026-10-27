@@ -1,0 +1,22 @@
+# Replace all three placeholders with absolute paths before installing.
+# @PROJECT_ROOT@: the WeKeeper checkout
+# @PYTHON@: the checkout's .venv/bin/python
+# @STATE_DIR@: the existing private archive directory outside the checkout
+[Unit]
+Description=WeKeeper missing group avatar backfill
+After=network-online.target wekeeper-sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart="@PYTHON@" -m chatlog_keeper.dashboard.cli --archive-state "@STATE_DIR@" avatar-backfill
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=40
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

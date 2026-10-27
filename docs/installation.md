@@ -1,8 +1,9 @@
 # Installation and operation
 
-WeKeeper 0.5.0 is a local Linux WeChat archive. The distribution and import name
+WeKeeper 0.6.0 is a local Linux WeChat archive with an optional web dashboard. The distribution and import name
 remain `chatlog-keeper` and `chatlog_keeper`; the CLI is `chatlog-keeper` and the
-MCP server identifier is `wechat-archive`.
+MCP server identifier is `wechat-archive`. The optional `wekeeper-dashboard` CLI
+and cloud deployment are described in [dashboard operation](dashboard.md).
 
 ## Verified environment
 
@@ -145,7 +146,7 @@ and state paths in [the MCP template](../examples/mcp-config.toml). The equivale
 Codex registration is:
 
 ```bash
-codex mcp add wechat-archive --env CHATLOG_KEEPER_DATA_DIR=/absolute/private/state --env CHATLOG_KEEPER_RUNTIME_VERSION=0.5.0 -- /absolute/WeKeeper/.venv/bin/python -m chatlog_keeper.mcp_server --state-dir /absolute/private/state
+codex mcp add wechat-archive --env CHATLOG_KEEPER_DATA_DIR=/absolute/private/state --env CHATLOG_KEEPER_RUNTIME_VERSION=0.6.0 -- /absolute/WeKeeper/.venv/bin/python -m chatlog_keeper.mcp_server --state-dir /absolute/private/state
 ```
 
 Initialize the archive with collection before querying. Reload the MCP connection
@@ -200,12 +201,18 @@ type in the composer, use OCR, or invoke a local/third-party ASR service.
 
 ## Upgrade, backup and recovery
 
-Version 0.5.0 uses schema 4 and parser 4. Opening a writable archive from schema
+Version 0.6.0 retains schema 4 and parser 4 from 0.5.0. Opening a writable archive from schema
 1, 2 or 3 first creates a private consistent backup under `archive/backups/`.
 Historical reparsing proceeds in batches of at most 500 per collector cycle,
 while retaining message references, first-seen timestamps and source checkpoints.
 Restart the collector and reload MCP after an upgrade; old processes cannot read
 the new schema. Inspect `get_status.semantics` for pending work or source gaps.
+
+Upgrading an existing 0.5.0 archive to 0.6.0 does not require a new archive schema
+migration or enabling the dashboard. Install `[web]` only on hosts that use its
+commands. Dashboard users must preserve their private local worker state and back
+up the independent cloud database before an upgrade; follow its separate
+[backup and recovery instructions](dashboard.md#data-alerts-and-recovery).
 
 For a full consistent backup, stop the collector, copy the entire private state
 directory including media and decoding material to a protected destination, then

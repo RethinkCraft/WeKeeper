@@ -1,6 +1,6 @@
 # Upstream and attribution
 
-WeKeeper 0.5.0 is maintained as a Linux WeChat archive and MCP project derived
+WeKeeper 0.6.0 is maintained as a Linux WeChat archive, MCP and optional dashboard project derived
 from [labazhou2024/chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper).
 The imported upstream baseline is commit
 [`2225294fd0761e10ce15540f21e7dbb2ac304c3c`](https://github.com/labazhou2024/chatlog-keeper/commit/2225294fd0761e10ce15540f21e7dbb2ac304c3c)
@@ -46,8 +46,17 @@ Linux CI and source/wheel build validation are added for this publication.
   note components, opt-in derived-text search, and a separately gated native
   conversion queue with current-cache proof and strict UI targeting.
 - Fifteen stdio tools: fourteen archive queries and one explicit native voice
-  request. The SDK remains optional; there is no HTTP service, model API,
-  vector database or external business store.
+  request. The SDK remains optional; base archive/MCP use needs no HTTP service,
+  model API, vector database or external business store.
+
+## Added optional dashboard behavior
+
+Version 0.6.0 adds allowlisted outgoing text and avatar-thumbnail synchronization,
+a separate FastAPI/SQLite cloud service, a React dashboard and persistent alerts.
+Local workers use independent Sign in with ChatGPT authorization for incremental
+summaries and private analysis conversations. Actual usage and official Codex quota
+retain distinct source labels. A separate opt-in worker fetches missing avatars
+from saved contact URLs; ordinary chat media remain local.
 
 Version 0.5.0 uses schema/parser 4. Its exact tested environment and incomplete
 media/type coverage are documented in [validation](docs/validation.md). Native
