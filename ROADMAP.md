@@ -1,7 +1,9 @@
 # Roadmap
 
-WeKeeper 0.5.0 provides local Linux group archival and a fifteen-tool stdio MCP
-surface. Scope follows one collector, one SQLite archive and one MCP layer.
+WeKeeper 0.6.0 retains local Linux group archival and its fifteen-tool stdio MCP
+surface, adding an optional self-hosted dashboard and local analysis workers.
+The archive remains one collector and one private SQLite store; dashboard storage
+and authorization are separate.
 This roadmap distinguishes implemented behavior from real-client acceptance;
 details and the dated baseline are in [validation](docs/validation.md).
 
@@ -25,6 +27,21 @@ details and the dated baseline are in [validation](docs/validation.md).
 Schema 4 migration preserves references, first-seen times, source generations and
 checkpoints, and creates a private backup. Fourteen tools remain read-only; only
 explicit accepted voice requests may operate the client.
+
+## Optional dashboard delivered in 0.6.0
+
+- Durable, allowlisted outgoing text/thumbnail sync, cloud accounts with admin/viewer
+  roles, SSE refresh, scoped search/statistics and persistent site alerts.
+- Private per-user analysis conversations with local execution, validated message
+  citations, resumable event delivery and explicit interruption after uncertain execution.
+- Bounded incremental summaries with persistent change tracking, retry limits and
+  independent ChatGPT authorization; actual usage and separately sourced Codex quota.
+- Automatically advancing seven-day ranges, stable member identity/avatars, and an
+  opt-in worker that fetches missing avatars from saved contact URLs.
+
+Synthetic recovery and authorization tests accompany deployment checks. These do
+not prove all accounts can use SIWC or that every member has a valid avatar URL.
+See [dashboard operation](docs/dashboard.md) and [validation](docs/validation.md).
 
 ## Implemented with real-sample gaps
 
@@ -51,7 +68,7 @@ explicit accepted voice requests may operate the client.
 ## Deferred
 
 OCR and cross-media text indexing, video processing, external page-body fetching,
-Moments, uncached-media downloads and general-purpose desktop automation remain
+Moments, ordinary uncached chat-media downloads and general-purpose desktop automation remain
 separate future work. No ASR model/service is introduced for the native-voice path.
 
 Every development and acceptance pass must avoid sending WeChat messages or

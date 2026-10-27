@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlog-keeper"
-version = "0.5.0"
-description = "WeKeeper: local Linux WeChat archives, cached media and MCP access"
+version = "0.6.0"
+description = "WeKeeper: Linux WeChat archives, MCP access and an optional self-hosted dashboard"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

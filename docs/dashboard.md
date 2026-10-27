@@ -7,7 +7,8 @@ schema are unchanged. There is no incoming connection to the WeChat machine.
 
 ## Local setup
 
-Install Python 3.11+ and the optional runtime:
+From the checkout root, activate a Python 3.11+ virtual environment and install
+the optional runtime:
 
 ```sh
 python -m pip install -e '.[web]'
@@ -26,11 +27,33 @@ removed groups are no longer exported or analyzed. Existing cloud copies remain
 available until an operator explicitly removes them; changing the allowlist does
 not silently delete history.
 
-Run `sync --once` to check the connection, then install the three service examples
-under `deploy/` with paths adjusted to your checkout and archive state. Sync scans
-every 30 seconds, with independent 30-second health heartbeats. Failed payloads
-stay queued; other valid partitions continue. The cloud displays upload errors
-separately from collector and heartbeat health.
+Once the cloud API and machine token are configured, check the connection:
+
+```sh
+wekeeper-dashboard --archive-state /private/state sync --once
+```
+
+The existing collector must keep running. Install the dashboard user services
+needed for your setup:
+
+| Service example under `deploy/` | Purpose |
+|---|---|
+| `wekeeper-sync.service.example` | Required for dashboard text, statistics, avatar thumbnails and health updates |
+| `wekeeper-summary.service.example` | Optional automatic summaries; requires independent ChatGPT authorization |
+| `wekeeper-agent.service.example` | Optional web conversations; uses the same ChatGPT authorization |
+| `wekeeper-avatar-backfill.service.example` | Optional downloads of missing selected-group avatars |
+
+Replace `@PROJECT_ROOT@`, `@PYTHON@` and `@STATE_DIR@` in each chosen example with
+absolute paths before installing it under `~/.config/systemd/user/` without the
+`.example` suffix. Use the same existing private archive directory for all
+services. Reload user units with `systemctl --user daemon-reload`, then enable
+and start the chosen services. The optional
+`~/.config/wekeeper/environment` file can hold local network/proxy settings;
+protect it with mode `0600` and keep it outside the checkout.
+
+Sync scans every 30 seconds, with independent 30-second health heartbeats.
+Failed payloads stay queued; other valid partitions continue. The cloud displays
+upload errors separately from collector and heartbeat health.
 
 ## Independent ChatGPT authorization
 
@@ -154,29 +177,42 @@ Reference: [registration](https://developers.openai.com/siwc/token-sharing-open-
 
 ## Cloud deployment
 
-`deploy/dashboard/Dockerfile` builds the React/TypeScript frontend and the Python
-service. Copy only source and deployment files to the cloud; never copy the
-WeChat state directory, OAuth credentials, media or this repository's `private/`.
+`deploy/dashboard/Dockerfile` builds the React/TypeScript frontend with Node 22
+and runs the Python 3.11 service. Copy only source and deployment files to the
+cloud; never copy the WeChat state directory, OAuth credentials, media or this
+repository's `private/`.
 
-Create `deploy/dashboard/.env` with mode `0600`:
+Create `deploy/dashboard/.env` with mode `0600`. This example uses port 9443;
+use a matching public origin and HTTPS port for your chosen listener:
 
 ```dotenv
 WEKEEPER_MACHINE_TOKEN=<independently-generated-machine-token>
 WEKEEPER_PUBLIC_ORIGIN=https://PUBLIC_IP:9443
+WEKEEPER_HTTPS_PORT=9443
 ```
 
-Provision `runtime/data` and `runtime/backups` with owner UID/GID `10001:10001`.
+All Compose commands below run on the cloud server. Relative `runtime/` paths
+are under `deploy/dashboard/`. Provision `runtime/data` and `runtime/backups`
+with owner UID/GID `10001:10001`.
 For a new server, use the supplied bootstrap HTTP configuration and Certbot
 webroot challenge to obtain a publicly trusted IP certificate, then render
 `nginx.conf.template`, validate Nginx and enable TLS. Certbot 5.4+ supports
 `--preferred-profile shortlived --webroot --webroot-path /var/www/acme
 --ip-address PUBLIC_IP`. Validate staging issuance before production issuance.
 Port 80 must reach the challenge webroot. IP certificates last about six days;
-enable the supplied renewal timer and test `renew --dry-run`.
+enable the supplied renewal timer and test `renew --dry-run`. After the
+certificate and `runtime/nginx.conf` are ready, start the standalone stack from
+the checkout:
+
+```sh
+cd /absolute/WeKeeper/deploy/dashboard
+docker compose up -d --build api nginx
+```
 
 If host Nginx already serves other applications, preserve it and start only API:
 
 ```sh
+cd /absolute/WeKeeper/deploy/dashboard
 docker compose -f compose.yaml -f compose.host-nginx.yaml up -d --build api
 ```
 
@@ -186,22 +222,59 @@ The API listens only through `127.0.0.1:18880`. Validate `nginx -t` before reloa
 Allow the selected TLS port in the cloud security group. Never replace an
 existing site's configuration merely to claim ports 80/443.
 
-An existing HTTPS site can alternatively include `nginx.subpath.conf` to serve
-the dashboard under `/wekeeper/`. Set `WEKEEPER_BASE_PATH=/wekeeper/` for a source
-build, use `https://PUBLIC_IP/wekeeper` as the local sync `server_url`, and keep
-`WEKEEPER_PUBLIC_ORIGIN=https://PUBLIC_IP` (an origin has no path). For an already
-verified frontend bundle, `compose.prebuilt.yaml` uses `Dockerfile.prebuilt`;
-build that bundle with `npm run build -- --base=/wekeeper/` first.
+An existing HTTPS site can alternatively include `nginx.subpath.conf` inside
+its HTTPS server block to serve the dashboard under `/wekeeper/`. Set these
+values in `deploy/dashboard/.env`, retaining the machine token:
+
+```dotenv
+WEKEEPER_PUBLIC_ORIGIN=https://PUBLIC_IP
+WEKEEPER_BASE_PATH=/wekeeper/
+```
+
+Use `https://PUBLIC_IP/wekeeper` as the local sync `server_url`; the public
+origin has no path. Build and start only the API with the host-Nginx override:
+
+```sh
+cd /absolute/WeKeeper/deploy/dashboard
+docker compose -f compose.yaml -f compose.host-nginx.yaml up -d --build api
+```
+
+For a frontend bundle built and verified before the Docker build, use the
+prebuilt override instead. Run these commands on the cloud checkout, or copy the
+verified `frontend/dist/` into the matching cloud checkout before the Compose
+command:
+
+```sh
+cd /absolute/WeKeeper/frontend
+npm ci
+npm test
+npm run build -- --base=/wekeeper/
+cd ../deploy/dashboard
+docker compose -f compose.yaml -f compose.host-nginx.yaml -f compose.prebuilt.yaml up -d --build api
+```
+
+Validate the host configuration with `nginx -t` before reloading it. The root
+listener and subpath variants are alternatives; choose the matching frontend base
+path and sync URL.
 
 If Docker's containerd image store reports a missing parent snapshot while
-unpacking a cached build, export just this project's image with
-`docker buildx build --provenance=false --output type=docker,dest=/tmp/wekeeper-image.tar
--t wekeeper-api:latest -f deploy/dashboard/Dockerfile.prebuilt .`, load it with
-`docker load -i /tmp/wekeeper-image.tar`, then start API with `--no-build`.
+unpacking a cached build, export just this project's image from the checkout
+root, load it, then start the API with the same Compose overrides:
+
+```sh
+cd /absolute/WeKeeper
+docker buildx build --provenance=false --output type=docker,dest=/tmp/wekeeper-image.tar \
+  -t wekeeper-api:latest -f deploy/dashboard/Dockerfile.prebuilt .
+docker load -i /tmp/wekeeper-image.tar
+cd deploy/dashboard
+docker compose -f compose.yaml -f compose.host-nginx.yaml -f compose.prebuilt.yaml up -d --no-build api
+```
+
 This avoids pruning images or restarting unrelated containers.
 
 Bootstrap the first administrator interactively, or pipe a protected password
-file to `user-add chris --role admin --password-stdin` inside the API container.
+file to `user-add ADMIN_USERNAME --role admin --password-stdin` inside the API
+container.
 Passwords require at least 12 characters. There is no public registration.
 Administrators create/disable accounts and maintain literal keyword rules;
 viewers can read selected groups and mark their own alerts read/acknowledged.
@@ -219,7 +292,8 @@ Atomic replacement covers late messages, deletions, deduplication and text
 enrichment without treating archive query cursors as replication watermarks.
 Message, card and transcript text remain one top-level message. Sender IDs are
 stable keyed pseudonyms; cross-day active counts use distinct IDs. Source
-database IDs, raw payloads, file paths and binary media are not exported.
+database IDs, raw payloads, file paths and ordinary message media are not
+exported; the avatar thumbnails described above are the only image upload.
 
 Keyword rules match future top-level messages with literal case-insensitive
 text matching. Initial history does not trigger alerts; replay does not duplicate

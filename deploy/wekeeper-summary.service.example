@@ -1,3 +1,7 @@
+# Replace all three placeholders with absolute paths before installing.
+# @PROJECT_ROOT@: the WeKeeper checkout
+# @PYTHON@: the checkout's .venv/bin/python
+# @STATE_DIR@: the existing private archive directory outside the checkout
 [Unit]
 Description=WeKeeper local ChatGPT plan summaries
 After=network-online.target wekeeper-sync.service
@@ -5,8 +9,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Desktop/WeKeeper
-ExecStart=%h/Desktop/WeKeeper/.venv/bin/python -m chatlog_keeper.dashboard.cli --archive-state %h/Desktop/wechat-linux-poc/state summarize
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart="@PYTHON@" -m chatlog_keeper.dashboard.cli --archive-state "@STATE_DIR@" summarize
 EnvironmentFile=-%h/.config/wekeeper/environment
 Restart=on-failure
 RestartSec=30

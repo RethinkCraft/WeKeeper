@@ -4,7 +4,7 @@ WeKeeper keeps one collector, one private SQLite archive and one local stdio MCP
 layer. The base archive has no HTTP server, vector database or distributed job
 system. Codex performs analysis after requesting scoped evidence. The optional
 [self-hosted dashboard](dashboard.md) adds an outgoing text projection service,
-a separate cloud read model and an independently authorized local summary worker.
+a separate cloud read model and independently authorized local summary/chat workers.
 
 ```mermaid
 flowchart LR
@@ -63,7 +63,7 @@ unresolved, missing, corrupt and unsupported states remain distinct. Existing
 decoding material is retained when new settings arrive. Source cache cleanup
 does not invalidate a good archive copy.
 
-All business storage remains in the selected private state:
+Base archive storage remains in the selected private state:
 
 ```text
 STATE_DIR/
@@ -104,6 +104,29 @@ and hash. The reviewed UI path checks account, group, sender, time and duration;
 ambiguous or changed targets stop. Results come from WeChat's native accessibility
 text and are saved separately. Querying does not trigger a task.
 
+## Optional dashboard and analysis workers
+
+The dashboard is independent of the local MCP transport. An outgoing sync worker
+projects explicitly selected groups into cloud SQLite, using persistent partition
+revisions and separate health heartbeats. Cloud user sessions and machine tokens
+are separate. Browser refresh uses SSE; ordinary message media, source databases,
+keys and ChatGPT credentials remain on the WeChat machine. Re-encoded member
+avatar thumbnails are the only uploaded binary media.
+
+Local summary and web-chat workers share an inference lock and independent SIWC
+authorization. Summaries track semantic changes in bounded batches; successful
+validation advances their cursors. Private cloud chat tasks use leases and sequenced
+events. Results are saved locally before upload; uncertain execution is interrupted
+rather than automatically inferred again. Both workers expose only scoped archive
+evidence to the model, and returned citations are validated.
+
+Private `STATE_DIR/dashboard/` storage contains worker queues, summary/usage state
+and authorization. The cloud owns a separate private data directory and backups.
+The optional avatar worker reads saved contact URLs using exact native identity,
+fetches only supported HTTPS avatar sources and archives validated bytes locally.
+Its queue is separate from message synchronization and summary inputs.
+See [dashboard operation](dashboard.md) for deployment and recovery.
+
 ## Module map
 
 | Area | Main modules |
@@ -115,10 +138,14 @@ text and are saved separately. Querying does not trigger a task.
 | Native voice tasks | `native_transcription.py`, `native_accessibility.py`, `native_cache_probe.py` |
 | Session health and alerts | `client_health.py`, `health_alerts.py` |
 | Linux/source adapters | `wechat_db.py`, `wechat_contacts.py`, `wechat_image.py`, key modules and `core/` |
+| Optional cloud dashboard | `dashboard/api.py`, `dashboard/store.py`, `dashboard/cloud_features.py`, `frontend/` |
+| Optional local workers | `dashboard/sync.py`, `dashboard/agent.py`, `dashboard/summaries.py`, `dashboard/avatar_backfill.py` |
+| Independent model authorization and usage | `dashboard/siwc.py`, `dashboard/usage.py`, `dashboard/quota.py` |
 
-The existing `chatlog_keeper/` and flat `tests/` layouts are retained for the
-0.5.0 publication. This packaging pass does not introduce a second runtime or
-rename stable package, CLI or MCP interfaces.
+The existing `chatlog_keeper/` and flat Python `tests/` layouts are retained.
+Version 0.6.0 adds an optional web runtime and `wekeeper-dashboard` CLI; stable
+archive package, `chatlog-keeper` CLI and MCP interfaces keep their existing names.
+The archive remains schema/parser 4; dashboard databases evolve independently.
 
 ## Trust and compatibility
 
