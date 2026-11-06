@@ -1,0 +1,400 @@
+diff --git a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+index 5ed01fe..9c2effd 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+@@ -734,9 +734,28 @@ impl Core {
+         let own_phase = format!("{receipt}:message-started");
+         let started = self.store.runtime(account, &own_phase)?.is_some();
+         let (source, created_by_intent) = if let Some(id) = existing {
++            let timing = std::env::var_os("WX_PROFILE_TIMINGS")
++                .is_some_and(|value| value == "1")
++                .then(std::time::Instant::now);
++            if timing.is_some() {
++                eprintln!(
++                    "{}",
++                    json!({"diagnostic":"profile_read","stage":"sync_duplicate_lookup","phase":"start","reader":"owned_if_held"})
++                );
++            }
++            // The mutation actor holds this account's gate. Refresh inventory and
++            // read the current committed row on the owned connection cache; do
++            // not pin a batch-wide snapshot across canonical profile writes.
+             let stored = self
+-                .profile_reader(account)?
+-                .message(&id, Some(&state.own_username))?;
++                .profile_reader_owned(account)
++                .and_then(|reader| Ok(reader.message(&id, Some(&state.own_username))?));
++            if let Some(timing) = timing {
++                eprintln!(
++                    "{}",
++                    json!({"diagnostic":"profile_read","stage":"sync_duplicate_lookup","phase":"end","reader":"owned_if_held","elapsed_ms":timing.elapsed().as_secs_f64()*1000.0,"completed":stored.is_ok()})
++                );
++            }
++            let stored = stored?;
+             let expected = std::str::from_utf8(&message.content)?;
+             if stored.create_time != message.created_at as i64
+                 || stored.content.text.as_deref() != Some(expected)
+@@ -2661,6 +2680,10 @@ mod recall_tests;
+ #[path = "business_sync_tests.rs"]
+ mod business_sync_tests;
+ 
++#[cfg(test)]
++#[path = "sync_duplicate_tests.rs"]
++mod duplicate_tests;
++
+ #[cfg(test)]
+ mod automatic_voice_tests {
+     use super::encrypted_roundtrip::{add, state};
+diff --git a/packages/native-client-rust/crates/wechat-profile/src/lib.rs b/packages/native-client-rust/crates/wechat-profile/src/lib.rs
+index 8c2a98b..ca38b81 100644
+--- a/packages/native-client-rust/crates/wechat-profile/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-profile/src/lib.rs
+@@ -39,6 +39,8 @@ pub use recall_search::*;
+ pub use recalls::*;
+ pub use schema::*;
+ pub use snapshot::{keys_from_agent_cache, keys_from_password, ProfileLocation, ReadOptions};
++#[doc(hidden)]
++pub use snapshot::{thread_snapshot_copy_stats, SnapshotCopyStats};
+ pub use thread_read::*;
+ pub use writer::*;
+ 
+diff --git a/packages/native-client-rust/crates/wechat-profile/src/snapshot.rs b/packages/native-client-rust/crates/wechat-profile/src/snapshot.rs
+index a96596d..d6926d0 100644
+--- a/packages/native-client-rust/crates/wechat-profile/src/snapshot.rs
++++ b/packages/native-client-rust/crates/wechat-profile/src/snapshot.rs
+@@ -14,6 +14,79 @@ use std::{
+ };
+ use zeroize::Zeroizing;
+ 
++#[derive(Clone, Copy, Default, Debug)]
++pub struct SnapshotCopyStats {
++    pub snapshots: u64,
++    pub copied_bytes: u64,
++    pub verified_bytes: u64,
++}
++thread_local! {
++    static COPY_STATS: std::cell::Cell<SnapshotCopyStats> = const { std::cell::Cell::new(SnapshotCopyStats { snapshots: 0, copied_bytes: 0, verified_bytes: 0 }) };
++}
++/// Counters on the calling thread, for diagnosing expensive profile copies.
++/// They contain no account, file, key or message values.
++#[doc(hidden)]
++pub fn thread_snapshot_copy_stats() -> SnapshotCopyStats {
++    COPY_STATS.get()
++}
++struct CopyObservation {
++    started: std::time::Instant,
++    number: u64,
++    enabled: bool,
++    files: usize,
++    copied: u64,
++    verified: u64,
++    completed: bool,
++}
++impl CopyObservation {
++    fn start() -> Self {
++        use std::sync::atomic::{AtomicU64, Ordering};
++        static NEXT: AtomicU64 = AtomicU64::new(1);
++        let mut stats = COPY_STATS.get();
++        stats.snapshots += 1;
++        COPY_STATS.set(stats);
++        let value = Self {
++            started: std::time::Instant::now(),
++            number: NEXT.fetch_add(1, Ordering::Relaxed),
++            enabled: std::env::var_os("WX_PROFILE_TIMINGS").is_some_and(|value| value == "1"),
++            files: 0,
++            copied: 0,
++            verified: 0,
++            completed: false,
++        };
++        if value.enabled {
++            eprintln!(
++                "{}",
++                serde_json::json!({"diagnostic":"profile_read","stage":"snapshot_copy","phase":"start","sequence":value.number})
++            );
++        }
++        value
++    }
++    fn copied(&mut self, bytes: u64) {
++        self.copied += bytes;
++        self.files += 1;
++        let mut stats = COPY_STATS.get();
++        stats.copied_bytes += bytes;
++        COPY_STATS.set(stats);
++    }
++    fn verified(&mut self, bytes: u64) {
++        self.verified += bytes;
++        let mut stats = COPY_STATS.get();
++        stats.verified_bytes += bytes;
++        COPY_STATS.set(stats);
++    }
++}
++impl Drop for CopyObservation {
++    fn drop(&mut self) {
++        if self.enabled {
++            eprintln!(
++                "{}",
++                serde_json::json!({"diagnostic":"profile_read","stage":"snapshot_copy","phase":"end","sequence":self.number,"elapsed_ms":self.started.elapsed().as_secs_f64()*1000.0,"files":self.files,"copied_bytes":self.copied,"verified_bytes":self.verified,"completed":self.completed})
++            );
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ pub struct ProfileLocation {
+     pub(crate) root: PathBuf,
+@@ -256,6 +329,7 @@ impl Snapshot {
+         {
+             return Err(ProfileError::InvalidQuery);
+         }
++        let mut observation = CopyObservation::start();
+         let temp = wechat_platform::private_tempdir("agent-wechat-read-")?;
+         // macOS and custom TMPDIRs may reach this private directory through a
+         // symlink. Resolve its root before opening files with SQLITE_OPEN_NOFOLLOW.
+@@ -274,6 +348,7 @@ impl Snapshot {
+             fs::create_dir_all(dest.parent().ok_or(ProfileError::UnsupportedFile)?)?;
+             let (bytes, hash) =
+                 hash_copy(source, Some(&dest), &mut total, options.max_database_bytes)?;
++            observation.copied(bytes);
+             manifest.insert(rel, (bytes, hash));
+         }
+         // Re-inventory catches newly created/deleted WAL files as well as main
+@@ -284,14 +359,9 @@ impl Snapshot {
+         let mut total = options.max_total_bytes;
+         for source in &files {
+             let rel = relative(&location.storage, source)?;
+-            if manifest.get(&rel)
+-                != Some(&hash_copy(
+-                    source,
+-                    None,
+-                    &mut total,
+-                    options.max_database_bytes,
+-                )?)
+-            {
++            let verified = hash_copy(source, None, &mut total, options.max_database_bytes)?;
++            observation.verified(verified.0);
++            if manifest.get(&rel) != Some(&verified) {
+                 return Err(ProfileError::SourceChanged);
+             }
+         }
+@@ -350,6 +420,7 @@ impl Snapshot {
+             };
+             result.inventory[i].state = state;
+         }
++        observation.completed = true;
+         Ok(result)
+     }
+     pub fn open(&self, rel: &str) -> Result<ReadConnection<'_>> {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/sync_duplicate_tests.rs b/packages/native-client-rust/crates/wechat-core/src/sync_duplicate_tests.rs
+new file mode 100644
+index 0000000..c86162f
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/sync_duplicate_tests.rs
+@@ -0,0 +1,198 @@
++//! Synthetic encrypted profiles only; no network or retained account data.
++use super::encrypted_roundtrip::{add, state};
++use super::*;
++
++fn fixture() -> (tempfile::TempDir, Arc<Store>, Arc<Core>) {
++    let temporary = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&temporary.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    let core = Core::new(store.clone(), None).unwrap();
++    core.configure_profile_format_key(&[9; 16]).unwrap();
++    core.install_login_state("one", &state(), None).unwrap();
++    core.ensure_managed_profile("one", &state()).unwrap();
++    assert!(core.owns_profile("one").unwrap());
++    (temporary, store, core)
++}
++
++fn message(sid: u64, text: &[u8]) -> SyncCommand {
++    add(1, "peer", "synthetic_self", text, sid, 100)
++}
++
++fn stage(core: &Core, id: &str, commands: Vec<SyncCommand>) {
++    let batch = wechat_protocol::wire::SyncBatch {
++        code: 0,
++        flags: 0,
++        cursor: wechat_protocol::protobuf::uint(1, 0),
++        continuation: false,
++        commands,
++    };
++    core.store
++        .stage_sync(
++            "one",
++            id,
++            &core
++                .vault
++                .seal(
++                    "one",
++                    &format!("apply:{id}"),
++                    &serde_json::to_vec(&batch).unwrap(),
++                )
++                .unwrap(),
++            &core
++                .vault
++                .seal("one", "received-cursor", &batch.cursor)
++                .unwrap(),
++        )
++        .unwrap();
++}
++
++fn committed(store: &Store) -> usize {
++    store
++        .events("one", 0, 100)
++        .unwrap()
++        .iter()
++        .filter(|event| event.kind == "message.committed")
++        .count()
++}
++
++fn rows(core: &Core) -> usize {
++    core.messages("one", "peer", None, None).unwrap()["items"]
++        .as_array()
++        .unwrap()
++        .len()
++}
++
++#[tokio::test]
++async fn same_batch_duplicates_use_no_full_profile_copies_or_extra_rows() {
++    let (_temporary, store, core) = fixture();
++    let _gate = core.lock_account("one").await.unwrap();
++    stage(
++        &core,
++        "duplicates",
++        vec![
++            message(71, b"First"),
++            message(71, b"First"),
++            message(72, b"Second"),
++            message(72, b"Second"),
++        ],
++    );
++    let before = wechat_profile::thread_snapshot_copy_stats();
++    let result = core.recover_projection("one").unwrap();
++    let after = wechat_profile::thread_snapshot_copy_stats();
++    assert_eq!(result["projectedCommands"], 4);
++    assert_eq!(result["pendingCommands"], 0);
++    assert_eq!(after.snapshots - before.snapshots, 0);
++    assert_eq!(after.copied_bytes - before.copied_bytes, 0);
++    assert_eq!(after.verified_bytes - before.verified_bytes, 0);
++    assert_eq!(rows(&core), 2);
++    assert_eq!(committed(&store), 2);
++    assert!(store.pending_sync("one").unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn duplicate_lookup_observes_canonical_write_after_cached_read() {
++    let (_temporary, store, core) = fixture();
++    let _gate = core.lock_account("one").await.unwrap();
++    core.apply_sync_command("one", &message(71, b"Before"), "first", "live")
++        .unwrap();
++    core.apply_sync_command("one", &message(71, b"Before"), "prime-cache", "catchup")
++        .unwrap();
++    let id = store
++        .events("one", 0, 100)
++        .unwrap()
++        .into_iter()
++        .find(|event| event.kind == "message.committed")
++        .unwrap()
++        .data["messageId"]
++        .as_str()
++        .unwrap()
++        .to_owned();
++    let source = crate::source_message_id(&id).unwrap();
++    let (location, _) = core.profile_location_keys("one").unwrap();
++    let database =
++        rusqlite::Connection::open(location.root().join("db_storage").join(&source.database))
++            .unwrap();
++    let password = [42u8; 32];
++    assert_eq!(
++        unsafe { rusqlite::ffi::sqlite3_key(database.handle(), password.as_ptr().cast(), 32) },
++        0
++    );
++    database
++        .execute_batch(
++            "PRAGMA cipher_compatibility=4;PRAGMA cipher_page_size=4096;PRAGMA kdf_iter=256000;",
++        )
++        .unwrap();
++    database
++        .execute(
++            &format!(
++                "UPDATE \"{}\" SET message_content=?1 WHERE local_id=?2",
++                source.table
++            ),
++            rusqlite::params!["After", source.local_id],
++        )
++        .unwrap();
++    let before = wechat_profile::thread_snapshot_copy_stats();
++    assert_eq!(
++        core.apply_sync_command("one", &message(71, b"Before"), "stale-replay", "catchup")
++            .unwrap_err()
++            .to_string(),
++        "message_identity_conflict"
++    );
++    core.apply_sync_command("one", &message(71, b"After"), "fresh-replay", "catchup")
++        .unwrap();
++    assert_eq!(
++        wechat_profile::thread_snapshot_copy_stats().snapshots,
++        before.snapshots
++    );
++    assert_eq!(rows(&core), 1);
++    assert_eq!(committed(&store), 1);
++    assert!(store.runtime("one", "stale-replay").unwrap().is_none());
++}
++
++#[tokio::test]
++async fn interrupted_event_commit_recovers_existing_row_after_restart_without_copies() {
++    let (temporary, store, core) = fixture();
++    let gate = core.lock_account("one").await.unwrap();
++    stage(&core, "interrupted", vec![message(71, b"Recover once")]);
++    let control =
++        rusqlite::Connection::open(store.root.join("accounts/one/agent/control.sqlite")).unwrap();
++    control.execute_batch("CREATE TRIGGER interrupt_commit BEFORE INSERT ON events WHEN NEW.kind='message.committed' BEGIN SELECT RAISE(ABORT,'synthetic interruption'); END;").unwrap();
++    assert_eq!(
++        core.recover_projection("one").unwrap()["pendingCommands"],
++        1
++    );
++    assert_eq!(rows(&core), 1);
++    assert_eq!(committed(&store), 0);
++    assert!(store
++        .runtime("one", "projected:interrupted:0")
++        .unwrap()
++        .is_none());
++    control
++        .execute_batch("DROP TRIGGER interrupt_commit")
++        .unwrap();
++    drop(control);
++    drop(gate);
++    drop(core);
++    drop(store);
++    let store = Arc::new(Store::open_existing(&temporary.path().join("data")).unwrap());
++    let core = Core::new(store.clone(), None).unwrap();
++    core.configure_profile_format_key(&[9; 16]).unwrap();
++    let _gate = core.lock_account("one").await.unwrap();
++    assert!(core.owns_profile("one").unwrap());
++    let before = wechat_profile::thread_snapshot_copy_stats();
++    assert_eq!(
++        core.recover_projection("one").unwrap()["projectedCommands"],
++        1
++    );
++    assert_eq!(
++        wechat_profile::thread_snapshot_copy_stats().snapshots,
++        before.snapshots
++    );
++    assert_eq!(
++        core.recover_projection("one").unwrap()["projectedCommands"],
++        0
++    );
++    assert_eq!(rows(&core), 1);
++    assert_eq!(committed(&store), 1);
++    assert!(store.pending_sync("one").unwrap().is_empty());
++}
+diff --git a/.changeset/reuse-owned-sync-duplicate-reader.md b/.changeset/reuse-owned-sync-duplicate-reader.md
+new file mode 100644
+index 0000000..e30c27d
+--- /dev/null
++++ b/.changeset/reuse-owned-sync-duplicate-reader.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Check incoming sync duplicates through fresh reads on the exclusively owned profile connection cache instead of copying and hashing the entire profile for each duplicate. Keep row identity validation, account serialization, and restart recovery unchanged. Optional `WX_PROFILE_TIMINGS=1` diagnostics report copy counts, bytes and lookup duration without account or message data.

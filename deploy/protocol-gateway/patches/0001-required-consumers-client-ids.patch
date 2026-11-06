@@ -1,0 +1,1256 @@
+diff --git a/docs/src/content/docs/use/api.mdx b/docs/src/content/docs/use/api.mdx
+index b8403a5..45b907e 100644
+--- a/docs/src/content/docs/use/api.mdx
++++ b/docs/src/content/docs/use/api.mdx
+@@ -232,7 +232,15 @@ For files, images, video and voice, stage bytes with `POST /uploads` and send th
+ curl -N -H "Authorization: Bearer $TOKEN" "$WX/accounts/$ACCOUNT/events/stream"
+ ```
+ 
+-A server-sent event stream. A new message arrives as a `message.committed` event; fetch it with `GET /messages/{messageId}`. To resume after a disconnect, reconnect with `?after=CURSOR` (or the standard `Last-Event-ID` header) and the daemon replays what you missed. `POST /consumers/{name}/ack` with `{"cursor": "..."}` records how far you've processed.
++A server-sent event stream. A new message arrives as a `message.committed` event; fetch it with `GET /messages/{messageId}`. To resume after a disconnect, reconnect with `?after=CURSOR` (or the standard `Last-Event-ID` header). The ordinary stream retains the latest 10,000 events; an older cursor returns `410 event_cursor_expired`. Legacy `POST /consumers/{name}/ack` records progress without extending retention.
++
++For a bot that must resume after a longer interruption, register a **required consumer** before switching its input to this daemon:
++
++1. `PUT /consumers/{name}` with `{"after":"0"}` registers the starting cursor. Use a previously processed cursor for a handover; the server refuses an expired or future start. Registration returns `consumerId`, `required: true`, `registeredAfter`, `acknowledgedCursor` and `deliveredCursor`. All cursors are strings. Repeating the same registration preserves progress; changing its starting cursor returns `409 consumer_registration_conflict`.
++2. `GET /consumers/{name}/events?limit=100` returns `items`, `nextCursor` and `consumer`. Omit `after` to resume from the saved ACK, or pass the previous page's `nextCursor`. Fetching beyond the last offered page returns `409 consumer_cursor_not_delivered`.
++3. Save the events in your own transactional inbox, then `POST /consumers/{name}/ack` with `{"cursor":"NEXT_CURSOR"}`. The response contains the actual saved `cursor` and `messageReadStateChanged: false`. ACKs cannot exceed fetched progress or move backwards. After a lost response, retry with the same cursor.
++
++`GET /consumers/{name}` reads the saved progress. Required consumers retain all events after the slowest ACK, including across daemon restarts. A stopped required consumer therefore grows disk usage; it is never silently expired or advanced. Fetch/ACK progress concerns operational events, not WeChat message-read state or phone delivery. These routes require the account's `read` scope.
+ 
+ The stream sends an immediate heartbeat comment, followed by periodic keepalives.
+ Heartbeat comments contain no message and do not advance the event cursor.
+@@ -255,7 +263,7 @@ All account routes start with `/v1/accounts/{account}`.
+ | Media | `GET /messages/{id}/media`, `POST /media/lookup`, `POST /messages/{id}/media-transfers`, `GET /media/{id}/content` |
+ | Read state | `POST /threads/{id}/read-state` with `{"expectedVersion": "..."}` |
+ | Background work | `GET /jobs/{id}`, `GET /operations/{id}` |
+-| Events | `GET /events`, `GET /events/stream`, `POST /consumers/{name}/ack` |
++| Events | `GET /events`, `GET /events/stream`, `GET/PUT /consumers/{name}`, `GET /consumers/{name}/events`, `POST /consumers/{name}/ack` |
+ | Tokens | `GET /v1/tokens`, `POST /v1/tokens`, `DELETE /v1/tokens/{id}` |
+ 
+ Request and response types are generated from the Rust source into [`native.generated.ts`](https://github.com/thisnick/agent-wechat/blob/main/packages/shared/src/native.generated.ts). The [`wechat-api`](https://github.com/thisnick/agent-wechat/tree/main/packages/native-client-rust/crates/wechat-api) crate is the source of truth.
+diff --git a/packages/native-client-rust/crates/wechat-api/src/contracts.rs b/packages/native-client-rust/crates/wechat-api/src/contracts.rs
+index 2fe4ce8..aece127 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/contracts.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/contracts.rs
+@@ -421,8 +421,16 @@ pub struct NativeAccountRemoval {
+     pub files_retained: bool,
+ }
+ 
++#[derive(Serialize, Deserialize, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeConsumerRegistration {
++    pub after: String,
++}
++
+ pub fn typescript() -> String {
+     let declarations = [
++        NativeConsumerRegistration::decl(),
++        wechat_store::RequiredEventConsumer::decl(),
+         NativeMentions::decl(),
+         NativeQuoteReference::decl(),
+         wechat_core::LinkCard::decl(),
+diff --git a/packages/native-client-rust/crates/wechat-api/src/lib.rs b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+index 0476286..8fa2e76 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+@@ -380,6 +380,31 @@ impl From<anyhow::Error> for ApiError {
+                 StatusCode::GONE,
+                 "event_cursor_expired",
+             ),
++            (
++                "consumer_not_found",
++                StatusCode::NOT_FOUND,
++                "consumer_not_found",
++            ),
++            (
++                "consumer_registration_conflict",
++                StatusCode::CONFLICT,
++                "consumer_registration_conflict",
++            ),
++            (
++                "consumer_cursor_not_delivered",
++                StatusCode::CONFLICT,
++                "consumer_cursor_not_delivered",
++            ),
++            (
++                "client_id_conflict",
++                StatusCode::CONFLICT,
++                "client_id_conflict",
++            ),
++            (
++                "client_id_allocation_exhausted",
++                StatusCode::CONFLICT,
++                "client_id_allocation_exhausted",
++            ),
+             (
+                 "operation_in_progress",
+                 StatusCode::CONFLICT,
+@@ -1095,6 +1120,55 @@ async fn stream(
+ struct Ack {
+     cursor: String,
+ }
++async fn register_consumer(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path((a, consumer)): Path<(String, String)>,
++    Json(input): Json<contracts::NativeConsumerRegistration>,
++) -> ApiResult<Json<wechat_store::RequiredEventConsumer>> {
++    c.require(Some(&a), "read")?;
++    Ok(Json(app.core.store.register_required_consumer(
++        &a,
++        &consumer,
++        decimal(Some(&input.after))?,
++    )?))
++}
++async fn consumer_status(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path((a, consumer)): Path<(String, String)>,
++) -> ApiResult<Json<wechat_store::RequiredEventConsumer>> {
++    c.require(Some(&a), "read")?;
++    Ok(Json(app.core.store.required_consumer(&a, &consumer)?))
++}
++async fn consumer_events(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path((a, consumer)): Path<(String, String)>,
++    Query(q): Query<EventQuery>,
++) -> ApiResult<Json<Value>> {
++    c.require(Some(&a), "read")?;
++    let after = q
++        .after
++        .as_deref()
++        .map(|value| decimal(Some(value)))
++        .transpose()?;
++    let (items, state) =
++        app.core
++            .store
++            .consumer_events(&a, &consumer, after, q.limit.unwrap_or(100))?;
++    let next = items
++        .last()
++        .map(|event| event.cursor.clone())
++        .unwrap_or_else(|| {
++            after
++                .map(|value| value.to_string())
++                .unwrap_or_else(|| state.acknowledged_cursor.clone())
++        });
++    Ok(Json(
++        json!({"items":items,"nextCursor":next,"consumer":state}),
++    ))
++}
+ async fn ack(
+     State(app): State<App>,
+     Extension(c): Extension<Claims>,
+@@ -1102,11 +1176,12 @@ async fn ack(
+     Json(input): Json<Ack>,
+ ) -> ApiResult<Json<Value>> {
+     c.require(Some(&a), "read")?;
+-    app.core
++    let acknowledged = app
++        .core
+         .store
+         .acknowledge(&a, &consumer, decimal(Some(&input.cursor))?)?;
+     Ok(Json(
+-        json!({"cursor":input.cursor,"messageReadStateChanged":false}),
++        json!({"cursor":acknowledged.to_string(),"messageReadStateChanged":false}),
+     ))
+ }
+ #[derive(Deserialize)]
+@@ -1213,6 +1288,14 @@ pub fn router(core: Arc<Core>, token: &str) -> Router {
+         .route("/v1/accounts/{a}/events", get(events))
+         .route("/v1/accounts/{a}/event-log", get(events))
+         .route("/v1/accounts/{a}/events/stream", get(stream))
++        .route(
++            "/v1/accounts/{a}/consumers/{consumer}",
++            get(consumer_status).put(register_consumer),
++        )
++        .route(
++            "/v1/accounts/{a}/consumers/{consumer}/events",
++            get(consumer_events),
++        )
+         .route("/v1/accounts/{a}/consumers/{consumer}/ack", post(ack))
+         .layer(DefaultBodyLimit::max(128 * 1024))
+         .merge(media::routes())
+@@ -2497,6 +2580,143 @@ mod tests {
+         );
+     }
+     #[tokio::test]
++    async fn required_consumer_must_fetch_before_ack_and_cannot_skip_or_reset() {
++        let (_t, core, app) = setup();
++        for _ in 0..3 {
++            core.store
++                .append_event("one", "message.committed", &json!({}))
++                .unwrap();
++        }
++        let path = "/v1/accounts/one/consumers/required";
++        let (status, state) = call(
++            app.clone(),
++            "PUT",
++            path,
++            Some(OWNER),
++            Some(json!({"after":"0"})),
++        )
++        .await;
++        assert_eq!(status, StatusCode::OK);
++        assert_eq!(state["required"], true);
++        assert_eq!(state["acknowledgedCursor"], "0");
++        let (status, error) = call(
++            app.clone(),
++            "POST",
++            &format!("{path}/ack"),
++            Some(OWNER),
++            Some(json!({"cursor":"1"})),
++        )
++        .await;
++        assert_eq!(status, StatusCode::CONFLICT);
++        assert_eq!(error["error"]["code"], "consumer_cursor_not_delivered");
++        let (status, page) = call(
++            app.clone(),
++            "GET",
++            &format!("{path}/events?limit=2"),
++            Some(OWNER),
++            None,
++        )
++        .await;
++        assert_eq!(status, StatusCode::OK);
++        assert_eq!(page["nextCursor"], "2");
++        assert_eq!(page["consumer"]["deliveredCursor"], "2");
++        assert_eq!(page["consumer"]["acknowledgedCursor"], "0");
++        let (status, _) = call(
++            app.clone(),
++            "GET",
++            &format!("{path}/events?after=3"),
++            Some(OWNER),
++            None,
++        )
++        .await;
++        assert_eq!(status, StatusCode::CONFLICT);
++        for cursor in ["2", "1"] {
++            let (status, ack) = call(
++                app.clone(),
++                "POST",
++                &format!("{path}/ack"),
++                Some(OWNER),
++                Some(json!({"cursor":cursor})),
++            )
++            .await;
++            assert_eq!(status, StatusCode::OK);
++            assert_eq!(ack, json!({"cursor":"2","messageReadStateChanged":false}));
++        }
++        let (_, page) = call(
++            app.clone(),
++            "GET",
++            &format!("{path}/events"),
++            Some(OWNER),
++            None,
++        )
++        .await;
++        assert_eq!(page["items"][0]["cursor"], "3");
++        let (status, state) = call(
++            app.clone(),
++            "PUT",
++            path,
++            Some(OWNER),
++            Some(json!({"after":"0"})),
++        )
++        .await;
++        assert_eq!(status, StatusCode::OK);
++        assert_eq!(state["acknowledgedCursor"], "2");
++        assert_eq!(
++            call(
++                app.clone(),
++                "PUT",
++                path,
++                Some(OWNER),
++                Some(json!({"after":"2"}))
++            )
++            .await
++            .0,
++            StatusCode::CONFLICT
++        );
++        assert_eq!(
++            call(
++                app,
++                "GET",
++                "/v1/accounts/one/consumers/missing/events",
++                Some(OWNER),
++                None
++            )
++            .await
++            .0,
++            StatusCode::NOT_FOUND
++        );
++        assert_eq!(core.store.read_version("one", "peer").unwrap(), "0");
++    }
++    #[tokio::test]
++    async fn required_consumer_registration_checks_auth_and_cursor_without_resetting() {
++        let (_t, _core, app) = setup();
++        let path = "/v1/accounts/one/consumers/required";
++        assert_eq!(
++            call(app.clone(), "PUT", path, None, Some(json!({"after":"0"})))
++                .await
++                .0,
++            StatusCode::UNAUTHORIZED
++        );
++        for after in ["1", "-1", "1e3"] {
++            assert_eq!(
++                call(
++                    app.clone(),
++                    "PUT",
++                    path,
++                    Some(OWNER),
++                    Some(json!({"after":after}))
++                )
++                .await
++                .0,
++                StatusCode::BAD_REQUEST
++            );
++        }
++        assert_eq!(
++            call(app, "GET", path, Some(OWNER), None).await.0,
++            StatusCode::NOT_FOUND
++        );
++    }
++    #[tokio::test]
+     async fn public_errors_do_not_return_keys_or_filesystem_paths() {
+         let (_t, _core, app) = setup();
+         let (status, v) = call(app, "GET", "/v1/accounts/one/threads", Some(OWNER), None).await;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/authorization.rs b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+index 14d52ad..7878b2f 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/authorization.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+@@ -198,7 +198,7 @@ impl Store {
+             tx.execute("DELETE FROM runtime WHERE key IN ('saved-login-publication','saved-login-projection-needed')",[])?;
+             if prior.as_deref()!=Some(credential_generation.as_bytes()) {
+                 tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('credentials.projected',?1,?2)",params![serde_json::to_string(&serde_json::json!({"officialSavedLogin":"complete"}))?,chrono::Utc::now().to_rfc3339()])?;
+-                let seq=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
++                let seq=tx.last_insert_rowid();crate::event_consumers::prune_events(&tx, seq)?;
+             }
+             tx.commit()?;Ok(())
+         })
+diff --git a/packages/native-client-rust/crates/wechat-store/src/checkpoint.rs b/packages/native-client-rust/crates/wechat-store/src/checkpoint.rs
+index e4481e8..dfcbef4 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/checkpoint.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/checkpoint.rs
+@@ -140,7 +140,7 @@ impl Store {
+             tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('sync.committed',?1,?2)", params![serde_json::to_string(&serde_json::json!({"profileCheckpoint":"complete","currentReceivedCheckpoint":current}))?,chrono::Utc::now().to_rfc3339()])?;
+             // Match the common event retention window in the same transaction.
+             let sequence=tx.last_insert_rowid();
+-            tx.execute("DELETE FROM events WHERE sequence < ?1",[sequence.saturating_sub(10_000)])?;
++            crate::event_consumers::prune_events(&tx, sequence)?;
+             tx.commit()?;
+             Ok(true)
+         })
+diff --git a/packages/native-client-rust/crates/wechat-store/src/group_mutations.rs b/packages/native-client-rust/crates/wechat-store/src/group_mutations.rs
+index aebb33f..718ad3b 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/group_mutations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/group_mutations.rs
+@@ -43,10 +43,7 @@ fn write(tx: &rusqlite::Transaction<'_>, op: &Operation) -> Result<()> {
+         ],
+     )?;
+     let seq = tx.last_insert_rowid();
+-    tx.execute(
+-        "DELETE FROM events WHERE sequence<=?1",
+-        [seq.saturating_sub(10_000)],
+-    )?;
++    crate::event_consumers::prune_events(tx, seq)?;
+     Ok(())
+ }
+ fn key_hash(key: &str) -> Result<String> {
+diff --git a/packages/native-client-rust/crates/wechat-store/src/lib.rs b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+index 4fc86e1..30c7086 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -3,7 +3,9 @@ mod account_removal;
+ mod admission;
+ mod authorization;
+ mod checkpoint;
++mod client_ids;
+ pub mod copy;
++mod event_consumers;
+ mod group_mutations;
+ mod media;
+ mod metadata;
+@@ -16,6 +18,7 @@ mod recalls;
+ mod settings;
+ pub mod vault;
+ use anyhow::{bail, Context, Result};
++pub use event_consumers::RequiredEventConsumer;
+ use fs2::FileExt;
+ pub use group_mutations::*;
+ pub use media::*;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/logout.rs b/packages/native-client-rust/crates/wechat-store/src/logout.rs
+index b5466e2..ab28356 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/logout.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/logout.rs
+@@ -14,10 +14,7 @@ fn event(tx: &rusqlite::Transaction<'_>, kind: &str, value: &Value) -> Result<()
+             chrono::Utc::now().to_rfc3339()
+         ],
+     )?;
+-    tx.execute(
+-        "DELETE FROM events WHERE sequence < ?1",
+-        [sequence.saturating_sub(10_000)],
+-    )?;
++    crate::event_consumers::prune_events(tx, sequence)?;
+     Ok(())
+ }
+ 
+diff --git a/packages/native-client-rust/crates/wechat-store/src/media.rs b/packages/native-client-rust/crates/wechat-store/src/media.rs
+index 288d0e1..166c54f 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/media.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/media.rs
+@@ -107,10 +107,7 @@ fn media_event(tx: &Connection, kind: &str, data: &Value) -> Result<()> {
+             chrono::Utc::now().to_rfc3339()
+         ],
+     )?;
+-    tx.execute(
+-        "DELETE FROM events WHERE sequence < ?1",
+-        [seq.saturating_sub(10_000)],
+-    )?;
++    crate::event_consumers::prune_events(tx, seq)?;
+     Ok(())
+ }
+ fn job_changed(old: &MediaJobRecord, new: &MediaJobRecord) -> bool {
+diff --git a/packages/native-client-rust/crates/wechat-store/src/metadata.rs b/packages/native-client-rust/crates/wechat-store/src/metadata.rs
+index 736d514..d4776f1 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/metadata.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/metadata.rs
+@@ -46,7 +46,7 @@ impl Store {
+         summary: &serde_json::Value,
+     ) -> Result<()> {
+         self.control(account,|db|{let tx=db.transaction()?;let pending=format!("metadata-pending:{id}");let n=tx.execute("DELETE FROM runtime WHERE key=?1",[&pending])?;if n==0{return Ok(())};if let Some((key,sealed))=cursor{if !matches!(key,"metadata-contacts-cursor"|"metadata-groups-cursor"){bail!("invalid metadata cursor key")};tx.execute("INSERT INTO runtime VALUES(?1,?2)ON CONFLICT(key)DO UPDATE SET value=excluded.value",params![key,sealed])?;}
+-   let seq:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events",[],|r|r.get(0))?;tx.execute("INSERT INTO events VALUES(?1,'metadata.changed',?2,?3)",params![seq,serde_json::to_string(summary)?,chrono::Utc::now().to_rfc3339()])?;tx.execute("DELETE FROM events WHERE sequence < ?1",[seq.saturating_sub(10_000)])?;tx.commit()?;Ok(())})
++   let seq:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events",[],|r|r.get(0))?;tx.execute("INSERT INTO events VALUES(?1,'metadata.changed',?2,?3)",params![seq,serde_json::to_string(summary)?,chrono::Utc::now().to_rfc3339()])?;crate::event_consumers::prune_events(&tx, seq)?;tx.commit()?;Ok(())})
+     }
+ }
+ 
+diff --git a/packages/native-client-rust/crates/wechat-store/src/operations.rs b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+index 1c0d8f1..657d174 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/operations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+@@ -249,7 +249,7 @@ impl Store {
+     pub(crate) fn prepare_account(db: &mut Connection) -> Result<()> {
+         db.busy_timeout(std::time::Duration::from_secs(2))?;
+         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+-        if !(1..=8).contains(&version) {
++        if !(1..=9).contains(&version) {
+             bail!("unsupported account sidecar schema");
+         }
+         if version == 1 {
+@@ -295,11 +295,18 @@ impl Store {
+             tx.execute_batch(include_str!("../migrations/account/V008__contact_sync.sql"))?;
+             tx.commit()?;
+         }
++        if version < 9 {
++            let tx = db.transaction()?;
++            tx.execute_batch(include_str!(
++                "../migrations/account/V009__event_consumers_client_ids.sql"
++            ))?;
++            tx.commit()?;
++        }
+         Ok(())
+     }
+     pub fn protected_state_exists(&self) -> Result<bool> {
+         for account in self.accounts()? {
+-            if self.control(&account.id,|db|Ok(db.query_row("SELECT (SELECT count(*) FROM runtime)+(SELECT count(*) FROM outbox)+(SELECT count(*) FROM apply_intents)+(SELECT count(*) FROM media_sources)+(SELECT count(*) FROM media_jobs)+(SELECT count(*) FROM media_assets)+(SELECT count(*) FROM pagination_views)+(SELECT count(*) FROM message_recalls)+(SELECT count(*) FROM outgoing_recalls)+(SELECT count(*) FROM group_mutations)",[],|r|r.get::<_,i64>(0))?>0))? {return Ok(true);}
++            if self.control(&account.id,|db|Ok(db.query_row("SELECT (SELECT count(*) FROM runtime)+(SELECT count(*) FROM outbox)+(SELECT count(*) FROM apply_intents)+(SELECT count(*) FROM media_sources)+(SELECT count(*) FROM media_jobs)+(SELECT count(*) FROM media_assets)+(SELECT count(*) FROM pagination_views)+(SELECT count(*) FROM message_recalls)+(SELECT count(*) FROM outgoing_recalls)+(SELECT count(*) FROM group_mutations)+(SELECT count(*) FROM required_event_consumers)+(SELECT count(*) FROM client_id_reservations)",[],|r|r.get::<_,i64>(0))?>0))? {return Ok(true);}
+         }
+         Ok(false)
+     }
+@@ -372,10 +379,7 @@ impl Store {
+                 "INSERT INTO events VALUES(?1,?2,?3,?4)",
+                 params![seq, kind, serde_json::to_string(data)?, now],
+             )?;
+-            tx.execute(
+-                "DELETE FROM events WHERE sequence < ?1",
+-                [seq.saturating_sub(10_000)],
+-            )?;
++            crate::event_consumers::prune_events(&tx, seq)?;
+             tx.commit()?;
+             Ok(Event {
+                 cursor: seq.to_string(),
+@@ -395,13 +399,23 @@ impl Store {
+         Ok(rows.collect::<rusqlite::Result<_>>()?)
+     })
+     }
+-    pub fn acknowledge(&self, id: &str, consumer: &str, cursor: i64) -> Result<()> {
+-        self.control(id,|db|{
+-        if consumer.is_empty() || consumer.len()>128 || cursor<0 {bail!("invalid consumer acknowledgement");}
+-        let latest:i64=db.query_row("SELECT COALESCE(MAX(sequence),0) FROM events",[],|r|r.get(0))?;
+-        if cursor>latest {bail!("cannot acknowledge a future cursor");}
+-        db.execute("INSERT INTO consumer_offsets VALUES(?1,?2) ON CONFLICT(consumer_id) DO UPDATE SET sequence=MAX(sequence,excluded.sequence)",params![consumer,cursor])?;Ok(())
+-    })
++    pub fn acknowledge(&self, id: &str, consumer: &str, cursor: i64) -> Result<i64> {
++        self.control(id, |db| {
++            if consumer.is_empty() || consumer.len() > 128 || cursor < 0 {
++                bail!("invalid consumer acknowledgement");
++            }
++            let tx = db.transaction()?;
++            let acknowledged = if crate::event_consumers::acknowledge_required(&tx, consumer, cursor)? {
++                tx.query_row("SELECT acknowledged_sequence FROM required_event_consumers WHERE consumer_id=?1", [consumer], |r| r.get(0))?
++            } else {
++                let latest: i64 = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |r| r.get(0))?;
++                if cursor > latest { bail!("invalid future acknowledgement cursor"); }
++                tx.execute("INSERT INTO consumer_offsets VALUES(?1,?2) ON CONFLICT(consumer_id) DO UPDATE SET sequence=MAX(sequence,excluded.sequence)", params![consumer, cursor])?;
++                tx.query_row("SELECT sequence FROM consumer_offsets WHERE consumer_id=?1", [consumer], |r| r.get(0))?
++            };
++            tx.commit()?;
++            Ok(acknowledged)
++        })
+     }
+     pub fn save_operation(&self, op: &Operation) -> Result<()> {
+         self.control(&op.account_id,|db|{
+@@ -409,7 +423,7 @@ impl Store {
+             let changed=tx.execute("INSERT INTO operations VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET state=excluded.state,result_json=excluded.result_json,updated_at=excluded.updated_at WHERE operations.state NOT IN ('cancelled','succeeded','failed','expired','rejected','needs_login','needs_review') OR operations.state=excluded.state",params![op.id,op.kind,op.state,serde_json::to_string(&op.result)?,op.created_at,op.updated_at])?;
+             if changed==1 {
+                 tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('operation.updated',?1,?2)",params![serde_json::to_string(&serde_json::json!({"id":op.id,"state":op.state,"kind":op.kind}))?,op.updated_at])?;
+-                let seq=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
++                let seq=tx.last_insert_rowid();crate::event_consumers::prune_events(&tx, seq)?;
+             }
+             tx.commit()?;Ok(())
+         })
+@@ -481,6 +495,7 @@ impl Store {
+                 let intent = read_send(&tx, account, &id)?;
+                 return Ok((intent, false));
+             }
++            crate::client_ids::check_client_id(&tx, key, client_id)?;
+             let id = uuid::Uuid::new_v4().to_string();
+             let now = chrono::Utc::now().to_rfc3339();
+             tx.execute(
+@@ -496,10 +511,7 @@ impl Store {
+                 ],
+             )?;
+             let seq = tx.last_insert_rowid();
+-            tx.execute(
+-                "DELETE FROM events WHERE sequence<=?1",
+-                [seq.saturating_sub(10_000)],
+-            )?;
++            crate::event_consumers::prune_events(&tx, seq)?;
+             tx.commit()?;
+             Ok((intent, true))
+         })
+@@ -534,7 +546,7 @@ impl Store {
+             tx.execute("UPDATE outbox SET state=?2,server_id=COALESCE(?3,server_id),error_code=?4 WHERE id=?1 AND state!='cancelled'",params![id,state,server_id,error])?;
+             let intent=read_send(&tx,account,id)?;
+             tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('send.updated',?1,?2)",params![serde_json::to_string(&intent)?,chrono::Utc::now().to_rfc3339()])?;
+-            let seq=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
++            let seq=tx.last_insert_rowid();crate::event_consumers::prune_events(&tx, seq)?;
+             tx.commit()?;Ok(intent)
+         })
+     }
+@@ -677,10 +689,7 @@ impl Store {
+                 "INSERT INTO runtime VALUES(?1,?2)",
+                 params![receipt, seq.to_string().as_bytes()],
+             )?;
+-            tx.execute(
+-                "DELETE FROM events WHERE sequence < ?1",
+-                [seq.saturating_sub(10_000)],
+-            )?;
++            crate::event_consumers::prune_events(&tx, seq)?;
+             tx.commit()?;
+             Ok(Some(Event {
+                 cursor: seq.to_string(),
+@@ -1122,7 +1131,7 @@ mod runtime_prefix_tests {
+             .stage_sync("test", "old", b"old sealed commands", b"message cursor")
+             .unwrap();
+         store.control("test", |db| {
+-            db.execute_batch("DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;PRAGMA user_version=7;")?;
++            db.execute_batch("DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;PRAGMA user_version=7;")?;
+             Ok(())
+         }).unwrap();
+         drop(store);
+diff --git a/packages/native-client-rust/crates/wechat-store/src/outbox.rs b/packages/native-client-rust/crates/wechat-store/src/outbox.rs
+index a1cd983..482b8f3 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/outbox.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/outbox.rs
+@@ -10,13 +10,23 @@ pub(super) fn event(tx: &rusqlite::Transaction<'_>, intent: &SendIntent) -> Resu
+         ],
+     )?;
+     let seq = tx.last_insert_rowid();
+-    tx.execute(
+-        "DELETE FROM events WHERE sequence<=?1",
+-        [seq.saturating_sub(10_000)],
+-    )?;
++    crate::event_consumers::prune_events(tx, seq)?;
+     Ok(())
+ }
+ impl Store {
++    /// Enumerate saved receipts needing local interpretation after restart.
++    /// This is a read of operational records, not permission to resubmit.
++    pub fn pending_send_receipt_ids(&self, account: &str, prefix: &str) -> Result<Vec<String>> {
++        anyhow::ensure!(
++            !prefix.is_empty() && prefix.len() <= 128,
++            "invalid receipt prefix"
++        );
++        self.control(account, |db| {
++            let mut query = db.prepare("SELECT o.id FROM outbox o JOIN runtime r ON r.key=?1||o.id WHERE o.state='needs_review' ORDER BY o.created_at,o.id")?;
++            let rows = query.query_map([prefix], |row| row.get(0))?;
++            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
++        })
++    }
+     /// Admit one protected read notification while atomically checking logout.
+     /// An existing receipt must never be replaced by a fresh submission.
+     pub fn begin_read_notification(
+@@ -82,7 +92,7 @@ impl Store {
+             let seq=tx.last_insert_rowid();
+             tx.execute("INSERT INTO runtime VALUES(?1,?2)",params![receipt,seq.to_string().as_bytes()])?;
+             tx.execute("DELETE FROM runtime WHERE key=?1",[pending_key])?;
+-            tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
++            crate::event_consumers::prune_events(&tx, seq)?;
+             tx.commit()?;
+             Ok(())
+         })
+@@ -129,7 +139,12 @@ impl Store {
+         self.control(account,|db|{
+             let tx=db.transaction()?;
+             let changed=tx.execute("UPDATE outbox SET state='submitting' WHERE id=?1 AND state='queued' AND EXISTS(SELECT 1 FROM runtime WHERE key='desired' AND value=CAST('connected' AS BLOB)) AND NOT EXISTS(SELECT 1 FROM runtime WHERE key='logged-out')",[id])?;
+-            if changed==1 {event(&tx,&super::operations::read_send(&tx,account,id)?)?;}
++            if changed==1 {
++                let intent = super::operations::read_send(&tx,account,id)?;
++                let key: String = tx.query_row("SELECT idempotency_key FROM outbox WHERE id=?1", [id], |row| row.get(0))?;
++                crate::client_ids::check_client_id(&tx, &key, &intent.client_id)?;
++                event(&tx,&intent)?;
++            }
+             tx.commit()?;Ok(changed==1)
+         })
+     }
+diff --git a/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs b/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
+index d74bc13..70eb1d8 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
+@@ -40,10 +40,7 @@ fn event(tx: &rusqlite::Transaction<'_>, op: &Operation) -> Result<()> {
+         ],
+     )?;
+     let seq = tx.last_insert_rowid();
+-    tx.execute(
+-        "DELETE FROM events WHERE sequence<=?1",
+-        [seq.saturating_sub(10_000)],
+-    )?;
++    crate::event_consumers::prune_events(tx, seq)?;
+     Ok(())
+ }
+ fn digest(value: &str) -> String {
+@@ -583,7 +580,7 @@ mod tests {
+         store
+             .control("a", |db| {
+                 db.execute_batch(
+-                    "DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;DROP TABLE group_mutations;DROP TABLE recall_keys;DROP TABLE outgoing_recalls;PRAGMA user_version=5;",
++                    "DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;DROP TABLE group_mutations;DROP TABLE recall_keys;DROP TABLE outgoing_recalls;PRAGMA user_version=5;",
+                 )?;
+                 Ok(())
+             })
+diff --git a/packages/native-client-rust/crates/wechat-store/src/recalls.rs b/packages/native-client-rust/crates/wechat-store/src/recalls.rs
+index fda4117..6c5a086 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/recalls.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/recalls.rs
+@@ -216,7 +216,7 @@ impl Store {
+                 if let Some(id)=message_id {data["messageId"]=json!(id);}
+                 if let Some(time)=occurred {data["recalledAt"]=json!(time);}
+                 tx.execute("INSERT INTO events VALUES(?1,'message.recalled',?2,?3)",params![seq,serde_json::to_string(&data)?,now])?;
+-                tx.execute("DELETE FROM events WHERE sequence<?1",[seq.saturating_sub(10_000)])?;
++                crate::event_consumers::prune_events(&tx, seq)?;
+             }
+             crate::outgoing_recall::confirm_recall_in_transaction(&tx, account, thread, server)?;
+             tx.commit()?;
+@@ -457,7 +457,7 @@ mod tests {
+                     |row| row.get::<_, i64>(0)
+                 )?))
+                 .unwrap(),
+-            8
++            9
+         );
+         drop(store);
+         let store = Store::open_existing(&root).unwrap();
+diff --git a/packages/shared/src/native.generated.ts b/packages/shared/src/native.generated.ts
+index fec0b9d..6a02a33 100644
+--- a/packages/shared/src/native.generated.ts
++++ b/packages/shared/src/native.generated.ts
+@@ -2,6 +2,8 @@
+ export const NATIVE_MAX_SOURCE_BYTES = 536870912 as const;
+ export const NATIVE_MAX_ORDINARY_SOURCE_BYTES = 26214383 as const;
+ export const NATIVE_MAX_VIDEO_SOURCE_BYTES = 52428800 as const;
++export type NativeConsumerRegistration = { after: string, };
++export type RequiredEventConsumer = { consumerId: string, required: boolean, registeredAfter: string, acknowledgedCursor: string, deliveredCursor: string, };
+ export type NativeMentions = { state: string, userIds: Array<string>, self: boolean | null, all: boolean | null, source: string | null, };
+ export type NativeQuoteReference = { serverId: string, type: number, state?: string, senderId?: string, direction?: string, appMessageType?: number, embeddedText?: string, embeddedImage?: boolean, embeddedLink?: LinkCard, embeddedSticker?: boolean, };
+ export type LinkCard = { title: string | null, description: string | null, url: string | null, sourceName: string | null, };
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -1325,8 +1325,11 @@
+         {
+             bail!("invalid send request");
+         }
+-        let client_id =
+-            wechat_protocol::wire::client_message_id(format!("{account}:{key}").as_bytes()).max(1);
++        let client_id = self.store.reserve_client_id(
++            account,
++            key,
++            wechat_protocol::wire::client_message_id(format!("{account}:{key}").as_bytes()),
++        )?;
+         let payload = SendPayload {
+             thread_id: destination.into(),
+             text: text.into(),
+diff --git a/.changeset/required-event-consumers.md b/.changeset/required-event-consumers.md
+new file mode 100644
+index 0000000..de4d8d0
+--- /dev/null
++++ b/.changeset/required-event-consumers.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Add registered event consumers that retain events until acknowledged, with restart-safe fetch progress and explicit errors for expired or undelivered cursors. Keep the existing recent-event window for clients that do not register. Reserve outgoing client IDs in the account sidecar and reject cross-request collisions before submission.
+diff --git a/packages/native-client-rust/crates/wechat-store/migrations/account/V009__event_consumers_client_ids.sql b/packages/native-client-rust/crates/wechat-store/migrations/account/V009__event_consumers_client_ids.sql
+new file mode 100644
+index 0000000..b008d27
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/migrations/account/V009__event_consumers_client_ids.sql
+@@ -0,0 +1,12 @@
++CREATE TABLE required_event_consumers(
++    consumer_id TEXT PRIMARY KEY,
++    registered_after INTEGER NOT NULL CHECK(registered_after>=0),
++    acknowledged_sequence INTEGER NOT NULL CHECK(acknowledged_sequence>=registered_after),
++    delivered_sequence INTEGER NOT NULL CHECK(delivered_sequence>=acknowledged_sequence)
++);
++CREATE TABLE client_id_reservations(
++    idempotency_key TEXT PRIMARY KEY,
++    client_id INTEGER NOT NULL UNIQUE CHECK(client_id BETWEEN 1 AND 4294967295)
++);
++CREATE INDEX outbox_client_id ON outbox(client_id);
++PRAGMA user_version=9;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/event_consumers.rs b/packages/native-client-rust/crates/wechat-store/src/event_consumers.rs
+new file mode 100644
+index 0000000..cad8976
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/event_consumers.rs
+@@ -0,0 +1,343 @@
++//! Required event consumers retain operational events until their local ACK.
++//! An ACK means the consumer saved the event; it never marks a chat as read.
++use super::*;
++use rusqlite::OptionalExtension;
++
++#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
++#[serde(rename_all = "camelCase")]
++pub struct RequiredEventConsumer {
++    pub consumer_id: String,
++    pub required: bool,
++    pub registered_after: String,
++    pub acknowledged_cursor: String,
++    pub delivered_cursor: String,
++}
++
++fn validate_name(consumer: &str) -> Result<()> {
++    anyhow::ensure!(
++        !consumer.is_empty()
++            && consumer.len() <= 128
++            && consumer
++                .bytes()
++                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
++        "invalid consumer name"
++    );
++    Ok(())
++}
++
++fn consumer_row(db: &Connection, consumer: &str) -> Result<Option<RequiredEventConsumer>> {
++    Ok(db.query_row(
++        "SELECT registered_after,acknowledged_sequence,delivered_sequence FROM required_event_consumers WHERE consumer_id=?1",
++        [consumer],
++        |r| Ok(RequiredEventConsumer {
++            consumer_id: consumer.into(), required: true,
++            registered_after: r.get::<_, i64>(0)?.to_string(),
++            acknowledged_cursor: r.get::<_, i64>(1)?.to_string(),
++            delivered_cursor: r.get::<_, i64>(2)?.to_string(),
++        }),
++    ).optional()?)
++}
++
++fn check_cursor(db: &Connection, after: i64) -> Result<i64> {
++    anyhow::ensure!(after >= 0, "invalid event cursor");
++    let (first, latest): (Option<i64>, i64) = db.query_row(
++        "SELECT MIN(sequence),COALESCE(MAX(sequence),0) FROM events",
++        [],
++        |r| Ok((r.get(0)?, r.get(1)?)),
++    )?;
++    if first.is_some_and(|first| after < first - 1) {
++        bail!("event_cursor_expired");
++    }
++    anyhow::ensure!(after <= latest, "invalid future event cursor");
++    Ok(latest)
++}
++
++/// Keep the recent window, plus every event not ACKed by every required reader.
++/// Called inside the same write transaction as every event producer.
++pub(crate) fn prune_events(db: &Connection, latest: i64) -> Result<()> {
++    db.execute(
++        "DELETE FROM events WHERE sequence<=MIN(?1,COALESCE((SELECT MIN(acknowledged_sequence) FROM required_event_consumers),?1))",
++        [latest.saturating_sub(10_000)],
++    )?;
++    Ok(())
++}
++
++/// Return false for legacy consumers, whose ACKs do not pin event retention.
++pub(crate) fn acknowledge_required(db: &Connection, consumer: &str, cursor: i64) -> Result<bool> {
++    let Some(current) = consumer_row(db, consumer)? else {
++        return Ok(false);
++    };
++    anyhow::ensure!(cursor >= 0, "invalid consumer acknowledgement");
++    let delivered = current.delivered_cursor.parse::<i64>()?;
++    anyhow::ensure!(cursor <= delivered, "consumer_cursor_not_delivered");
++    // An old retry is harmless; it cannot roll the committed ACK backwards.
++    db.execute(
++        "UPDATE required_event_consumers SET acknowledged_sequence=MAX(acknowledged_sequence,?2) WHERE consumer_id=?1",
++        params![consumer, cursor],
++    )?;
++    let latest = db.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |r| {
++        r.get(0)
++    })?;
++    prune_events(db, latest)?;
++    Ok(true)
++}
++
++impl Store {
++    pub fn register_required_consumer(
++        &self,
++        account: &str,
++        consumer: &str,
++        after: i64,
++    ) -> Result<RequiredEventConsumer> {
++        validate_name(consumer)?;
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            if let Some(current) = consumer_row(&tx, consumer)? {
++                anyhow::ensure!(
++                    current.registered_after == after.to_string(),
++                    "consumer_registration_conflict"
++                );
++                return Ok(current);
++            }
++            check_cursor(&tx, after)?;
++            tx.execute(
++                "INSERT INTO required_event_consumers VALUES(?1,?2,?2,?2)",
++                params![consumer, after],
++            )?;
++            let state = consumer_row(&tx, consumer)?.context("consumer_not_found")?;
++            tx.commit()?;
++            Ok(state)
++        })
++    }
++
++    pub fn required_consumer(
++        &self,
++        account: &str,
++        consumer: &str,
++    ) -> Result<RequiredEventConsumer> {
++        validate_name(consumer)?;
++        self.control(account, |db| {
++            consumer_row(db, consumer)?.context("consumer_not_found")
++        })
++    }
++
++    /// Deliver a contiguous prefix. Requesting beyond the previous delivered
++    /// cursor is refused, so an ACK cannot skip a page that was never offered.
++    pub fn consumer_events(
++        &self,
++        account: &str,
++        consumer: &str,
++        after: Option<i64>,
++        limit: usize,
++    ) -> Result<(Vec<Event>, RequiredEventConsumer)> {
++        validate_name(consumer)?;
++        anyhow::ensure!((1..=200).contains(&limit), "invalid event limit");
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            let current = consumer_row(&tx, consumer)?.context("consumer_not_found")?;
++            let after = after.unwrap_or(current.acknowledged_cursor.parse()?);
++            check_cursor(&tx, after)?;
++            anyhow::ensure!(after >= current.registered_after.parse()?, "invalid cursor before registration");
++            anyhow::ensure!(after <= current.delivered_cursor.parse()?, "consumer_cursor_not_delivered");
++            let items = {
++                let mut query = tx.prepare("SELECT sequence,kind,data_json,created_at FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
++                let rows = query.query_map(params![after, limit as i64], |r| {
++                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
++                })?.collect::<rusqlite::Result<Vec<_>>>()?;
++                rows.into_iter().map(|(seq, kind, raw, created_at)| Ok(Event {
++                    cursor: seq.to_string(), kind, data: serde_json::from_str(&raw)?, created_at,
++                })).collect::<Result<Vec<_>>>()?
++            };
++            if let Some(last) = items.last() {
++                tx.execute("UPDATE required_event_consumers SET delivered_sequence=MAX(delivered_sequence,?2) WHERE consumer_id=?1", params![consumer, last.cursor.parse::<i64>()?])?;
++            }
++            let state = consumer_row(&tx, consumer)?.context("consumer_not_found")?;
++            tx.commit()?;
++            Ok((items, state))
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn fixture() -> (tempfile::TempDir, Store) {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        store.create_account("one").unwrap();
++        (temp, store)
++    }
++
++    fn publish(store: &Store, count: i64) {
++        store.control("one", |db| {
++            let tx = db.transaction()?;
++            for _ in 0..count {
++                tx.execute("INSERT INTO events(kind,data_json,created_at) VALUES('message.committed','{}','synthetic')", [])?;
++                prune_events(&tx, tx.last_insert_rowid())?;
++            }
++            tx.commit()?;
++            Ok(())
++        }).unwrap();
++    }
++
++    fn count(store: &Store) -> i64 {
++        store
++            .control("one", |db| {
++                Ok(db.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)
++            })
++            .unwrap()
++    }
++
++    #[test]
++    fn legacy_consumers_keep_the_window_and_expired_registration_does_not_skip() {
++        let (_temp, store) = fixture();
++        store.acknowledge("one", "legacy", 0).unwrap();
++        publish(&store, 10_020);
++        assert_eq!(count(&store), 10_000);
++        assert_eq!(
++            store.events("one", 0, 1).unwrap_err().to_string(),
++            "event_cursor_expired"
++        );
++        assert_eq!(
++            store
++                .register_required_consumer("one", "required", 0)
++                .unwrap_err()
++                .to_string(),
++            "event_cursor_expired"
++        );
++        assert!(store.required_consumer("one", "required").is_err());
++        assert!(store
++            .register_required_consumer("one", "future", 10_021)
++            .is_err());
++        let state = store
++            .register_required_consumer("one", "required", 10_020)
++            .unwrap();
++        assert_eq!(state.acknowledged_cursor, "10020");
++        assert_eq!(
++            store
++                .register_required_consumer("one", "required", 20)
++                .unwrap_err()
++                .to_string(),
++            "consumer_registration_conflict"
++        );
++    }
++
++    #[test]
++    fn slowest_required_ack_protects_events_across_producers_and_restart() {
++        let (temp, store) = fixture();
++        store.register_required_consumer("one", "slow", 0).unwrap();
++        store.register_required_consumer("one", "fast", 0).unwrap();
++        publish(&store, 10_020);
++        store
++            .append_event("one", "sync.committed", &json!({}))
++            .unwrap();
++        store
++            .create_send("one", "send", "peer", "hash", b"sealed", "17")
++            .unwrap();
++        assert_eq!(count(&store), 10_022);
++        let (page, _) = store.consumer_events("one", "slow", None, 10).unwrap();
++        assert_eq!(page.first().unwrap().cursor, "1");
++        assert_eq!(page.last().unwrap().cursor, "10");
++        assert_eq!(
++            store
++                .acknowledge("one", "slow", 11)
++                .unwrap_err()
++                .to_string(),
++            "consumer_cursor_not_delivered"
++        );
++        assert_eq!(
++            store
++                .consumer_events("one", "slow", Some(11), 1)
++                .unwrap_err()
++                .to_string(),
++            "consumer_cursor_not_delivered"
++        );
++        drop(store);
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        let state = store.required_consumer("one", "slow").unwrap();
++        assert_eq!(state.acknowledged_cursor, "0");
++        assert_eq!(state.delivered_cursor, "10");
++        // A lost response or restart reoffers the page until the local ACK.
++        assert_eq!(
++            store.consumer_events("one", "slow", None, 10).unwrap().0[0].cursor,
++            "1"
++        );
++        let mut after = 0;
++        loop {
++            let (page, _) = store
++                .consumer_events("one", "fast", Some(after), 200)
++                .unwrap();
++            if page.is_empty() {
++                break;
++            }
++            after = page.last().unwrap().cursor.parse().unwrap();
++        }
++        assert_eq!(store.acknowledge("one", "fast", after).unwrap(), 10_022);
++        assert_eq!(count(&store), 10_022);
++        assert_eq!(store.acknowledge("one", "slow", 10).unwrap(), 10);
++        assert_eq!(count(&store), 10_012);
++        assert_eq!(store.acknowledge("one", "slow", 0).unwrap(), 10);
++        assert_eq!(
++            store
++                .required_consumer("one", "slow")
++                .unwrap()
++                .acknowledged_cursor,
++            "10"
++        );
++        assert_eq!(
++            store
++                .register_required_consumer("one", "slow", 0)
++                .unwrap()
++                .acknowledged_cursor,
++            "10"
++        );
++        assert_eq!(
++            store.consumer_events("one", "slow", None, 1).unwrap().0[0].cursor,
++            "11"
++        );
++    }
++
++    #[test]
++    fn failed_fetch_and_ack_leave_progress_and_retention_unchanged() {
++        let (_temp, store) = fixture();
++        store
++            .register_required_consumer("one", "required", 0)
++            .unwrap();
++        publish(&store, 10_002);
++        store.control("one", |db| {
++            db.execute_batch("CREATE TRIGGER reject_consumer_update BEFORE UPDATE ON required_event_consumers BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;")?;
++            Ok(())
++        }).unwrap();
++        assert!(store.consumer_events("one", "required", None, 2).is_err());
++        assert_eq!(
++            store
++                .required_consumer("one", "required")
++                .unwrap()
++                .delivered_cursor,
++            "0"
++        );
++        assert!(store.acknowledge("one", "required", 1).is_err());
++        store
++            .control("one", |db| {
++                db.execute_batch("DROP TRIGGER reject_consumer_update;")?;
++                Ok(())
++            })
++            .unwrap();
++        store.consumer_events("one", "required", None, 2).unwrap();
++        store.control("one", |db| {
++            db.execute_batch("CREATE TRIGGER reject_prune BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;")?;
++            Ok(())
++        }).unwrap();
++        assert!(store.acknowledge("one", "required", 2).is_err());
++        assert_eq!(
++            store
++                .required_consumer("one", "required")
++                .unwrap()
++                .acknowledged_cursor,
++            "0"
++        );
++        assert_eq!(count(&store), 10_002);
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/client_ids.rs b/packages/native-client-rust/crates/wechat-store/src/client_ids.rs
+new file mode 100644
+index 0000000..d4a7d4a
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/client_ids.rs
+@@ -0,0 +1,179 @@
++//! Reserve the existing wire-format u32 ID before sealing an outgoing intent.
++use super::*;
++use rusqlite::OptionalExtension;
++
++pub(crate) fn check_client_id(db: &Connection, key: &str, client_id: &str) -> Result<()> {
++    let conflict: bool = db.query_row(
++        "SELECT EXISTS(SELECT 1 FROM outbox WHERE client_id=?1 AND idempotency_key<>?2)",
++        params![client_id, key],
++        |r| r.get(0),
++    )?;
++    anyhow::ensure!(!conflict, "client_id_conflict");
++    // Also protect a reservation that has not reached outbox insertion yet.
++    let conflict: bool = db.query_row(
++        "SELECT EXISTS(SELECT 1 FROM client_id_reservations WHERE client_id=?1 AND idempotency_key<>?2) OR EXISTS(SELECT 1 FROM client_id_reservations WHERE idempotency_key=?2 AND client_id<>?1)",
++        params![client_id, key], |r| r.get(0),
++    )?;
++    anyhow::ensure!(!conflict, "client_id_conflict");
++    Ok(())
++}
++
++impl Store {
++    pub fn reserve_client_id(&self, account: &str, key: &str, preferred: u32) -> Result<u32> {
++        anyhow::ensure!(!key.is_empty() && key.len() <= 200, "invalid send intent");
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            if let Some(id) = tx.query_row("SELECT client_id FROM outbox WHERE idempotency_key=?1", [key], |r| r.get::<_, String>(0)).optional()? {
++                let id: u32 = id.parse().context("invalid saved client ID")?;
++                anyhow::ensure!(id != 0, "invalid saved client ID");
++                check_client_id(&tx, key, &id.to_string())?;
++                return Ok(id);
++            }
++            if let Some(id) = tx.query_row("SELECT client_id FROM client_id_reservations WHERE idempotency_key=?1", [key], |r| r.get::<_, u32>(0)).optional()? {
++                return Ok(id);
++            }
++            let mut candidate = preferred.max(1);
++            // A bounded search fails explicitly, never reuses an existing ID.
++            for _ in 0..1024 {
++                let occupied: bool = tx.query_row(
++                    "SELECT EXISTS(SELECT 1 FROM client_id_reservations WHERE client_id=?1) OR EXISTS(SELECT 1 FROM outbox WHERE client_id=?2)",
++                    params![candidate, candidate.to_string()], |r| r.get(0),
++                )?;
++                if !occupied {
++                    tx.execute("INSERT INTO client_id_reservations VALUES(?1,?2)", params![key, candidate])?;
++                    tx.commit()?;
++                    return Ok(candidate);
++                }
++                candidate = candidate.checked_add(1).unwrap_or(1);
++            }
++            bail!("client_id_allocation_exhausted")
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn collisions_have_distinct_persisted_ids_and_key_replay_is_stable() {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        store.create_account("one").unwrap();
++        assert_eq!(store.reserve_client_id("one", "first", 7).unwrap(), 7);
++        assert_eq!(store.reserve_client_id("one", "second", 7).unwrap(), 8);
++        assert_eq!(store.reserve_client_id("one", "first", 99).unwrap(), 7);
++        store
++            .create_send("one", "first", "peer", "hash", b"sealed", "7")
++            .unwrap();
++        assert_eq!(
++            store
++                .create_send("one", "third", "peer", "hash", b"sealed", "7")
++                .unwrap_err()
++                .to_string(),
++            "client_id_conflict"
++        );
++        assert_eq!(
++            store
++                .create_send("one", "second", "peer", "hash", b"sealed", "9")
++                .unwrap_err()
++                .to_string(),
++            "client_id_conflict"
++        );
++        assert_eq!(
++            store
++                .create_send("one", "third", "peer", "hash", b"sealed", "8")
++                .unwrap_err()
++                .to_string(),
++            "client_id_conflict"
++        );
++        drop(store);
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        assert_eq!(store.reserve_client_id("one", "first", 99).unwrap(), 7);
++        assert_eq!(store.reserve_client_id("one", "second", 99).unwrap(), 8);
++        assert_eq!(store.reserve_client_id("one", "third", 7).unwrap(), 9);
++    }
++
++    #[test]
++    fn existing_outbox_ids_and_wraparound_are_not_reused() {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        store.create_account("one").unwrap();
++        store
++            .create_send("one", "legacy", "peer", "hash", b"sealed", "4294967295")
++            .unwrap();
++        assert_eq!(store.reserve_client_id("one", "new", u32::MAX).unwrap(), 1);
++        assert_eq!(store.reserve_client_id("one", "next", 0).unwrap(), 2);
++        store
++            .control("one", |db| {
++                db.execute(
++                    "UPDATE outbox SET client_id='1' WHERE idempotency_key='legacy'",
++                    [],
++                )?;
++                Ok(())
++            })
++            .unwrap();
++        assert_eq!(
++            store
++                .reserve_client_id("one", "legacy", 5)
++                .unwrap_err()
++                .to_string(),
++            "client_id_conflict"
++        );
++    }
++
++    #[test]
++    fn concurrent_reservations_cannot_share_a_client_id() {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&temp.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        let handles: Vec<_> = (0..12)
++            .map(|index| {
++                let store = store.clone();
++                std::thread::spawn(move || {
++                    store
++                        .reserve_client_id("one", &format!("request-{index}"), 23)
++                        .unwrap()
++                })
++            })
++            .collect();
++        let ids: std::collections::BTreeSet<_> = handles
++            .into_iter()
++            .map(|thread| thread.join().unwrap())
++            .collect();
++        assert_eq!(ids.len(), 12);
++    }
++
++    #[test]
++    fn legacy_collisions_cannot_be_claimed_after_restart() {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        store.create_account("one").unwrap();
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        let (first, _) = store
++            .create_send("one", "first", "peer", "hash", b"sealed", "7")
++            .unwrap();
++        let (second, _) = store
++            .create_send("one", "second", "peer", "hash", b"sealed", "8")
++            .unwrap();
++        store
++            .control("one", |db| {
++                db.execute(
++                    "UPDATE outbox SET client_id='7' WHERE idempotency_key='second'",
++                    [],
++                )?;
++                Ok(())
++            })
++            .unwrap();
++        drop(store);
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        for id in [&first.id, &second.id] {
++            assert_eq!(
++                store.claim_send("one", id).unwrap_err().to_string(),
++                "client_id_conflict"
++            );
++            assert_eq!(store.send("one", id).unwrap().state, "queued");
++        }
++        assert_eq!(store.events("one", 0, 100).unwrap().len(), 2);
++    }
++}

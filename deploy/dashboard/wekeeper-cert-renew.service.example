@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew WeKeeper public IP certificate
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/WeKeeper/deploy/dashboard
+ExecStart=/bin/sh /path/to/WeKeeper/deploy/dashboard/renew.sh

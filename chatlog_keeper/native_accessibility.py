@@ -55,7 +55,7 @@ def context():
     return process, Atspi, matches[0]
 
 
-def walk(root, maximum=8000, depth_limit=30):
+def walk(root, maximum=8000, depth_limit=30, *, prune=None):
     # Qt updates the AT-SPI tree asynchronously after navigation. Dispatch its
     # events before observing the next state, without a second GUI main loop.
     from gi.repository import GLib
@@ -70,6 +70,8 @@ def walk(root, maximum=8000, depth_limit=30):
         count += 1
         try:
             yield node, path
+            if prune is not None and prune(node, path):
+                continue
             if depth < depth_limit:
                 for index in range(min(node.get_child_count(), 200)):
                     queue.append((node.get_child_at_index(index), path + (index,), depth + 1))
@@ -104,12 +106,132 @@ def snapshot(root, Atspi, maximum=250):
     return items
 
 
-def _click(process, node, Atspi, button=1, *, voice_bubble=False):
+class ClickSession:
+    """One task's X11 connection; ownership/geometry are still reread per click."""
+
+    def __init__(self):
+        self.connection = None
+        self.timings = {}
+
+    def get(self):
+        if self.connection is None:
+            started = time.monotonic()
+            try:
+                self.connection = _open_click_connection()
+            finally:
+                self.timings['x11_seconds'] = self.timings.get('x11_seconds', 0) + time.monotonic() - started
+        return self.connection
+
+    def close(self):
+        if self.connection is not None:
+            x, display = self.connection
+            self.connection = None
+            x.XCloseDisplay(display)
+
+
+def _open_click_connection():
+    x = C.CDLL(C.util.find_library('X11'))
+    D, U, W = C.c_void_p, C.c_ulong, C.c_ulong
+    x.XOpenDisplay.argtypes = [C.c_char_p]; x.XOpenDisplay.restype = D
+    x.XDefaultRootWindow.argtypes = [D]; x.XDefaultRootWindow.restype = W
+    x.XInternAtom.argtypes = [D, C.c_char_p, C.c_int]; x.XInternAtom.restype = U
+    x.XGetWindowProperty.argtypes = [D, W, U, C.c_long, C.c_long, C.c_int, U, C.POINTER(U), C.POINTER(C.c_int), C.POINTER(U), C.POINTER(U), C.POINTER(C.c_void_p)]
+    x.XQueryTree.argtypes = [D, W, C.POINTER(W), C.POINTER(W), C.POINTER(C.POINTER(W)), C.POINTER(C.c_uint)]
+    x.XTranslateCoordinates.argtypes = [D, W, W, C.c_int, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(W)]
+    x.XGetGeometry.argtypes = [D, W, C.POINTER(W), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint)]
+    x.XFree.argtypes = [C.c_void_p]; x.XCloseDisplay.argtypes = [D]; x.XFlush.argtypes = [D]
+    display = x.XOpenDisplay(os.environ['DISPLAY'].encode())
+    if not display:
+        raise NativeUnavailable('native_display_unavailable')
+    x.XGetInputFocus.argtypes = [D, C.POINTER(W), C.POINTER(C.c_int)]
+    x.XSync.argtypes = [D, C.c_int]
+    return x, display
+
+
+def _focus_window(x, display, window, *, clock=time.monotonic, wait=time.sleep):
+    """Wait for observed focus, never assume a fixed sleep made focus safe."""
+    focused, reverted = C.c_ulong(), C.c_int()
+    def ready():
+        return bool(x.XGetInputFocus(display, C.byref(focused), C.byref(reverted))) and focused.value == window
+    if ready():
+        return
+    x.XRaiseWindow.argtypes = [C.c_void_p, C.c_ulong]
+    x.XSetInputFocus.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_ulong]
+    x.XRaiseWindow(display, window)
+    x.XSetInputFocus(display, window, 2, 0)
+    x.XFlush(display)
+    deadline = clock() + .15
+    while True:
+        x.XSync(display, 0)
+        if ready():
+            return
+        if clock() >= deadline:
+            raise NativeUnavailable('native_focus_unverified')
+        wait(.005)
+
+
+_BUBBLE_BGR_RUNS = {
+    color: re.compile(re.escape(color) + b'(?:.' + re.escape(color) + b')*', re.DOTALL)
+    for color in (b'\xf0\xee\xee', b'\x9f\xf2\x9d')
+}
+
+
+def _pixel_color_extent(raw, width, height, stride, scan_top, start_x, end_x, color):
+    """Count exact reviewed BGR pixels and bounds without a Python pixel list.
+
+    A run ends at its last three BGR bytes, before the final alpha byte. Both
+    reviewed colors have no overlapping three-byte occurrences; an unaligned
+    run therefore cannot consume a later aligned match. Check alignment before
+    accepting each run. Alpha is deliberately unconstrained, including newline.
+    Each row/half is independently bounded, so padding and clipped bytes cannot
+    contribute a pixel or join two runs.
+    """
+    if (not isinstance(raw, (bytes, bytearray))
+            or any(type(value) is not int for value in (width, height, stride, scan_top, start_x, end_x))
+            or width < 1 or height < 1 or stride < width * 4 or len(raw) < stride * height
+            or not 0 <= scan_top <= height or not 0 <= start_x <= end_x <= width
+            or not isinstance(color, bytes) or color not in _BUBBLE_BGR_RUNS):
+        raise NativeUnavailable('native_voice_pixel_format_changed')
+    count, min_x, max_x, min_y, max_y = 0, width, -1, height, -1
+    pattern = _BUBBLE_BGR_RUNS[color]
+    for y in range(scan_top, height):
+        row = y * stride
+        for match in pattern.finditer(raw, row + start_x * 4, row + end_x * 4):
+            offset = match.start() - row
+            if offset % 4:
+                continue
+            pixels = (match.end() - match.start() + 1) // 4
+            x = offset // 4
+            count += pixels
+            min_x, max_x = min(min_x, x), max(max_x, x + pixels - 1)
+            min_y, max_y = min(min_y, y), y
+    return count, (min_x, max_x, min_y, max_y) if count else None
+
+
+def _right_palette_bgr(raw, width, height, stride, scan_top):
+    """Keep diagnostic colors/counts and first-seen tie ordering unchanged."""
+    from collections import Counter
+    colors = Counter()
+    for y in range(scan_top, height):
+        start, end = y * stride + width // 2 * 4, y * stride + width * 4
+        colors.update(zip(raw[start:end:4], raw[start + 1:end:4], raw[start + 2:end:4]))
+    return [(bytes(color).hex(), count) for color, count in colors.most_common(4)]
+
+
+def _click(process, node, Atspi, button=1, *, voice_bubble=False, text_bubble=False, quote_bubble=False, _probe_only=False, _session=None, _before_click=None, _verify_click=None, _physical_wheel=False):
+    if _physical_wheel and (button not in {4, 5} or voice_bubble or text_bubble or quote_bubble or _probe_only or _before_click):
+        raise NativeUnavailable('native_physical_wheel_forbidden')
+    if quote_bubble and not (_probe_only and text_bubble):
+        raise NativeUnavailable('native_readonly_quote_probe_forbidden')
+    if _probe_only and not text_bubble:
+        raise NativeUnavailable('native_readonly_probe_forbidden')
     if button not in {1, 3, 4, 5} or not showing(node, Atspi):
         raise NativeUnavailable('native_control_not_visible')
     if 'EditableText' in node.get_interfaces():
         raise NativeUnavailable('native_editable_control_forbidden')
     rectangle = node.get_component_iface().get_extents(Atspi.CoordType.SCREEN)
+    original_name = node.get_name() if text_bubble else None
+    original_rectangle = tuple(getattr(rectangle, key) for key in ('x', 'y', 'width', 'height'))
     if not 1 <= rectangle.width <= 10000 or not 1 <= rectangle.height <= 10000:
         raise NativeUnavailable('native_control_geometry_invalid')
     ancestor = node
@@ -127,19 +249,10 @@ def _click(process, node, Atspi, button=1, *, voice_bubble=False):
     if right <= left or bottom <= top:
         raise NativeUnavailable('native_control_clipped')
     gx, gy = (left + right) // 2, (top + bottom) // 2
-    x = C.CDLL(C.util.find_library('X11'))
+    owns_session = _session is None
+    session = _session if _session is not None else ClickSession()
+    x, display = session.get()
     D, U, W = C.c_void_p, C.c_ulong, C.c_ulong
-    x.XOpenDisplay.argtypes = [C.c_char_p]; x.XOpenDisplay.restype = D
-    x.XDefaultRootWindow.argtypes = [D]; x.XDefaultRootWindow.restype = W
-    x.XInternAtom.argtypes = [D, C.c_char_p, C.c_int]; x.XInternAtom.restype = U
-    x.XGetWindowProperty.argtypes = [D, W, U, C.c_long, C.c_long, C.c_int, U, C.POINTER(U), C.POINTER(C.c_int), C.POINTER(U), C.POINTER(U), C.POINTER(C.c_void_p)]
-    x.XQueryTree.argtypes = [D, W, C.POINTER(W), C.POINTER(W), C.POINTER(C.POINTER(W)), C.POINTER(C.c_uint)]
-    x.XTranslateCoordinates.argtypes = [D, W, W, C.c_int, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(W)]
-    x.XGetGeometry.argtypes = [D, W, C.POINTER(W), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint)]
-    x.XFree.argtypes = [C.c_void_p]; x.XCloseDisplay.argtypes = [D]; x.XFlush.argtypes = [D]
-    display = x.XOpenDisplay(os.environ['DISPLAY'].encode())
-    if not display:
-        raise NativeUnavailable('native_display_unavailable')
     try:
         root = x.XDefaultRootWindow(display)
         def prop(window, name):
@@ -162,8 +275,8 @@ def _click(process, node, Atspi, button=1, *, voice_bubble=False):
                     x.XFree(children)
         candidates = []
         for window in windows:
-            owner = prop(window, '_NET_WM_PID')
-            if not owner or owner[0] != process['pid']:
+            window_owner = prop(window, '_NET_WM_PID')
+            if not window_owner or window_owner[0] != process['pid']:
                 continue
             rw, px, py, width, height, border, depth = W(), C.c_int(), C.c_int(), C.c_uint(), C.c_uint(), C.c_uint(), C.c_uint()
             if not x.XGetGeometry(display, window, C.byref(rw), C.byref(px), C.byref(py), C.byref(width), C.byref(height), C.byref(border), C.byref(depth)):
@@ -181,9 +294,13 @@ def _click(process, node, Atspi, button=1, *, voice_bubble=False):
         if not candidates:
             raise NativeUnavailable('native_control_outside_verified_window')
         _, window, lx, ly = min(candidates)
-        if voice_bubble:
-            if button != 3 or not re.fullmatch(r'Audio\d+"sec(?: \d{2}:\d{2}|Unplayed)?', node.get_name() or ''):
+        if voice_bubble or text_bubble:
+            if (voice_bubble and text_bubble) or button != 3:
+                raise NativeUnavailable('native_message_control_changed')
+            if voice_bubble and not re.fullmatch(r'Audio\d+"sec(?: \d{2}:\d{2}|Unplayed)?', node.get_name() or ''):
                 raise NativeUnavailable('native_voice_control_changed')
+            if text_bubble and (node.get_role_name() != 'list item' or not (node.get_name() or '').strip()):
+                raise NativeUnavailable('native_text_control_changed')
             # This build exposes each history row as one accessible leaf. Find
             # its visible voice bubble by its reviewed native background color;
             # no text recognition or guessed fixed screen coordinate is used.
@@ -206,38 +323,118 @@ def _click(process, node, Atspi, button=1, *, voice_bubble=False):
                 if pic.bits_per_pixel != 32 or pic.byte_order != 0 or pic.red_mask != 0xff0000:
                     raise NativeUnavailable('native_voice_pixel_format_changed')
                 raw = C.string_at(pic.data, pic.bytes_per_line * pic.height)
-                points = [(cx, cy) for cy in range(pic.height // 3, pic.height)
-                          for cx in range(pic.width // 2)
-                          if raw[cy * pic.bytes_per_line + cx * 4:cy * pic.bytes_per_line + cx * 4 + 3] == b'\xf0\xee\xee']
-                if len(points) < 700:
+                # Quote rows put the message bubble above the quoted-text
+                # footer. Inspect the complete reviewed row only for this
+                # read-only proof; ordinary clicking keeps its original crop.
+                scan_top = 0 if quote_bubble else pic.height // 3
+                count, box = _pixel_color_extent(raw, pic.width, pic.height, pic.bytes_per_line,
+                    scan_top, 0, pic.width // 2, b'\xf0\xee\xee')
+                if _probe_only:
+                    left = None
+                    if count >= 700:
+                        if 40 <= box[0] < box[1] and 50 <= box[1]-box[0] <= 400 and 25 <= box[3]-box[2] <= 65:
+                            left = box
+                    right_count, box = _pixel_color_extent(raw, pic.width, pic.height, pic.bytes_per_line,
+                        scan_top, pic.width // 2, pic.width, b'\x9f\xf2\x9d')
+                    right = None
+                    if right_count >= 700:
+                        if 40 <= pic.width-1-box[1] and 50 <= box[1]-box[0] <= 400 and 25 <= box[3]-box[2] <= 65:
+                            right = box
+                    return {'incoming_gray_bounds': left,
+                            'outgoing_green_bounds': right,
+                            'right_palette_bgr': _right_palette_bgr(raw, pic.width, pic.height,
+                                pic.bytes_per_line, scan_top)}
+                if count < 700:
                     raise NativeUnavailable('native_voice_bubble_not_unique')
-                xs, ys = zip(*points)
-                x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+                x0, x1, y0, y1 = box
                 if not (40 <= x0 < x1 and 50 <= x1-x0 <= 400 and 25 <= y1-y0 <= 65):
                     raise NativeUnavailable('native_voice_bubble_shape_changed')
                 lx, ly = rx + (x0+x1)//2, ry + (y0+y1)//2
                 gx, gy = frame.x + lx, frame.y + ly
             finally:
                 x.XDestroyImage(pixels)
-        x.XRaiseWindow.argtypes = [D, W]
-        x.XSetInputFocus.argtypes = [D, W, C.c_int, U]
         if node.get_role_name() != 'menu item':
-            x.XRaiseWindow(display, window)
-            x.XSetInputFocus(display, window, 2, 0)
-            x.XFlush(display)
-            time.sleep(0.15)
+            focus_started = time.monotonic()
+            try:
+                _focus_window(x, display, window)
+            finally:
+                session.timings['focus_seconds'] = session.timings.get('focus_seconds', 0) + time.monotonic() - focus_started
+        if _verify_click is not None:
+            _verify_click()
+        # Focus acquisition and final state verification may have dispatched
+        # Qt updates. Recheck geometry after both, before the attempted flag.
+        current = node.get_component_iface().get_extents(Atspi.CoordType.SCREEN)
+        if (not showing(node, Atspi)
+                or tuple(getattr(current, key) for key in ('x', 'y', 'width', 'height')) != original_rectangle
+                or (text_bubble and node.get_name() != original_name)):
+            raise NativeUnavailable('native_control_changed_before_click')
+        if _physical_wheel:
+            # Wheel input follows the actual pointer. The ordinary fixed-window
+            # click path above remains unchanged; this narrow route cannot
+            # activate a button, type text or open a message's context menu.
+            library = C.util.find_library('Xtst')
+            if not library:
+                raise NativeUnavailable('native_wheel_unavailable')
+            test = C.CDLL(library)
+            test.XTestFakeMotionEvent.argtypes = [D, C.c_int, C.c_int, C.c_int, U]
+            test.XTestFakeButtonEvent.argtypes = [D, C.c_uint, C.c_int, U]
+            if not test.XTestFakeMotionEvent(display, -1, gx, gy, 0):
+                raise NativeUnavailable('native_wheel_unavailable')
+            x.XSync(display, 0)
+            # A different top-level popup/window must not receive global input.
+            x.XQueryPointer.argtypes = [D, W, C.POINTER(W), C.POINTER(W),
+                C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_uint)]
+            def pointer_verified():
+                pointer_window = root
+                for _ in range(32):
+                    if pointer_window == window:
+                        return True
+                    query_root, child, root_x, root_y = W(), W(), C.c_int(), C.c_int()
+                    local_x, local_y, mask = C.c_int(), C.c_int(), C.c_uint()
+                    if not x.XQueryPointer(display, pointer_window, C.byref(query_root), C.byref(child),
+                            C.byref(root_x), C.byref(root_y), C.byref(local_x), C.byref(local_y), C.byref(mask)) or not child.value:
+                        return False
+                    pointer_window = child.value
+                return False
+            if not pointer_verified():
+                raise NativeUnavailable('native_wheel_pointer_not_verified')
+            if _verify_click is not None:
+                _verify_click()  # Pointer motion may dispatch hover/UI changes.
+            current = node.get_component_iface().get_extents(Atspi.CoordType.SCREEN)
+            if (not showing(node, Atspi)
+                    or tuple(getattr(current, key) for key in ('x', 'y', 'width', 'height')) != original_rectangle):
+                raise NativeUnavailable('native_control_changed_before_click')
+            if not pointer_verified():
+                raise NativeUnavailable('native_wheel_pointer_not_verified')
+            release_needed = False
+            try:
+                # A timeout can interrupt the C call after the event was sent.
+                release_needed = True
+                if not test.XTestFakeButtonEvent(display, button, 1, 0):
+                    raise NativeUnavailable('native_wheel_unavailable')
+            finally:
+                if release_needed:
+                    try:
+                        if not test.XTestFakeButtonEvent(display, button, 0, 0):
+                            raise NativeUnavailable('native_wheel_unavailable')
+                    finally:
+                        x.XSync(display, 0)
+            return
         class Button(C.Structure):
             _fields_ = [('type', C.c_int), ('serial', U), ('send_event', C.c_int), ('display', D), ('window', W), ('root', W), ('subwindow', W), ('time', U), ('x', C.c_int), ('y', C.c_int), ('x_root', C.c_int), ('y_root', C.c_int), ('state', C.c_uint), ('button', C.c_uint), ('same_screen', C.c_int)]
         class Event(C.Union):
             _fields_ = [('button', Button), ('pad', C.c_long * 24)]
         x.XSendEvent.argtypes = [D, W, C.c_int, C.c_long, C.POINTER(Event)]
         state = {1: 256, 3: 1024, 4: 2048, 5: 4096}[button]
+        if _before_click is not None:
+            _before_click()
         for event_type, event_state in ((4, 0), (5, state)):
             event = Event(); event.button = Button(event_type, 0, 1, display, window, root, 0, 0, lx, ly, gx, gy, event_state, button, 1)
             x.XSendEvent(display, window, 1, 4 if event_type == 4 else 8, C.byref(event))
         x.XFlush(display)
     finally:
-        x.XCloseDisplay(display)
+        if owns_session:
+            session.close()
 
 
 def select_chat(process, root, Atspi, name):

@@ -1,129 +1,115 @@
 # WeKeeper
 
-**Local WeChat archiving for AI agents · 面向 AI Agent 的本地微信归档**
+**微信群消息同步、私人 AI 对话与协议群机器人。**
 
-[English](README.md) · [简体中文](README_zh.md)
+[English](README.md) · [简体中文](README_zh.md) · [MIT](LICENSE)
 
-![Linux](https://img.shields.io/badge/platform-Linux-blue)
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-[![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://github.com/RethinkCraft/WeKeeper/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RethinkCraft/WeKeeper/actions/workflows/ci.yml)
+项目分为两个可独立运行的板块：
 
-WeKeeper 在 Linux 上持续归档本机已同步的微信群消息及已缓存媒体。
-本地 MCP 服务器让 Codex 检索讨论、追溯引用、查看图片并读取文档正文。
-采集器独立于 Agent 运行，保持一个采集器、一个 SQLite 归档和一层 stdio MCP。
+| 板块 | 功能 |
+|---|---|
+| 云端看板与消息同步 | 将选定群的文字、头像缩略图同步到自有服务器，提供搜索、统计、告警、私人 AI 问答及用量记录。 |
+| 群机器人 | 通过本机协议网关接收真实 @，使用限定权限的业务 MCP 查询或报备状态，再引用触发消息回复。 |
 
-## 功能与当前状态
+共享底座包括本地 SQLite 归档、缓存媒体读取和十五工具的 stdio MCP。机器人统一使用协议网关收发。定时群聊自动总结、旧版 UI 机器人及 pilot 镜像已退出；仍可在私人对话中主动要求 AI 总结指定讨论。
 
-当前基线：**0.5.0**，归档 schema **4**。已实测 Ubuntu 26.04 x86_64、
-Python 3.11.15 和官方 Linux 微信 4.1.13.26；其他客户端构建需要兼容性核验。
+## 环境与兼容
 
-| 能力 | 已提供行为 | 边界 |
-|---|---|---|
-| 群聊归档 | 历史回填、增量采集、新群发现和停机补读 | 只能归档本机实际同步过的历史 |
-| 搜索与上下文 | 关键词、发送者、类型及时间筛选；引用、合并转发和精确统计 | 明确群 ID 和时间范围，结果附覆盖信息 |
-| 图片 | 真实图片像素、尺寸、缓存质量及离线副本 | 仅处理已缓存且能验证关联的内容 |
-| 文件与文档 | 本地附件，以及分页 PDF、DOCX、XLSX、CSV、文本和惰性 HTML 正文 | 受支持格式及已归档字节，真实样本覆盖仍有差异 |
-| 资料与卡片 | 缓存头像、已观察成员、本地卡片字段及有序笔记组件 | 缺缓存和未实测 Linux 类型均明确标记 |
-| 语音 | 原始 SILK 归档、已有微信转字及显式原生转字请求 | 原生操作受验收开关控制，未经验证的安装默认禁用 |
-| 健康检测 | 客户端／会话证据、近期收取证据及本机桌面提醒 | 采集器运行不代表微信正在收消息 |
+当前版本 **0.7.0**，需要 Linux、Python **3.11+**；前端使用 Node **22** 构建。原生协议网关使用独立固定的 Rust 工具链及补丁链，见 [upstream.lock.json](deploy/protocol-gateway/upstream.lock.json)。
 
-**已知限制：**原生转字目前限已验证客户端中当天、可见且能够唯一定位的语音，
-操作前必须证明当前音频缓存仍然存在。真实笔记图片和 HTML 附件尚未可靠关联缓存，
-目前可读取笔记结构及文字。暂不提供 OCR、视频处理、朋友圈或未缓存媒体下载。
+已有归档 schema **4、5** 均按原版本读写，新建归档为 schema 5；云端看板为 schema **3**。Python 包名 `chatlog_keeper`、发行名 `chatlog-keeper`、三个 CLI 和 MCP 名称 `wechat-archive` 保持稳定。
 
-## 架构概览
+官方客户端归档读取的已验证环境为 Ubuntu 26.04 x86_64、Linux 微信 4.1.13.26。协议收发与固定网关版本绑定；离线测试通过不代表其他客户端兼容或手机端收件验收通过。
+
+## 架构
 
 ```mermaid
 flowchart LR
-    W[微信本地数据库与缓存] --> C[采集器]
-    C --> A[(SQLite 归档与媒体副本)]
-    A --> M[本地 stdio MCP]
-    M --> X[Codex]
+    G[本机协议网关] --> B[机器人与业务 MCP]
+    B --> G
+    G --> P[归档桥接]
+    P --> A[(本地归档)]
+    A --> M[归档 MCP]
+    A --> S[向外同步]
+    S --> D[云端看板]
+    D -->|私人问题任务| Q[本机 AI worker]
+    Q -->|答案和用量| D
+    D -->|配置| B
+    B -->|状态和用量| D
 ```
 
-普通查询只读取归档。可选的原生语音任务使用独立、受限的子进程，
-只有明确请求并通过本机验收后才会启动。模块职责和数据边界见[架构说明](docs/architecture.md)。
+归档、同步、私人问答及机器人分别维护队列。云端暂时不可用时，协议网关继续接收消息。模型凭据和普通聊天媒体留在本机；被选中的分析文本会发送给配置的模型供应商。
 
-## 快速开始
-
-需要 Linux 和 Python 3.11 以上；首次取密钥还需要 C 编译器及带 Python 支持的 GDB。
-系统依赖与客户端兼容范围见[安装说明](docs/installation.md)。
+## 安装
 
 ```bash
 git clone https://github.com/RethinkCraft/WeKeeper.git
 cd WeKeeper
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[mcp]'
+. .venv/bin/activate
+python -m pip install -e '.[mcp,web,bot]'
 export CHATLOG_KEEPER_DATA_DIR="$HOME/.local/share/wekeeper"
-chatlog-keeper probe
 ```
 
-私有状态目录放在仓库外。首次登录生成本地数据库后，正常退出微信，再明确执行下方初始化命令；
-该命令可能启动微信进行密钥捕获，需要你自行完成登录确认。采集器和 MCP 不会自动取密钥。
+私有状态应放在版本控制之外。官方客户端归档初始化和缓存密钥准备见 [安装说明](docs/installation.md)。官方客户端采集与协议归档桥接是两种接入方式，按部署选择，账号及归档写入保持单一所有者。
+
+## 看板、同步与 AI 问答
 
 ```bash
-chatlog-keeper extract-key
-# 可选的图片初始化，所需图片应已缓存到本机：
-chatlog-keeper image-key
-chatlog-keeper collect --state-dir "$CHATLOG_KEEPER_DATA_DIR" --once
+wekeeper-dashboard --archive-state "$CHATLOG_KEEPER_DATA_DIR" groups
+wekeeper-dashboard --archive-state "$CHATLOG_KEEPER_DATA_DIR" configure \
+  --server-url https://YOUR_SERVER/wekeeper \
+  --group group_REFERENCE --token-file /protected/machine-token
+wekeeper-dashboard --archive-state "$CHATLOG_KEEPER_DATA_DIR" sync --once
 ```
 
-单轮采集可能尚未完成历史回填。持续采集可在独立终端运行下方命令，
-或安装[用户服务示例](deploy/wechat-archive-collector.service.example)。同一状态目录只运行一个采集器。
+依照 [看板部署说明](docs/dashboard.md) 启动云端，再运行本机 `sync` 与 `agent` 服务。私人问答复用独立保存在本机的 Sign in with ChatGPT 授权；看板登录与此授权相互独立。头像补全和官方 Codex 额度采样保留原有功能边界。
+
+项目不再运行定时总结。旧版总结服务及数据清理步骤见 [升级说明](docs/upgrading.md)。
+
+## 协议群机器人
 
 ```bash
-chatlog-keeper collect --state-dir "$CHATLOG_KEEPER_DATA_DIR" --interval 30
+python scripts/setup_protocol_gateway.py --verify-lock
+# 安装固定 Rust 工具链后再构建：
+python scripts/setup_protocol_gateway.py --build
 ```
 
-在仓库目录的另一个终端中设置相同状态目录，然后注册本地 MCP：
+按 [机器人运行说明](docs/bot.md) 和 [协议网关说明](docs/protocol-gateway.md) 设置网关、账号、群绑定、模型与业务权限。`wekeeper-bot check` 只检查明确指定的本机路径，不运行模型或发消息；`wekeeper-bot run` 启动协议处理。首次激活单独执行，普通重启沿用已有收件边界。
+
+首次启用云端机器人管理时，先将当前本机生效配置对齐到云端，再接受新修改。密钥只保存在本机。配置由本机确认应用后生效；关闭群会取消尚未发送的工作。看板明确区分网关受理与手机端收件。
+
+## 归档 MCP
+
+初始化归档后，可注册本机解释器和私有状态目录：
 
 ```bash
 codex mcp add wechat-archive \
   --env CHATLOG_KEEPER_DATA_DIR="$CHATLOG_KEEPER_DATA_DIR" \
-  --env CHATLOG_KEEPER_RUNTIME_VERSION=0.5.0 \
+  --env CHATLOG_KEEPER_RUNTIME_VERSION=0.7.0 \
   -- "$PWD/.venv/bin/python" -m chatlog_keeper.mcp_server \
   --state-dir "$CHATLOG_KEEPER_DATA_DIR"
 ```
 
-在 Codex 中重新加载 MCP，再查看 `get_status` 的版本、覆盖情况和 `health.state`。
-共 **15 个工具：14 个只读查询，加上受门控的 `request_voice_transcription` 操作**。
-本轮保留 Python 包名 `chatlog_keeper`、命令 `chatlog-keeper` 和 MCP 名称 `wechat-archive`。
+保留十五个工具：十四个只读查询，以及一个需要明确请求和单独验收的原生语音转文字操作。归档 MCP 不获得机器人发消息能力。消息引用、覆盖范围、缓存图片及文档读取见 [MCP 参考](docs/mcp.md)。
 
-## 与 Agent 配合使用
-
-- “先检查归档健康状态，找到唯一群 ID，再总结今天的讨论并附消息引用。”
-- “在指定时间范围内搜索关键词，追溯引用目标和前后文。”
-- “显示这条消息的缓存图片并报告质量；如果关联文档已归档，再读取正文。”
-- “先读取已有语音转字；只有我明确要求时才请求微信原生转字。”
-
-读取时跟随分页和覆盖信息；空结果不代表从未同步到本机的历史为空。
-使用程序统计结果，不从一页消息估算整体数量。
-
-## 文档入口
-
-- [安装与运行](docs/installation.md)：初始化、systemd、可访问性准备及回滚。
-- [MCP 参考](docs/mcp.md)：全部工具、标识、分页、健康状态和失败状态。
-- [架构说明](docs/architecture.md)：采集、存储、解析及隔离任务进程。
-- [验证说明](docs/validation.md)：实测环境、证据范围和剩余缺口。
-- [路线图](ROADMAP.md)：已交付能力和后续优先级。
-
-## 隐私与操作边界
-
-WeKeeper 不发送微信消息或文件，不自动登录，不下载未缓存媒体。
-唯一的客户端操作例外是明确请求且通过本机验收的微信原生语音转字。
-归档包含明文消息和媒体，应保护整个私有状态目录及其备份。
-选中内容会进入 Agent 的模型上下文；聊天和文档中的指令始终作为不可信的待分析数据。
-不需要额外模型服务、向量数据库或公网 HTTP 服务。
-
-## 开发与上游来源
+## 开发与发布准备
 
 ```bash
-python -m pip install -e '.[dev,mcp]'
+python -m pip install -e '.[dev,mcp,web,bot]' build
 python -m pytest -q
+(cd frontend && npm ci && npm test && npm run build -- --base=/wekeeper/)
+python -m build
+python scripts/check_release_artifacts.py dist/*
 ```
 
-自动测试使用合成数据和模拟桌面操作，原生客户端验收单独记录。
-WeKeeper 源自 [chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper)，保留 Linux 专用能力，
-并增加归档及 MCP 层。原始 MIT 署名保留，见 [LICENSE](LICENSE) 与 [UPSTREAM.md](UPSTREAM.md)。
+默认回归使用合成数据、临时数据库和模拟供应商。真实微信验收单独执行，限明确授权的测试群。源码包包含前端、部署模板、测试和完整网关补丁链；wheel 包含 Python 运行时。CI 会在仓库外验证源码包和 wheel。
+
+## 文档
+
+- [安装运行](docs/installation.md)、[升级流程](docs/upgrading.md)
+- [看板部署](docs/dashboard.md)、[机器人](docs/bot.md)、[协议网关](docs/protocol-gateway.md)
+- [架构](docs/architecture.md)、[验证边界](docs/validation.md)、[MCP](docs/mcp.md)
+- [更新记录](CHANGELOG.md)、[路线图](ROADMAP.md)、[上游归属](UPSTREAM.md)
+
+不要发布归档、账号数据库、模型凭据、网关 token、日志或部署备份。项目衍生自 [labazhou2024/chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper)，保留原 MIT 许可与署名。

@@ -107,14 +107,16 @@ def official_wechat_executables() -> List[Path]:
     candidates = [Path("/opt/wechat/wechat"), Path("/usr/bin/wechat")]
     # Local PoC: official Tencent 4.1.13.26 deb, extracted without root.
     # Accept only this exact reviewed ELF; never an environment-supplied path.
-    portable = Path(__file__).resolve().parents[3] / "wechat/opt/wechat/wechat"
-    try:
-        if hashlib.sha256(portable.read_bytes()).hexdigest() == (
-            "2749535f299ba67feb8ef80cab898bb0531fa8f376b16f8a72db706811c84132"
-        ):
-            candidates.append(portable)
-    except OSError:
-        pass
+    workspace = Path(__file__).resolve().parents[3]
+    for portable in (workspace / "wechat/opt/wechat/wechat",
+                     workspace / "wechat-linux-poc/wechat/opt/wechat/wechat"):
+        try:
+            if hashlib.sha256(portable.read_bytes()).hexdigest() == (
+                "2749535f299ba67feb8ef80cab898bb0531fa8f376b16f8a72db706811c84132"
+            ):
+                candidates.append(portable)
+        except OSError:
+            pass
     return _existing_executables(candidates)
 
 

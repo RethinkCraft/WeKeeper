@@ -1,0 +1,2656 @@
+diff --git a/.changeset/native-equal-auth-finalization.md b/.changeset/native-equal-auth-finalization.md
+new file mode 100644
+--- /dev/null
++++ b/.changeset/native-equal-auth-finalization.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Coalesce a redundant native-received quote authorization refresh with final send completion only after complete persistent-state equality and current read-only profile proof. Keep original receipt persistence before parsing, and preserve failed-commit recovery with a durable network-publication fence. Changed state retains fenced ordinary authorization persistence; local session recovery preserves connection preferences and does not resend the message.
+diff --git a/packages/native-client-rust/FEATURES.md b/packages/native-client-rust/FEATURES.md
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -203,15 +203,27 @@
+ 
+ ### Unchanged native send finalization
+ 
+-For native-received quoted replies only, an unchanged saved-login proof can
+-complete its sidecar markers in the same FULL transaction as the final send
+-result/event. Accepted authorization is still committed before profile work,
+-and the raw native receipt is still committed before application parsing.
+-Current profile/password, saved credentials and routing checks remain; changed
+-profile publication follows its original journal and completion path. A stale
+-proof leaves projection pending without discarding verified send evidence.
+-Metadata SQL failures retain connection cleanup and the independent final-send
+-path. A failed shared final transaction retains its receipt for existing local
+-recovery without another RPC. The projection timing phase covers its proof;
+-the combined completion commit is included in final-state timing. Synthetic
+-commit-count and recovery fixtures do not establish a live latency improvement.
++For native-received quoted replies, a complete persistent authorization state
++that equals the currently accepted state may refresh its protected ciphertext
++in the same FULL transaction as the unchanged-profile completion and final send
++result/event. Eligibility includes current ownership, accepted and projected
++generations, no earlier pending publication, and complete read-only profile,
++password, saved-credential and routing proof. Changed or unproven state retains
++the original accepted-auth commit before official-file publication.
++
++The original response is independently FULL-committed before application
++parsing. An eligible attempt records pending profile verification and a network
++publication fence with that response. A failed final commit therefore keeps its
++receipt and blocks older network snapshots even if no new authorization could
++be installed. A successful fresh accepted cipher clears that fence; reinstalling
++the same cipher does not. Local recovery under the account gate rotates the
++blocked state before resuming session work, without a remote retry or changing
++the connection preference or validated owner.
++
++A stale final proof cannot install old authorization or erase newer publication
++work, but strictly verified send facts remain recoverable. Expected state changes
++use a fenced original-auth fallback. Original raw evidence, unknown outcomes,
++writer cleanup and profile recovery remain separate from phone receipt.
++Synthetic equality, commit, fault, restart and disconnected-session fixtures do
++not establish a live latency or recipient-validation result. New comparison and
++proof timing phases are nested in their parent phases and must not be added twice.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/equal_state_send.rs b/packages/native-client-rust/crates/wechat-core/src/equal_state_send.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/equal_state_send.rs
+@@ -0,0 +1,196 @@
++//! Coalesce a redundant auth refresh only after retaining the original reply.
++use super::*;
++use wechat_store::{EqualSendSnapshot, EqualSendStage};
++use zeroize::Zeroizing;
++
++pub(super) struct EqualSendContext {
++    pub(super) snapshot: Option<EqualSendSnapshot>,
++    pub(super) pending: Option<PendingEqualSend>,
++    pub(super) suppress_auth: bool,
++}
++
++impl EqualSendContext {
++    pub(super) fn new(snapshot: Option<EqualSendSnapshot>) -> Self {
++        Self {
++            snapshot,
++            pending: None,
++            suppress_auth: false,
++        }
++    }
++}
++
++pub(super) struct PendingEqualSend {
++    pub(super) snapshot: EqualSendSnapshot,
++    pub(super) stage: EqualSendStage,
++}
++
++pub(super) struct PreparedEqualSend {
++    pub(super) stage: EqualSendStage,
++    pub(super) new_cipher: Vec<u8>,
++}
++
++fn complete_state_equal(left: &AccountState, right: &AccountState) -> Result<bool> {
++    // Typed serialization covers every persistent field, including future
++    // fields. No plaintext, field values or credential-derived hash is logged.
++    let left = Zeroizing::new(serde_json::to_vec(left)?);
++    let right = Zeroizing::new(serde_json::to_vec(right)?);
++    Ok(left.as_slice() == right.as_slice())
++}
++
++impl Core {
++    pub(super) fn capture_equal_send_state(
++        &self,
++        account: &str,
++        state: &AccountState,
++        trace: &QuoteTrace,
++    ) -> Result<Option<EqualSendSnapshot>> {
++        let span = trace.span(TimingStage::EqualStateCapture);
++        let result = (|| -> Result<Option<EqualSendSnapshot>> {
++            let snapshot = self
++                .store
++                .capture_equal_send_snapshot(account, &self.ownership_generation)?;
++            let Some(snapshot) = snapshot else {
++                return Ok(None);
++            };
++            let saved = self.native_send_state(account, &snapshot.state_cipher)?;
++            if !complete_state_equal(&saved, state)? {
++                return Ok(None);
++            }
++            Ok(Some(snapshot))
++        })();
++        span.finish(match result.as_ref() {
++            Ok(Some(_)) => TimingOutcome::Ok,
++            Ok(None) => TimingOutcome::Skipped,
++            Err(_) => TimingOutcome::Error,
++        });
++        result
++    }
++
++    pub(super) fn equal_send_state_unchanged(
++        &self,
++        account: &str,
++        state: &AccountState,
++        snapshot: &EqualSendSnapshot,
++        trace: &QuoteTrace,
++    ) -> Result<bool> {
++        let span = trace.span(TimingStage::EqualStateCompare);
++        let result = self
++            .native_send_state(account, &snapshot.state_cipher)
++            .and_then(|saved| complete_state_equal(&saved, state));
++        span.finish(match result.as_ref() {
++            Ok(true) => TimingOutcome::Unchanged,
++            Ok(false) => TimingOutcome::Other,
++            Err(_) => TimingOutcome::Error,
++        });
++        result
++    }
++
++    pub(super) fn prepare_equal_send_final(
++        &self,
++        account: &str,
++        state: &AccountState,
++        pending: PendingEqualSend,
++        trace: &QuoteTrace,
++    ) -> Result<Option<PreparedEqualSend>> {
++        let proof = trace.span(TimingStage::EqualStateProfileProof);
++        let eligible = self.prove_equal_send_saved_login(account, state, &pending.snapshot);
++        proof.finish(match eligible.as_ref() {
++            Ok(true) => TimingOutcome::Unchanged,
++            Ok(false) => TimingOutcome::Other,
++            Err(_) => TimingOutcome::Error,
++        });
++        if !eligible? {
++            return Ok(None);
++        }
++        let new_cipher = trace.measure(TimingStage::StateValidateSeal, || {
++            let bytes = Zeroizing::new(serde_json::to_vec(state)?);
++            self.vault.seal(account, "account-state", &bytes)
++        })?;
++        Ok(Some(PreparedEqualSend {
++            stage: pending.stage,
++            new_cipher,
++        }))
++    }
++
++    /// Caller holds the account gate, or is completing single-threaded startup.
++    /// This repairs owned local records only and never calls a remote service.
++    pub(super) fn repair_blocked_equal_authorization(
++        &self,
++        account: &str,
++        trace: &QuoteTrace,
++    ) -> Result<bool> {
++        let Some(snapshot) = self.store.blocked_authorization_snapshot(account)? else {
++            return Ok(false);
++        };
++        let span = trace.span(TimingStage::BlockedAuthorizationRepair);
++        let result = (|| -> Result<bool> {
++            anyhow::ensure!(self.owns_profile(account)?, "profile_ownership_required");
++            let state = self.native_send_state(account, &snapshot.state_cipher)?;
++            self.upstream.validate_state(&state)?;
++            self.check_state_profile(account, &state)?;
++            let bytes = Zeroizing::new(serde_json::to_vec(&state)?);
++            let fresh = self.vault.seal(account, "account-state", &bytes)?;
++            let installed = self
++                .store
++                .repair_blocked_authorization(account, &snapshot, &fresh)?;
++            if installed {
++                // The accepted-state commit created the ordinary pending
++                // publication marker before any official-profile work.
++                let _ = self.project_saved_login(account, &state);
++            }
++            Ok(installed)
++        })();
++        span.finish(match result.as_ref() {
++            Ok(true) => TimingOutcome::Ok,
++            Ok(false) => TimingOutcome::Skipped,
++            Err(_) => TimingOutcome::Error,
++        });
++        result
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn complete_persistent_equality_covers_all_fields_and_nested_auth_sections() {
++        let original = super::super::tests::state();
++        let value = serde_json::to_value(&original).unwrap();
++        assert!(complete_state_equal(&original, &original).unwrap());
++        let mut paths = Vec::new();
++        fn fields(value: &Value, prefix: Vec<String>, paths: &mut Vec<Vec<String>>) {
++            if let Value::Object(map) = value {
++                for (key, value) in map {
++                    let mut next = prefix.clone();
++                    next.push(key.clone());
++                    fields(value, next, paths);
++                }
++            } else {
++                paths.push(prefix);
++            }
++        }
++        fields(&value, Vec::new(), &mut paths);
++        assert!(paths.len() >= 21);
++        for path in paths {
++            let mut changed = value.clone();
++            let mut field = &mut changed;
++            for segment in &path {
++                field = field.get_mut(segment).unwrap();
++            }
++            match field {
++                Value::String(text) => text.push('x'),
++                Value::Number(number) => *field = json!(number.as_i64().unwrap() + 1),
++                Value::Array(bytes) if bytes.is_empty() => bytes.push(json!(1)),
++                Value::Array(bytes) => bytes[0] = json!(bytes[0].as_u64().unwrap() ^ 1),
++                _ => panic!("unhandled persistent field kind"),
++            }
++            let changed: AccountState = serde_json::from_value(changed).unwrap();
++            assert!(
++                !complete_state_equal(&original, &changed).unwrap(),
++                "persistent field not compared: {}",
++                path.join(".")
++            );
++        }
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/identity.rs b/packages/native-client-rust/crates/wechat-core/src/identity.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/identity.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/identity.rs
+@@ -181,6 +181,21 @@
+         }
+     }
+     pub(super) fn check_state_profile(&self, account: &str, state: &AccountState) -> Result<()> {
++        self.check_state_profile_mode(account, state, true)
++    }
++    pub(super) fn check_state_profile_readonly(
++        &self,
++        account: &str,
++        state: &AccountState,
++    ) -> Result<()> {
++        self.check_state_profile_mode(account, state, false)
++    }
++    fn check_state_profile_mode(
++        &self,
++        account: &str,
++        state: &AccountState,
++        extend_keys: bool,
++    ) -> Result<()> {
+         let Some(binding) = self.identity_binding(account)? else {
+             if self.populated_profile(account)? {
+                 bail!("profile_identity_unavailable");
+@@ -207,7 +222,8 @@
+                     == Some(accepted.as_bytes())
+                 {
+                     let known = self.state_unfenced(account)?;
+-                    if known.uin == state.uin
++                    if extend_keys
++                        && known.uin == state.uin
+                         && known.own_username == state.own_username
+                         && known.device.device_id == state.device.device_id
+                         && known.database_password == state.database_password
+diff --git a/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs b/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs
+@@ -0,0 +1,562 @@
++use super::*;
++include!("post_rpc_fixture.rs");
++
++#[tokio::test]
++async fn complete_equal_native_quote_coalesces_standalone_authorization_commit() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "equal-coalesced").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(sent.server_id.as_deref(), Some("99"));
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++    assert!(f
++        .core
++        .store
++        .runtime("one", &format!("quote-receipt:{}", sent.id))
++        .unwrap()
++        .is_some());
++    let current = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    assert_ne!(
++        old, current,
++        "equal plaintext still rotates the Push CAS generation"
++    );
++    assert_eq!(
++        serde_json::to_vec(&f.core.account_state("one").unwrap()).unwrap(),
++        serde_json::to_vec(&f.state).unwrap()
++    );
++    let authorizations = rows
++        .iter()
++        .filter(|row| row["stage"] == "authorization_persist" && row["edge"] == "begin")
++        .count();
++    assert_eq!(
++        authorizations, 0,
++        "complete equal-state quote should not use a standalone auth FULL"
++    );
++}
++
++fn auth_begins(rows: &[Value]) -> usize {
++    rows.iter()
++        .filter(|row| row["stage"] == "authorization_persist" && row["edge"] == "begin")
++        .count()
++}
++fn synthetic_control(core: &Core) -> rusqlite::Connection {
++    rusqlite::Connection::open(core.store.root.join("accounts/one/agent/control.sqlite")).unwrap()
++}
++
++#[tokio::test]
++async fn changed_cookie_retains_the_original_authorization_and_profile_path() {
++    let f = equal_fixture(true);
++    let (sent, rows) = perform_equal_fixture(&f, "changed-cookie").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(auth_begins(&rows), 1);
++    assert_eq!(f.core.account_state("one").unwrap().cookie, vec![8; 15]);
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert!(!rows.iter().any(|row| row["stage"] == "equal_state_final"));
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn preexisting_projection_work_uses_the_original_authorization_path() {
++    let f = equal_fixture(false);
++    f.core
++        .store
++        .put_runtime("one", "saved-login-projection-needed", b"preexisting")
++        .unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "prior-projection").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(auth_begins(&rows), 1);
++    assert!(!rows.iter().any(|row| row["stage"] == "equal_state_final"));
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++}
++
++#[tokio::test]
++async fn optional_raw_metadata_failure_keeps_the_receipt_and_fenced_old_path() {
++    let f = equal_fixture(false);
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER reject_equal_block BEFORE INSERT ON runtime WHEN NEW.key='network-blocked-state' BEGIN SELECT RAISE(ABORT,'synthetic block metadata failure'); END;").unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "metadata-failure").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(auth_begins(&rows), 1);
++    assert!(f
++        .core
++        .store
++        .runtime("one", &format!("quote-receipt:{}", sent.id))
++        .unwrap()
++        .is_some());
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn failed_final_auth_keeps_old_push_blocked_then_manual_disconnected_repairs_locally() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER reject_equal_auth BEFORE UPDATE ON runtime WHEN NEW.key='account-state' BEGIN SELECT RAISE(ABORT,'synthetic auth metadata failure'); END;").unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "final-auth-failure").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(
++        f.core
++            .store
++            .runtime("one", "account-state")
++            .unwrap()
++            .unwrap(),
++        old
++    );
++    assert!(rows.iter().any(|row| row["stage"] == "equal_state_final"
++        && row["edge"] == "end"
++        && row["outcome"] == "skipped"));
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_some());
++    assert!(f
++        .core
++        .store
++        .save_network_authorization("one", b"stale push result", &old, None, Some(b"connected"))
++        .is_err());
++    synthetic_control(&f.core)
++        .execute_batch("DROP TRIGGER reject_equal_auth")
++        .unwrap();
++    f.core
++        .store
++        .put_runtime("one", "desired", b"disconnected")
++        .unwrap();
++    let owner = f.core.store.runtime("one", "validated-generation").unwrap();
++    let calls = f.native.calls.load(Ordering::SeqCst);
++    f.core
++        .session_request("one", "manual-test", |_fence| async { Ok(()) })
++        .await
++        .unwrap();
++    assert_eq!(
++        f.native.calls.load(Ordering::SeqCst),
++        calls,
++        "local repair must not send an RPC"
++    );
++    let fresh = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    assert_ne!(fresh, old);
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert!(f
++        .core
++        .store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_none());
++    assert_eq!(
++        f.core.store.runtime("one", "desired").unwrap().as_deref(),
++        Some(b"disconnected".as_slice())
++    );
++    assert_eq!(
++        f.core.store.runtime("one", "validated-generation").unwrap(),
++        owner
++    );
++    assert!(f
++        .core
++        .store
++        .save_network_authorization(
++            "one",
++            b"stale push result",
++            &old,
++            None,
++            Some(b"disconnected")
++        )
++        .is_err());
++}
++
++#[tokio::test]
++async fn startup_rotates_blocked_state_before_finishing_its_pending_profile_verification() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    let old_owner = f.core.store.runtime("one", "validated-generation").unwrap();
++    f.core
++        .store
++        .put_runtime(
++            "one",
++            "network-blocked-state",
++            format!("{:x}", Sha256::digest(&old)).as_bytes(),
++        )
++        .unwrap();
++    f.core
++        .store
++        .put_runtime(
++            "one",
++            "saved-login-projection-needed",
++            b"equal-send:synthetic-interruption",
++        )
++        .unwrap();
++    let store = f.core.store.clone();
++    let native = f.native.clone();
++    drop(f.core);
++    let restarted = Core::with_upstream(store.clone(), None, native.clone()).unwrap();
++    assert_ne!(
++        restarted.ownership_generation.as_bytes(),
++        old_owner.as_deref().unwrap()
++    );
++    assert_eq!(
++        store.runtime("one", "validated-generation").unwrap(),
++        old_owner,
++        "local repair does not activate a new owner"
++    );
++    assert_ne!(store.runtime("one", "account-state").unwrap().unwrap(), old);
++    assert!(store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert!(store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_none());
++    assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++}
++
++#[tokio::test]
++async fn owner_superseded_at_raw_retention_preserves_new_owner_and_send_facts() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER supersede_equal_owner AFTER INSERT ON runtime WHEN NEW.key LIKE 'quote-receipt:%' BEGIN UPDATE runtime SET value=CAST('replacement-owner' AS BLOB) WHERE key='validated-generation'; END;").unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "owner-superseded").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(auth_begins(&rows), 0);
++    assert_eq!(
++        f.core
++            .store
++            .runtime("one", "account-state")
++            .unwrap()
++            .unwrap(),
++        old
++    );
++    assert_eq!(
++        f.core
++            .store
++            .runtime("one", "validated-generation")
++            .unwrap()
++            .as_deref(),
++        Some(b"replacement-owner".as_slice())
++    );
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++}
++
++#[tokio::test]
++async fn disconnected_after_rpc_falls_back_without_losing_accepted_cookie_or_reconnecting() {
++    let f = equal_fixture(true);
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER disconnect_equal_quote AFTER INSERT ON runtime WHEN NEW.key LIKE 'quote-receipt:%' BEGIN UPDATE runtime SET value=CAST('disconnected' AS BLOB) WHERE key='desired'; END;").unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "disconnect-after-rpc").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(auth_begins(&rows), 1);
++    assert_eq!(f.core.account_state("one").unwrap().cookie, vec![8; 15]);
++    assert_eq!(
++        f.core.store.runtime("one", "desired").unwrap().as_deref(),
++        Some(b"disconnected".as_slice())
++    );
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn profile_proof_failure_keeps_receipt_and_recovery_markers_until_local_repair() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    let binding = f
++        .core
++        .store
++        .runtime("one", "profile-identity-binding")
++        .unwrap()
++        .unwrap();
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER invalidate_equal_profile AFTER INSERT ON runtime WHEN NEW.key LIKE 'quote-receipt:%' BEGIN UPDATE runtime SET value=x'00' WHERE key='profile-identity-binding'; END;").unwrap();
++    let (sent, rows) = perform_equal_fixture(&f, "profile-proof-failure").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(
++        f.core
++            .store
++            .runtime("one", "account-state")
++            .unwrap()
++            .unwrap(),
++        old
++    );
++    assert!(rows
++        .iter()
++        .any(|row| row["stage"] == "equal_state_profile_proof"
++            && row["edge"] == "end"
++            && row["outcome"] == "error"));
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_some());
++    assert!(f
++        .core
++        .store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_some());
++    synthetic_control(&f.core)
++        .execute_batch("DROP TRIGGER invalidate_equal_profile")
++        .unwrap();
++    f.core
++        .store
++        .put_runtime("one", "profile-identity-binding", &binding)
++        .unwrap();
++    f.core
++        .session_request("one", "fixed-local-repair", |_fence| async { Ok(()) })
++        .await
++        .unwrap();
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn idle_push_entry_repairs_blocked_authorization_without_a_message_or_restart() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER reject_idle_equal_auth BEFORE UPDATE ON runtime WHEN NEW.key='account-state' BEGIN SELECT RAISE(ABORT,'synthetic idle auth failure'); END;").unwrap();
++    let (sent, _) = perform_equal_fixture(&f, "idle-auth-failure").await;
++    assert_eq!(sent.state, "accepted");
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_some());
++    synthetic_control(&f.core)
++        .execute_batch("DROP TRIGGER reject_idle_equal_auth")
++        .unwrap();
++    // This is the real idle caller, not a direct call to the repair helper.
++    // Fake upstream's default push_connection fails locally without a socket.
++    f.core.start_push_worker("one").unwrap();
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while f
++            .core
++            .store
++            .runtime("one", "network-blocked-state")
++            .unwrap()
++            .is_some()
++        {
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++    })
++    .await
++    .unwrap();
++    assert_ne!(
++        f.core
++            .store
++            .runtime("one", "account-state")
++            .unwrap()
++            .unwrap(),
++        old
++    );
++    assert_eq!(
++        f.core.store.runtime("one", "desired").unwrap().as_deref(),
++        Some(b"connected".as_slice())
++    );
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++    f.core.shutdown();
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while Arc::strong_count(&f.core) != 1 {
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++    })
++    .await
++    .unwrap();
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++    assert_eq!(
++        f.core.store.send("one", &sent.id).unwrap().state,
++        "accepted"
++    );
++}
++
++#[tokio::test]
++async fn second_crash_after_receipt_recovery_still_repairs_profile_without_resending() {
++    let f = equal_fixture(false);
++    let old = f
++        .core
++        .store
++        .runtime("one", "account-state")
++        .unwrap()
++        .unwrap();
++    synthetic_control(&f.core).execute_batch("CREATE TRIGGER reject_equal_final_event BEFORE INSERT ON events WHEN NEW.kind='send.updated' AND json_extract(NEW.data_json,'$.state')='accepted' BEGIN SELECT RAISE(ABORT,'synthetic final event failure'); END;").unwrap();
++    f.core.stopping.store(true, Ordering::SeqCst);
++    let queued = f
++        .core
++        .send_quoted_source_text(
++            "one",
++            "double-crash",
++            "room@chatroom",
++            "fixed reply",
++            QuoteSourceReference::Received(f.reference.clone()),
++        )
++        .await
++        .unwrap();
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    f.core.stopping.store(false, Ordering::SeqCst);
++    let error = f
++        .core
++        .perform_send_inner("one", &queued.id, QuoteTrace::default())
++        .await;
++    assert!(error.is_err());
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++    assert_eq!(
++        f.core
++            .store
++            .runtime("one", "account-state")
++            .unwrap()
++            .unwrap(),
++        old
++    );
++    assert!(f
++        .core
++        .store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_some());
++    synthetic_control(&f.core)
++        .execute_batch("DROP TRIGGER reject_equal_final_event")
++        .unwrap();
++    // Recover the send, then interrupt before saved-login recovery. The next
++    // restart no longer finds a pending receipt, but must still find the token.
++    f.core.store.recover_uncertain_sends("one").unwrap();
++    assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 1);
++    assert_eq!(
++        f.core.store.send("one", &queued.id).unwrap().state,
++        "accepted"
++    );
++    assert!(f
++        .core
++        .store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_some());
++    let store = f.core.store.clone();
++    let native = f.native.clone();
++    drop(f.core);
++    let restarted = Core::with_upstream(store.clone(), None, native.clone()).unwrap();
++    assert_eq!(restarted.recover_quote_receipts("one").unwrap(), 0);
++    assert_eq!(store.send("one", &queued.id).unwrap().state, "accepted");
++    assert_ne!(store.runtime("one", "account-state").unwrap().unwrap(), old);
++    assert!(store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_none());
++    assert!(store
++        .runtime("one", "network-blocked-state")
++        .unwrap()
++        .is_none());
++    assert_eq!(native.calls.load(Ordering::SeqCst), 1);
++}
++
++struct InvalidEqualReply(Arc<EqualNative>);
++impl crate::upstream::Upstream for InvalidEqualReply {
++    fn kind(&self) -> crate::upstream::UpstreamKind {
++        crate::upstream::UpstreamKind::Native
++    }
++    fn send_quote_raw(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++    ) -> Result<Vec<u8>> {
++        let _ = self
++            .0
++            .send_quote_raw(state, destination, client_id, created_at, content)?;
++        // Valid status alone is insufficient: destination/client/server missing.
++        Ok(wechat_protocol::protobuf::bytes(
++            1,
++            &wechat_protocol::protobuf::int32(1, 0),
++        ))
++    }
++}
++#[tokio::test]
++async fn equal_state_with_uncorrelated_reply_is_retained_but_never_accepted() {
++    let mut f = equal_fixture(false);
++    let replacement = Arc::new(InvalidEqualReply(f.native.clone()));
++    Arc::get_mut(&mut Arc::get_mut(&mut f.core).unwrap().shared)
++        .unwrap()
++        .upstream = replacement;
++    let (sent, rows) = perform_equal_fixture(&f, "uncorrelated-equal").await;
++    assert_eq!(sent.state, "needs_review");
++    assert_eq!(sent.server_id, None);
++    assert_eq!(sent.error_code.as_deref(), Some("quote_receipt_invalid"));
++    assert!(f
++        .core
++        .store
++        .runtime("one", &format!("quote-receipt:{}", sent.id))
++        .unwrap()
++        .is_some());
++    assert_eq!(auth_begins(&rows), 0);
++    assert!(rows.iter().any(|row| row["stage"] == "equal_state_final"
++        && row["edge"] == "end"
++        && row["outcome"] == "unchanged"));
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 1);
++    assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 0);
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/post_rpc_fixture.rs b/packages/native-client-rust/crates/wechat-core/src/post_rpc_fixture.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/post_rpc_fixture.rs
+@@ -0,0 +1,167 @@
++struct EqualNative {
++    calls: std::sync::atomic::AtomicUsize,
++    change_cookie: AtomicBool,
++}
++impl crate::upstream::Upstream for EqualNative {
++    fn kind(&self) -> crate::upstream::UpstreamKind {
++        crate::upstream::UpstreamKind::Native
++    }
++    fn send_quote_raw(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        _content: &str,
++    ) -> Result<Vec<u8>> {
++        let sequence = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
++        if self.change_cookie.load(Ordering::SeqCst) {
++            state.cookie = vec![(sequence as u8).wrapping_add(7); 15];
++        }
++        let p = wechat_protocol::protobuf::message(&[
++            wechat_protocol::protobuf::bytes(1, &wechat_protocol::protobuf::int32(1, 0)),
++            wechat_protocol::protobuf::bytes(3, state.own_username.as_bytes()),
++            wechat_protocol::protobuf::bytes(4, destination.as_bytes()),
++            wechat_protocol::protobuf::uint(5, 17),
++            wechat_protocol::protobuf::bytes(6, client_id.as_bytes()),
++            wechat_protocol::protobuf::uint(7, u64::from(created_at) + 1),
++            wechat_protocol::protobuf::uint(8, 57),
++            wechat_protocol::protobuf::uint(9, 98 + sequence as u64),
++        ])?;
++        Ok(p)
++    }
++}
++struct EqualFixture {
++    _directory: tempfile::TempDir,
++    core: Arc<Core>,
++    native: Arc<EqualNative>,
++    state: AccountState,
++    reference: crate::ReceivedQuoteReference,
++}
++fn equal_fixture(change_cookie: bool) -> EqualFixture {
++    use wechat_protocol::{
++        protobuf as p,
++        wire::{SyncBatch, SyncCommand},
++    };
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    let native = Arc::new(EqualNative {
++        calls: std::sync::atomic::AtomicUsize::new(0),
++        change_cookie: AtomicBool::new(change_cookie),
++    });
++    let core = Core::with_upstream(store.clone(), None, native.clone()).unwrap();
++    core.configure_profile_format_key(&[9; 16]).unwrap();
++    let token = p::message(&[
++        p::bytes(1, &p::buffer(&[1; 8])),
++        p::bytes(2, &p::buffer(&[2; 8])),
++    ])
++    .unwrap();
++    let state = AccountState {
++        schema: 1,
++        device: DeviceProfile {
++            device_id: vec![b'A'; 16],
++            device_type: "UnifiedPCLinux x86_64".into(),
++            client_version: -227271398,
++        },
++        uin: 7,
++        own_username: "synthetic_self".into(),
++        cookie: vec![1; 15],
++        session_key: vec![1; 16],
++        request_key: vec![2; 24],
++        response_key: vec![3; 24],
++        auto_auth_key: token,
++        key_info: vec![4; 180],
++        database_password: vec![42; 32],
++        auth_snapshot: Default::default(),
++        long_host: "long.weixin.qq.com".into(),
++        short_host: "short.weixin.qq.com".into(),
++    };
++    core.install_login_state("one", &state, None).unwrap();
++    core.ensure_managed_profile("one", &state).unwrap();
++    assert_eq!(
++        core.project_saved_login("one", &state).unwrap()["state"],
++        "complete"
++    );
++    store.put_runtime("one", "desired", b"connected").unwrap();
++    store
++        .mark_validated_if_active("one", &core.ownership_generation)
++        .unwrap();
++    let payload = p::message(&[
++        p::uint(1, 1),
++        p::bytes(2, &p::bytes(1, b"room@chatroom")),
++        p::bytes(3, &p::bytes(1, b"synthetic_self")),
++        p::uint(4, 1),
++        p::bytes(5, &p::bytes(1, b"member:\nquestion")),
++        p::uint(6, 0),
++        p::uint(7, 0),
++        p::bytes(8, &p::buffer(&[])),
++        p::uint(9, 1700000000),
++        p::bytes(10, b"<msgsource/>"),
++        p::uint(12, 17),
++    ])
++    .unwrap();
++    core.commit_native_ingress(
++        "one",
++        "equal-fixture",
++        &SyncBatch {
++            code: 0,
++            flags: 0,
++            cursor: p::uint(1, 1),
++            commands: vec![SyncCommand { id: 5, payload }],
++            continuation: false,
++        },
++        "live",
++    )
++    .unwrap();
++    let event = store
++        .events("one", 0, 100)
++        .unwrap()
++        .into_iter()
++        .find(|event| event.kind == "message.received")
++        .unwrap();
++    let received_id = event.data["receivedId"].as_str().unwrap().to_string();
++    let message = core.received_message("one", &received_id).unwrap();
++    let reference = crate::ReceivedQuoteReference {
++        received_id,
++        server_id: "17".into(),
++        source_sha256: message["sourceSha256"].as_str().unwrap().into(),
++    };
++    // Match the daemon's account control mode before observing transactions.
++    drop(store.read_snapshot("one").unwrap());
++    EqualFixture {
++        _directory: directory,
++        core,
++        native,
++        state,
++        reference,
++    }
++}
++async fn perform_equal_fixture(f: &EqualFixture, key: &str) -> (SendIntent, Vec<Value>) {
++    f.core.stopping.store(true, Ordering::SeqCst);
++    let intent = f
++        .core
++        .send_quoted_source_text(
++            "one",
++            key,
++            "room@chatroom",
++            "fixed reply",
++            QuoteSourceReference::Received(f.reference.clone()),
++        )
++        .await
++        .unwrap();
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    assert_eq!(f.native.calls.load(Ordering::SeqCst), 0);
++    f.core.stopping.store(false, Ordering::SeqCst);
++    let (timings, receiver) = quote_timing::Timings::test_channel(256);
++    let trace = timings.recovered_worker(&intent.id, quote_timing::Runtime::Native);
++    f.core
++        .perform_send_inner("one", &intent.id, trace)
++        .await
++        .unwrap();
++    let rows = receiver
++        .try_iter()
++        .map(|row| serde_json::to_value(row).unwrap())
++        .collect();
++    (f.core.store.send("one", &intent.id).unwrap(), rows)
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -89,6 +89,30 @@
+         payload: &SendPayload,
+         trace: &QuoteTrace,
+     ) -> Result<SendReceipt> {
++        self.send_quote_with_receipt_inner(account, id, state, payload, trace, None)
++    }
++
++    pub(super) fn send_quote_with_equal_receipt_observed(
++        &self,
++        account: &str,
++        id: &str,
++        state: &mut AccountState,
++        payload: &SendPayload,
++        trace: &QuoteTrace,
++        context: &mut equal_state_send::EqualSendContext,
++    ) -> Result<SendReceipt> {
++        self.send_quote_with_receipt_inner(account, id, state, payload, trace, Some(context))
++    }
++
++    fn send_quote_with_receipt_inner(
++        &self,
++        account: &str,
++        id: &str,
++        state: &mut AccountState,
++        payload: &SendPayload,
++        trace: &QuoteTrace,
++        context: Option<&mut equal_state_send::EqualSendContext>,
++    ) -> Result<SendReceipt> {
+         let quote = payload.quote.as_ref().context("missing_quote_intent")?;
+         if self.upstream_kind() == crate::upstream::UpstreamKind::Simulator {
+             // Simulator decoded results remain marked simulator. They do not
+@@ -112,9 +136,45 @@
+                 trace.protocol_observer(),
+             )
+         })?);
++        // Equality is over the complete persistent state, not projected
++        // credentials. A changed state keeps the fenced original auth path.
++        let same = context
++            .as_ref()
++            .and_then(|context| context.snapshot.as_ref())
++            .is_some_and(|snapshot| {
++                self.equal_send_state_unchanged(account, state, snapshot, trace)
++                    .unwrap_or(false)
++            });
+         trace
+-            .measure(TimingStage::ReceiptRetain, || {
+-                self.retain_quote_receipt(account, id, payload, &sender, &raw)
++            .measure(TimingStage::ReceiptRetain, || -> Result<()> {
++                if same {
++                    let context = context.expect("equal-state capture exists");
++                    let snapshot = context
++                        .snapshot
++                        .as_ref()
++                        .expect("equal-state snapshot exists");
++                    let sealed = self.seal_quote_receipt(account, id, payload, &sender, &raw)?;
++                    match self.store.retain_equal_send_receipt(
++                        account,
++                        id,
++                        &sealed,
++                        Some(snapshot),
++                    )? {
++                        wechat_store::ReceiptDisposition::Staged(stage) => {
++                            context.pending = Some(equal_state_send::PendingEqualSend {
++                                snapshot: snapshot.clone(),
++                                stage,
++                            });
++                        }
++                        wechat_store::ReceiptDisposition::AuthorizationSuperseded => {
++                            context.suppress_auth = true;
++                        }
++                        wechat_store::ReceiptDisposition::MetadataFallback => {}
++                    }
++                    Ok(())
++                } else {
++                    self.retain_quote_receipt(account, id, payload, &sender, &raw)
++                }
+             })
+             .map_err(|_| anyhow::anyhow!("quote_receipt_persistence_failed"))?;
+         trace.measure(TimingStage::ReceiptLoadDecode, || {
+@@ -130,6 +190,19 @@
+         sender: &str,
+         raw: &[u8],
+     ) -> Result<()> {
++        let sealed = self.seal_quote_receipt(account, id, payload, sender, raw)?;
++        self.store
++            .put_runtime(account, &format!("{RECEIPT_PREFIX}{id}"), &sealed)
++    }
++
++    fn seal_quote_receipt(
++        &self,
++        account: &str,
++        id: &str,
++        payload: &SendPayload,
++        sender: &str,
++        raw: &[u8],
++    ) -> Result<Vec<u8>> {
+         ensure!(
+             payload.quote.is_some() && raw.len() <= wechat_protocol::MAX_MESSAGE_BYTES,
+             "invalid_quote_receipt"
+@@ -147,8 +220,7 @@
+             response_base64: STANDARD.encode(raw),
+         };
+         let bytes = Zeroizing::new(serde_json::to_vec(&receipt)?);
+-        let sealed = self.vault.seal(account, &purpose, &bytes)?;
+-        self.store.put_runtime(account, &purpose, &sealed)
++        self.vault.seal(account, &purpose, &bytes)
+     }
+ 
+     fn decode_retained_quote_receipt(
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+@@ -57,6 +57,11 @@
+     ReceiptRetain,
+     ReceiptLoadDecode,
+     ReceiptRecovery,
++    EqualStateCapture,
++    EqualStateCompare,
++    EqualStateProfileProof,
++    EqualStateFinal,
++    BlockedAuthorizationRepair,
+     StateValidateSeal,
+     AuthorizationPersist,
+     SavedLoginProjection,
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -25,6 +25,8 @@
+ #[path = "official_profile.rs"]
+ mod official_profile;
+ pub use official_profile::{OfficialProfileRequest, OfficialProfileSelection};
++#[path = "equal_state_send.rs"]
++mod equal_state_send;
+ #[path = "native_ingress.rs"]
+ mod native_ingress;
+ #[path = "native_send_admission.rs"]
+@@ -560,7 +562,24 @@
+         trace: &QuoteTrace,
+         completion: Option<&mut Option<wechat_store::UnchangedSavedLoginCompletion>>,
+     ) -> Result<()> {
+-        let sealed = trace.measure(TimingStage::StateValidateSeal, || -> Result<_> {
++        let sealed = self.seal_state_for_persist(account, state, trace)?;
++        if accepted {
++            trace.measure(TimingStage::AuthorizationPersist, || {
++                self.store.save_accepted_authorization(account, &sealed)
++            })?;
++            self.project_persisted_state_for_send(account, state, trace, completion);
++            Ok(())
++        } else {
++            self.store.save_active_authorization(account, &sealed)
++        }
++    }
++    fn seal_state_for_persist(
++        &self,
++        account: &str,
++        state: &AccountState,
++        trace: &QuoteTrace,
++    ) -> Result<Vec<u8>> {
++        trace.measure(TimingStage::StateValidateSeal, || -> Result<_> {
+             self.upstream.validate_state(state)?;
+             self.check_state_profile(account, state)?;
+             if let Ok(prior) = self.state_unfenced(account) {
+@@ -570,29 +589,47 @@
+             }
+             self.vault
+                 .seal(account, "account-state", &serde_json::to_vec(state)?)
++        })
++    }
++    fn persist_equal_send_fallback(
++        &self,
++        account: &str,
++        state: &AccountState,
++        snapshot: &wechat_store::EqualSendSnapshot,
++        trace: &QuoteTrace,
++        completion: &mut Option<wechat_store::UnchangedSavedLoginCompletion>,
++    ) -> Result<bool> {
++        let sealed = self.seal_state_for_persist(account, state, trace)?;
++        let installed = trace.measure(TimingStage::AuthorizationPersist, || {
++            self.store
++                .save_accepted_equal_fallback(account, snapshot, &sealed)
+         })?;
+-        if accepted {
+-            trace.measure(TimingStage::AuthorizationPersist, || {
+-                self.store.save_accepted_authorization(account, &sealed)
+-            })?;
+-            let span = trace.span(TimingStage::SavedLoginProjection);
+-            let projected = match completion {
+-                Some(slot) => self.project_saved_login_for_send(account, state, slot),
+-                None => self.project_saved_login(account, state),
+-            };
+-            span.finish(match projected.as_ref() {
+-                Err(_) => TimingOutcome::Error,
+-                Ok(value) if value["unchanged"] == true || value["state"] == "unchanged" => {
+-                    TimingOutcome::Unchanged
+-                }
+-                Ok(value) if value["state"] == "complete" => TimingOutcome::Ok,
+-                Ok(value) if value["state"] == "pending" => TimingOutcome::Pending,
+-                Ok(_) => TimingOutcome::Other,
+-            });
+-            Ok(())
+-        } else {
+-            self.store.save_active_authorization(account, &sealed)
+-        }
++        if installed {
++            self.project_persisted_state_for_send(account, state, trace, Some(completion));
++        }
++        Ok(installed)
++    }
++    fn project_persisted_state_for_send(
++        &self,
++        account: &str,
++        state: &AccountState,
++        trace: &QuoteTrace,
++        completion: Option<&mut Option<wechat_store::UnchangedSavedLoginCompletion>>,
++    ) {
++        let span = trace.span(TimingStage::SavedLoginProjection);
++        let projected = match completion {
++            Some(slot) => self.project_saved_login_for_send(account, state, slot),
++            None => self.project_saved_login(account, state),
++        };
++        span.finish(match projected.as_ref() {
++            Err(_) => TimingOutcome::Error,
++            Ok(value) if value["unchanged"] == true || value["state"] == "unchanged" => {
++                TimingOutcome::Unchanged
++            }
++            Ok(value) if value["state"] == "complete" => TimingOutcome::Ok,
++            Ok(value) if value["state"] == "pending" => TimingOutcome::Pending,
++            Ok(_) => TimingOutcome::Other,
++        });
+     }
+     #[cfg(test)]
+     fn install_login_state(
+@@ -1640,7 +1677,18 @@
+                 .vault
+                 .open_record(&account, "send-payload", &encrypted)?;
+             let payload: SendPayload = serde_json::from_slice(&plain)?;
++            core.repair_blocked_equal_authorization(&account, &trace)?;
+             let mut state = core.account_state(&account)?;
++            let native_source = payload.quote.as_ref().is_some_and(|quote| {
++                matches!(quote.target, crate::QuoteSourceReference::Received(_))
++            });
++            let snapshot =
++                if native_source && core.upstream_kind() == crate::upstream::UpstreamKind::Native {
++                    core.capture_equal_send_state(&account, &state, &trace)?
++                } else {
++                    None
++                };
++            let mut equal_context = equal_state_send::EqualSendContext::new(snapshot);
+             preparation.finish(TimingOutcome::Ok);
+             let native = &core.upstream;
+             if payload.mentions.as_ref().is_some_and(|m| m.request.all) {
+@@ -1694,7 +1742,20 @@
+                 return Ok(());
+             }
+             let result = if payload.quote.is_some() {
+-                core.send_quote_with_receipt_observed(&account, &id, &mut state, &payload, &trace)
++                if native_source && core.upstream_kind() == crate::upstream::UpstreamKind::Native {
++                    core.send_quote_with_equal_receipt_observed(
++                        &account,
++                        &id,
++                        &mut state,
++                        &payload,
++                        &trace,
++                        &mut equal_context,
++                    )
++                } else {
++                    core.send_quote_with_receipt_observed(
++                        &account, &id, &mut state, &payload, &trace,
++                    )
++                }
+             } else if let Some(share) = &payload.share {
+                 let xml = share.xml(&state.own_username)?;
+                 native
+@@ -1745,11 +1806,24 @@
+             };
+             // A logout may suppress credential installation during this RPC,
+             // but cannot erase an authenticated, accepted send receipt.
+-            let native_source = payload.quote.as_ref().is_some_and(|quote| {
+-                matches!(quote.target, crate::QuoteSourceReference::Received(_))
++            let prepared_equal = equal_context.pending.take().and_then(|pending| {
++                core.prepare_equal_send_final(&account, &state, pending, &trace)
++                    .ok()
++                    .flatten()
+             });
+             let mut completion = None;
+-            let authorization_saved =
++            let authorization_saved = if prepared_equal.is_some() || equal_context.suppress_auth {
++                false
++            } else if let Some(snapshot) = equal_context.snapshot.as_ref() {
++                core.persist_equal_send_fallback(
++                    &account,
++                    &state,
++                    snapshot,
++                    &trace,
++                    &mut completion,
++                )
++                .unwrap_or(false)
++            } else {
+                 if native_source && core.upstream_kind() == crate::upstream::UpstreamKind::Native {
+                     core.persist_state_with_send_completion(
+                         &account,
+@@ -1761,7 +1835,8 @@
+                 } else {
+                     core.persist_state_observed(&account, &state, true, &trace)
+                 }
+-                .is_ok();
++                .is_ok()
++            };
+             if authorization_saved {
+                 trace.measure(TimingStage::ValidatedMarker, || {
+                     core.store
+@@ -1782,7 +1857,26 @@
+                 Ok(result) if !result.accepted => ("failed", None, Some("service_rejected")),
+                 _ => ("needs_review", None, Some(unknown_code)),
+             };
+-            let updated = if let Some(proof) = completion.as_ref() {
++            let updated = if let Some(prepared) = prepared_equal.as_ref() {
++                let span = trace.span(TimingStage::EqualStateFinal);
++                let result = core.store.finalize_equal_send(
++                    &account,
++                    wechat_store::SendFinalUpdate {
++                        id: &id,
++                        state: final_state,
++                        server_id: server_id.as_deref(),
++                        error: final_error,
++                    },
++                    &prepared.stage,
++                    &prepared.new_cipher,
++                );
++                span.finish(match result.as_ref() {
++                    Ok(result) if result.authorization_installed => TimingOutcome::Unchanged,
++                    Ok(_) => TimingOutcome::Skipped,
++                    Err(_) => TimingOutcome::Error,
++                });
++                result.map(|result| result.intent)
++            } else if let Some(proof) = completion.as_ref() {
+                 core.store.update_send_after_unchanged_projection(
+                     &account,
+                     wechat_store::SendFinalUpdate {
+@@ -3894,3 +3988,7 @@
+         assert_eq!(core.account_state("fresh").unwrap().uin, 1);
+     }
+ }
++
++#[cfg(test)]
++#[path = "post_rpc_equal_tests.rs"]
++mod post_rpc_equal_tests;
+diff --git a/packages/native-client-rust/crates/wechat-core/src/saved_login.rs b/packages/native-client-rust/crates/wechat-core/src/saved_login.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/saved_login.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/saved_login.rs
+@@ -122,6 +122,15 @@
+         generation: &str,
+         epoch: Option<&[u8]>,
+     ) -> Result<Vec<u8>> {
++        self.saved_login_guard_mode(account, generation, epoch, false)
++    }
++    fn saved_login_guard_mode(
++        &self,
++        account: &str,
++        generation: &str,
++        epoch: Option<&[u8]>,
++        readonly: bool,
++    ) -> Result<Vec<u8>> {
+         if self.store.runtime(account, "logged-out")?.is_some()
+             || self.store.runtime(account, "logout-epoch")?.as_deref() != epoch
+         {
+@@ -146,7 +155,11 @@
+         if credential_generation(&state, epoch)? != generation {
+             bail!("saved_login_generation_changed");
+         }
+-        self.check_state_profile(account, &state)?;
++        if readonly {
++            self.check_state_profile_readonly(account, &state)?;
++        } else {
++            self.check_state_profile(account, &state)?;
++        }
+         // Password validation can be slow on a newly opened profile. Recheck
+         // the complete admitted state and logout epoch atomically afterward,
+         // immediately before returning to an individual file publisher.
+@@ -296,6 +309,62 @@
+         accepted: &AccountState,
+     ) -> Result<Value> {
+         pending_publication(self.project_saved_login_inner(account, accepted))
++    }
++    /// A read-only proof for an already accepted, fully equal state. The
++    /// original journal/publication path remains the fallback for every miss.
++    pub(super) fn prove_equal_send_saved_login(
++        &self,
++        account: &str,
++        accepted: &AccountState,
++        snapshot: &wechat_store::EqualSendSnapshot,
++    ) -> Result<bool> {
++        self.upstream.validate_state(accepted)?;
++        self.check_state_profile_readonly(account, accepted)?;
++        let Some(binding) = self.identity_binding(account)? else {
++            return Ok(false);
++        };
++        require_saved_login_store(&binding)?;
++        let generation = credential_generation(accepted, snapshot.logout_epoch.as_deref())?;
++        if generation != snapshot.credential_generation {
++            return Ok(false);
++        }
++        let cipher = self.saved_login_guard_mode(
++            account,
++            &generation,
++            snapshot.logout_epoch.as_deref(),
++            true,
++        )?;
++        if cipher != snapshot.state_cipher
++            || self
++                .store
++                .runtime(account, "saved-login-publication")?
++                .is_some()
++            || self
++                .store
++                .runtime(account, "saved-login-projected-generation")?
++                .as_deref()
++                != Some(generation.as_bytes())
++        {
++            return Ok(false);
++        }
++        let identity = self.read_bound_identity(account, &binding)?;
++        if identity.username != accepted.own_username
++            || identity.uin != accepted.uin
++            || identity.request_device_id()? != accepted.device.device_id
++        {
++            bail!("account_identity_mismatch");
++        }
++        if !self.saved_credentials_match(account, accepted, &binding.format_key)?
++            || !self.saved_login_matches(account, accepted, &binding.format_key)?
++        {
++            return Ok(false);
++        }
++        Ok(self.saved_login_guard_mode(
++            account,
++            &generation,
++            snapshot.logout_epoch.as_deref(),
++            true,
++        )? == snapshot.state_cipher)
+     }
+     pub(super) fn project_saved_login_for_send(
+         &self,
+@@ -433,6 +502,10 @@
+     /// only when the exact current encrypted state has a durable acceptance tag.
+     /// Imported credentials alone do not authorize profile publication.
+     pub(super) fn recover_saved_login(&self, account: &str) -> Result<Value> {
++        // Startup holds exclusive ownership before workers begin. A blocked
++        // equal-state refresh must rotate its ciphertext before clearing the
++        // ordinary profile-recovery marker.
++        self.repair_blocked_equal_authorization(account, &QuoteTrace::default())?;
+         pending_publication(self.recover_saved_login_inner(account))
+     }
+     fn recover_saved_login_inner(&self, account: &str) -> Result<Value> {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+@@ -71,10 +71,15 @@
+         F: FnOnce(SessionFence) -> Fut,
+         Fut: Future<Output = Result<T>>,
+     {
+-        let fence = {
+-            let _guard = self.lock_account(account).await?;
+-            self.session_fence(account)?
+-        };
++        let guard = self.lock_account(account).await?;
++        let core = self.clone();
++        let owned = account.to_owned();
++        let fence = blocking(move || {
++            let _guard = guard;
++            core.repair_blocked_equal_authorization(&owned, &QuoteTrace::default())?;
++            core.session_fence(&owned)
++        })
++        .await?;
+         match request(fence.clone()).await {
+             Err(error) if authentication_required(&error) => {
+                 let logged_out = self
+diff --git a/packages/native-client-rust/crates/wechat-store/src/authorization.rs b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+--- a/packages/native-client-rust/crates/wechat-store/src/authorization.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+@@ -103,8 +103,11 @@
+         epoch: Option<&[u8]>,
+         desired: Option<&[u8]>,
+     ) -> Result<()> {
+-        self.control(account, |db| {
++        let installed = self.control(account, |db| {
+             let tx = db.transaction()?;
++            if crate::equal_send_persistence::network_generation_blocked(&tx, expected)? {
++                return Ok(false);
++            }
+             let current: Option<Vec<u8>> = tx
+                 .query_row("SELECT value FROM runtime WHERE key='desired'", [], |r| {
+                     r.get(0)
+@@ -119,8 +122,12 @@
+             )?;
+             accepted_projection_needed(&tx, encrypted)?;
+             tx.commit()?;
+-            Ok(())
+-        })
++            Ok(true)
++        })?;
++        if !installed {
++            bail!("push_session_superseded");
++        }
++        Ok(())
+     }
+     fn save_authorization(&self, account: &str, encrypted: &[u8], accepted: bool) -> Result<()> {
+         self.control(account, |db| {
+@@ -247,8 +254,18 @@
+     }
+ }
+ 
+-fn accepted_projection_needed(tx: &rusqlite::Transaction<'_>, encrypted: &[u8]) -> Result<()> {
++pub(crate) fn accepted_projection_needed(
++    tx: &rusqlite::Transaction<'_>,
++    encrypted: &[u8],
++) -> Result<()> {
+     let generation = format!("{:x}", Sha256::digest(encrypted));
++    tx.execute(
++        "DELETE FROM runtime WHERE key=?1 AND value<>?2",
++        params![
++            crate::equal_send_persistence::NETWORK_BLOCKED_STATE,
++            generation.as_bytes()
++        ],
++    )?;
+     for (key, value) in [
+         ("saved-login-projection-needed", b"1".as_slice()),
+         (
+diff --git a/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence.rs b/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence.rs
+@@ -0,0 +1,429 @@
++//! Retain quote evidence independently before deferring an equal auth refresh.
++use crate::*;
++use rusqlite::{OptionalExtension, Transaction};
++
++pub(crate) const NETWORK_BLOCKED_STATE: &str = "network-blocked-state";
++const RECEIPT_PREFIX: &str = "quote-receipt:";
++
++#[derive(Clone)]
++pub struct EqualSendSnapshot {
++    account_id: String,
++    pub state_cipher: Vec<u8>,
++    pub logout_epoch: Option<Vec<u8>>,
++    pub owner: String,
++    pub credential_generation: String,
++    pub projected_state_generation: String,
++}
++
++#[derive(Clone)]
++pub struct EqualSendStage {
++    snapshot: EqualSendSnapshot,
++    intent_id: String,
++    token: Vec<u8>,
++}
++
++pub enum ReceiptDisposition {
++    Staged(EqualSendStage),
++    MetadataFallback,
++    AuthorizationSuperseded,
++}
++
++pub struct EqualSendFinalResult {
++    pub intent: SendIntent,
++    pub authorization_installed: bool,
++}
++
++#[derive(Clone)]
++pub struct BlockedAuthorizationSnapshot {
++    account_id: String,
++    pub state_cipher: Vec<u8>,
++    pub logout_epoch: Option<Vec<u8>>,
++    pub validated_owner: Option<Vec<u8>>,
++    pub desired: Option<Vec<u8>>,
++}
++
++fn value(db: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
++    Ok(db
++        .query_row("SELECT value FROM runtime WHERE key=?1", [key], |r| {
++            r.get(0)
++        })
++        .optional()?)
++}
++
++pub(crate) fn cipher_generation(cipher: &[u8]) -> Vec<u8> {
++    format!("{:x}", Sha256::digest(cipher)).into_bytes()
++}
++
++pub(crate) fn network_generation_blocked(db: &Connection, expected: &[u8]) -> Result<bool> {
++    Ok(
++        value(db, NETWORK_BLOCKED_STATE)?.as_deref()
++            == Some(cipher_generation(expected).as_slice()),
++    )
++}
++
++fn authorization_current(db: &Connection, snapshot: &EqualSendSnapshot) -> Result<bool> {
++    Ok(value(db, "logged-out")?.is_none()
++        && value(db, "validated-generation")?.as_deref() == Some(snapshot.owner.as_bytes())
++        && value(db, "logout-epoch")? == snapshot.logout_epoch
++        && value(db, "account-state")?.as_deref() == Some(snapshot.state_cipher.as_slice())
++        && value(db, "saved-login-accepted-state-generation")?.as_deref()
++            == Some(cipher_generation(&snapshot.state_cipher).as_slice()))
++}
++
++fn snapshot_current(db: &Connection, snapshot: &EqualSendSnapshot) -> Result<bool> {
++    Ok(authorization_current(db, snapshot)?
++        && value(db, "desired")?.as_deref() == Some(b"connected")
++        && value(db, "saved-login-projected-generation")?.as_deref()
++            == Some(snapshot.credential_generation.as_bytes())
++        && value(db, "saved-login-projected-state-generation")?.as_deref()
++            == Some(snapshot.projected_state_generation.as_bytes())
++        && value(db, "saved-login-publication")?.is_none())
++}
++
++fn fresh_cipher(old: &[u8], new: &[u8]) -> Result<()> {
++    anyhow::ensure!(
++        !new.is_empty() && cipher_generation(old) != cipher_generation(new),
++        "equal_send_requires_fresh_cipher"
++    );
++    Ok(())
++}
++
++enum ReceiptWrite {
++    Existing,
++    Retained(ReceiptDisposition),
++}
++
++#[derive(Debug)]
++struct EqualAuthMetadataFailure(anyhow::Error);
++impl std::fmt::Display for EqualAuthMetadataFailure {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("equal_send_auth_metadata_failed")
++    }
++}
++impl std::error::Error for EqualAuthMetadataFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(self.0.as_ref())
++    }
++}
++
++fn update_send_in_tx(
++    tx: &Transaction<'_>,
++    account: &str,
++    send: &SendFinalUpdate<'_>,
++) -> Result<SendIntent> {
++    tx.execute("UPDATE outbox SET state=?2,server_id=COALESCE(?3,server_id),error_code=?4 WHERE id=?1 AND state!='cancelled'", params![send.id,send.state,send.server_id,send.error])?;
++    let intent = crate::read_send(tx, account, send.id)?;
++    crate::outbox::event(tx, &intent)?;
++    Ok(intent)
++}
++
++impl Store {
++    pub fn capture_equal_send_snapshot(
++        &self,
++        account: &str,
++        owner: &str,
++    ) -> Result<Option<EqualSendSnapshot>> {
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            let Some(cipher) = value(&tx, "account-state")? else {
++                return Ok(None);
++            };
++            let Some(generation) = value(&tx, "saved-login-projected-generation")? else {
++                return Ok(None);
++            };
++            let generation = match String::from_utf8(generation) {
++                Ok(generation)
++                    if generation.len() == 64
++                        && generation.bytes().all(|b| b.is_ascii_hexdigit()) =>
++                {
++                    generation
++                }
++                _ => return Ok(None),
++            };
++            let snapshot = EqualSendSnapshot {
++                account_id: account.into(),
++                projected_state_generation: String::from_utf8(cipher_generation(&cipher))?,
++                state_cipher: cipher,
++                logout_epoch: value(&tx, "logout-epoch")?,
++                owner: owner.into(),
++                credential_generation: generation,
++            };
++            if !snapshot_current(&tx, &snapshot)?
++                || value(&tx, "saved-login-projection-needed")?.is_some()
++                || value(&tx, NETWORK_BLOCKED_STATE)?.is_some()
++            {
++                return Ok(None);
++            }
++            Ok(Some(snapshot))
++        })
++    }
++
++    /// The receipt always precedes application parsing. Optional metadata may
++    /// fail independently, but must never replace the original protected bytes.
++    pub fn retain_equal_send_receipt(
++        &self,
++        account: &str,
++        id: &str,
++        sealed: &[u8],
++        snapshot: Option<&EqualSendSnapshot>,
++    ) -> Result<ReceiptDisposition> {
++        anyhow::ensure!(
++            !id.is_empty() && id.len() <= 200 && !sealed.is_empty(),
++            "invalid_quote_receipt"
++        );
++        let key = format!("{RECEIPT_PREFIX}{id}");
++        let mut committed = false;
++        let mut commit_attempted = false;
++        let mut optional_metadata_started = false;
++        let result = self.control(account, |db| {
++            let mut tx = db.transaction()?;
++            if value(&tx, &key)?.is_some() {
++                return Ok(ReceiptWrite::Existing);
++            }
++            tx.execute("INSERT INTO runtime VALUES(?1,?2)", params![key, sealed])?;
++            let mut disposition = ReceiptDisposition::MetadataFallback;
++            if let Some(snapshot) = snapshot {
++                optional_metadata_started = true;
++                let submitting: bool = tx.query_row(
++                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE id=?1 AND state='submitting')",
++                    [id],
++                    |r| r.get(0),
++                )?;
++                if snapshot.account_id != account || !authorization_current(&tx, snapshot)? {
++                    disposition = ReceiptDisposition::AuthorizationSuperseded;
++                } else if submitting
++                    && snapshot_current(&tx, snapshot)?
++                    && value(&tx, "saved-login-projection-needed")?.is_none()
++                    && value(&tx, NETWORK_BLOCKED_STATE)?.is_none()
++                {
++                    let token = format!("equal-send:{id}:{}", uuid::Uuid::new_v4()).into_bytes();
++                    let mut savepoint = tx.savepoint()?;
++                    let metadata = (|| -> Result<()> {
++                        savepoint.execute(
++                            "INSERT INTO runtime VALUES('saved-login-projection-needed',?1)",
++                            [token.as_slice()],
++                        )?;
++                        savepoint.execute(
++                            "INSERT INTO runtime VALUES(?1,?2)",
++                            params![
++                                NETWORK_BLOCKED_STATE,
++                                cipher_generation(&snapshot.state_cipher)
++                            ],
++                        )?;
++                        Ok(())
++                    })();
++                    match metadata {
++                        Ok(()) => {
++                            savepoint.commit()?;
++                            disposition = ReceiptDisposition::Staged(EqualSendStage {
++                                snapshot: snapshot.clone(),
++                                intent_id: id.into(),
++                                token,
++                            });
++                        }
++                        Err(_) => {
++                            // ABORT leaves this savepoint usable; ROLLBACK and
++                            // fatal IO errors reach the receipt-only fallback.
++                            savepoint.rollback()?;
++                            savepoint.commit()?;
++                        }
++                    }
++                }
++            }
++            commit_attempted = true;
++            tx.commit()?;
++            committed = true;
++            Ok(ReceiptWrite::Retained(disposition))
++        });
++        match result {
++            Ok(ReceiptWrite::Existing) => bail!("quote_receipt_already_retained"),
++            Ok(ReceiptWrite::Retained(disposition)) => Ok(disposition),
++            Err(error) => {
++                // Visibility cannot prove a failed COMMIT reached stable
++                // storage. Keep that outcome unknown rather than parse it.
++                if !committed && (commit_attempted || !optional_metadata_started) {
++                    return Err(error);
++                }
++                // A metadata error may roll back the entire outer transaction.
++                // Re-enter normal Store admission; never bypass family checks.
++                self.retain_original_receipt_only(account, &key, sealed, committed)
++                    .map_err(|fallback| fallback.context(error))?;
++                Ok(ReceiptDisposition::MetadataFallback)
++            }
++        }
++    }
++
++    /// Preserve the original auth path when only coalescing eligibility changed.
++    /// The context CAS is in this transaction, not in a preceding Core read.
++    pub fn save_accepted_equal_fallback(
++        &self,
++        account: &str,
++        snapshot: &EqualSendSnapshot,
++        new_cipher: &[u8],
++    ) -> Result<bool> {
++        fresh_cipher(&snapshot.state_cipher, new_cipher)?;
++        if snapshot.account_id != account {
++            return Ok(false);
++        }
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            if !authorization_current(&tx, snapshot)? {
++                return Ok(false);
++            }
++            tx.execute(
++                "UPDATE runtime SET value=?1 WHERE key='account-state'",
++                [new_cipher],
++            )?;
++            crate::authorization::accepted_projection_needed(&tx, new_cipher)?;
++            tx.commit()?;
++            Ok(true)
++        })
++    }
++
++    fn retain_original_receipt_only(
++        &self,
++        account: &str,
++        key: &str,
++        sealed: &[u8],
++        known_committed: bool,
++    ) -> Result<()> {
++        enum Outcome {
++            Saved,
++            ExistingDifferent,
++            DurabilityUnknown,
++        }
++        let outcome = self.control(account, |db| {
++            let tx = db.transaction()?;
++            if let Some(existing) = value(&tx, key)? {
++                if existing != sealed {
++                    return Ok(Outcome::ExistingDifferent);
++                }
++                return Ok(if known_committed {
++                    Outcome::Saved
++                } else {
++                    Outcome::DurabilityUnknown
++                });
++            }
++            tx.execute("INSERT INTO runtime VALUES(?1,?2)", params![key, sealed])?;
++            tx.commit()?;
++            Ok(Outcome::Saved)
++        })?;
++        match outcome {
++            Outcome::Saved => Ok(()),
++            Outcome::ExistingDifferent => bail!("quote_receipt_already_retained"),
++            Outcome::DurabilityUnknown => bail!("quote_receipt_durability_unknown"),
++        }
++    }
++
++    pub fn finalize_equal_send(
++        &self,
++        account: &str,
++        send: SendFinalUpdate<'_>,
++        stage: &EqualSendStage,
++        new_cipher: &[u8],
++    ) -> Result<EqualSendFinalResult> {
++        anyhow::ensure!(
++            stage.intent_id == send.id && stage.snapshot.account_id == account,
++            "invalid_equal_send_intent"
++        );
++        fresh_cipher(&stage.snapshot.state_cipher, new_cipher)?;
++        let result = self.control(account, |db| {
++            let tx = db.transaction()?;
++            let install = snapshot_current(&tx, &stage.snapshot)?
++                && value(&tx, "saved-login-projection-needed")?.as_deref() == Some(stage.token.as_slice())
++                && network_generation_blocked(&tx, &stage.snapshot.state_cipher)?;
++            if install {
++                (|| -> Result<()> {
++                    tx.execute("INSERT INTO runtime VALUES('account-state',?1) ON CONFLICT(key)DO UPDATE SET value=excluded.value", [new_cipher])?;
++                    crate::authorization::accepted_projection_needed(&tx, new_cipher)?;
++                    let generation = cipher_generation(new_cipher);
++                    for (key, value) in [
++                        ("saved-login-projected-generation", stage.snapshot.credential_generation.as_bytes()),
++                        ("saved-login-projected-state-generation", generation.as_slice()),
++                    ] {
++                        tx.execute("INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key)DO UPDATE SET value=excluded.value", params![key,value])?;
++                    }
++                    tx.execute("DELETE FROM runtime WHERE key IN ('saved-login-publication','saved-login-projection-needed')", [])?;
++                    Ok(())
++                })().map_err(EqualAuthMetadataFailure)?;
++            }
++            let intent = update_send_in_tx(&tx, account, &send)?;
++            tx.commit()?;
++            Ok(EqualSendFinalResult { intent, authorization_installed: install })
++        });
++        match result {
++            Err(error) if error.downcast_ref::<EqualAuthMetadataFailure>().is_some() => {
++                let intent =
++                    self.update_send(account, send.id, send.state, send.server_id, send.error)?;
++                Ok(EqualSendFinalResult {
++                    intent,
++                    authorization_installed: false,
++                })
++            }
++            other => other,
++        }
++    }
++
++    pub fn blocked_authorization_snapshot(
++        &self,
++        account: &str,
++    ) -> Result<Option<BlockedAuthorizationSnapshot>> {
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            let Some(cipher) = value(&tx, "account-state")? else {
++                return Ok(None);
++            };
++            if value(&tx, "logged-out")?.is_some()
++                || !network_generation_blocked(&tx, &cipher)?
++                || value(&tx, "saved-login-accepted-state-generation")?.as_deref()
++                    != Some(cipher_generation(&cipher).as_slice())
++            {
++                return Ok(None);
++            }
++            Ok(Some(BlockedAuthorizationSnapshot {
++                account_id: account.into(),
++                state_cipher: cipher,
++                logout_epoch: value(&tx, "logout-epoch")?,
++                validated_owner: value(&tx, "validated-generation")?,
++                desired: value(&tx, "desired")?,
++            }))
++        })
++    }
++
++    pub fn repair_blocked_authorization(
++        &self,
++        account: &str,
++        snapshot: &BlockedAuthorizationSnapshot,
++        new_cipher: &[u8],
++    ) -> Result<bool> {
++        fresh_cipher(&snapshot.state_cipher, new_cipher)?;
++        if snapshot.account_id != account {
++            return Ok(false);
++        }
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            if value(&tx, "logged-out")?.is_some()
++                || value(&tx, "logout-epoch")? != snapshot.logout_epoch
++                || value(&tx, "validated-generation")? != snapshot.validated_owner
++                || value(&tx, "desired")? != snapshot.desired
++                || value(&tx, "account-state")?.as_deref() != Some(snapshot.state_cipher.as_slice())
++                || value(&tx, "saved-login-accepted-state-generation")?.as_deref()
++                    != Some(cipher_generation(&snapshot.state_cipher).as_slice())
++                || !network_generation_blocked(&tx, &snapshot.state_cipher)?
++            {
++                return Ok(false);
++            }
++            tx.execute(
++                "UPDATE runtime SET value=?1 WHERE key='account-state'",
++                [new_cipher],
++            )?;
++            crate::authorization::accepted_projection_needed(&tx, new_cipher)?;
++            tx.commit()?;
++            Ok(true)
++        })
++    }
++}
++
++#[cfg(test)]
++#[path = "equal_send_persistence_tests.rs"]
++mod tests;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence_tests.rs b/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/equal_send_persistence_tests.rs
+@@ -0,0 +1,640 @@
++use super::*;
++use std::{
++    ffi::{c_void, CStr},
++    sync::atomic::{AtomicUsize, Ordering},
++};
++
++const OLD: &[u8] = b"old-protected-full-auth";
++const FRESH: &[u8] = b"fresh-protected-equal-full-auth";
++const RAW: &[u8] = b"original-protected-correlated-receipt";
++
++fn setup() -> (tempfile::TempDir, Arc<Store>, SendIntent, EqualSendSnapshot) {
++    let dir = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    drop(store.read_snapshot("one").unwrap());
++    store.save_accepted_authorization("one", OLD).unwrap();
++    store.put_runtime("one", "desired", b"connected").unwrap();
++    store.mark_validated_if_active("one", "owner").unwrap();
++    store
++        .put_runtime(
++            "one",
++            "saved-login-projected-generation",
++            "a".repeat(64).as_bytes(),
++        )
++        .unwrap();
++    store
++        .put_runtime(
++            "one",
++            "saved-login-projected-state-generation",
++            &cipher_generation(OLD),
++        )
++        .unwrap();
++    store
++        .clear_runtime("one", "saved-login-projection-needed")
++        .unwrap();
++    let intent = store
++        .create_send(
++            "one",
++            "reply",
++            "room",
++            "payload-hash",
++            b"frozen-payload",
++            "7",
++        )
++        .unwrap()
++        .0;
++    assert!(store.claim_send("one", &intent.id).unwrap());
++    let snapshot = store
++        .capture_equal_send_snapshot("one", "owner")
++        .unwrap()
++        .unwrap();
++    store
++        .control("one", |db| {
++            db.execute_batch(
++                "CREATE TEMP TABLE equal_canary(value); INSERT INTO equal_canary VALUES(7)",
++            )?;
++            Ok(())
++        })
++        .unwrap();
++    (dir, store, intent, snapshot)
++}
++fn receipt_key(id: &str) -> String {
++    format!("quote-receipt:{id}")
++}
++fn stage(store: &Store, intent: &SendIntent, snapshot: &EqualSendSnapshot) -> EqualSendStage {
++    match store
++        .retain_equal_send_receipt("one", &intent.id, RAW, Some(snapshot))
++        .unwrap()
++    {
++        ReceiptDisposition::Staged(stage) => stage,
++        _ => panic!("not staged"),
++    }
++}
++fn finish(
++    store: &Store,
++    intent: &SendIntent,
++    stage: &EqualSendStage,
++) -> Result<EqualSendFinalResult> {
++    store.finalize_equal_send(
++        "one",
++        SendFinalUpdate {
++            id: &intent.id,
++            state: "accepted",
++            server_id: Some("17"),
++            error: None,
++        },
++        stage,
++        FRESH,
++    )
++}
++fn assert_raw(store: &Store, intent: &SendIntent) {
++    assert_eq!(
++        store
++            .runtime("one", &receipt_key(&intent.id))
++            .unwrap()
++            .as_deref(),
++        Some(RAW)
++    );
++}
++fn assert_blocked(store: &Store) {
++    assert_eq!(
++        store.runtime("one", NETWORK_BLOCKED_STATE).unwrap(),
++        Some(cipher_generation(OLD))
++    );
++    assert!(store
++        .save_network_authorization("one", b"late-push", OLD, None, Some(b"connected"))
++        .is_err());
++}
++fn canary(store: &Store) {
++    let n: i64 = store
++        .control("one", |db| {
++            Ok(db.query_row("SELECT value FROM equal_canary", [], |r| r.get(0))?)
++        })
++        .unwrap();
++    assert_eq!(n, 7);
++}
++
++struct Commits<'a> {
++    store: &'a Store,
++    count: Arc<AtomicUsize>,
++}
++unsafe extern "C" fn count_commit(
++    kind: u32,
++    context: *mut c_void,
++    statement: *mut c_void,
++    _sql: *mut c_void,
++) -> std::ffi::c_int {
++    if kind == rusqlite::ffi::SQLITE_TRACE_STMT as u32 {
++        let text = rusqlite::ffi::sqlite3_sql(statement.cast());
++        if !text.is_null()
++            && CStr::from_ptr(text)
++                .to_bytes()
++                .eq_ignore_ascii_case(b"COMMIT")
++        {
++            (&*context.cast::<AtomicUsize>()).fetch_add(1, Ordering::SeqCst);
++        }
++    }
++    0
++}
++impl<'a> Commits<'a> {
++    fn new(store: &'a Store) -> Self {
++        let count = Arc::new(AtomicUsize::new(0));
++        store
++            .control("one", |db| {
++                let rc = unsafe {
++                    rusqlite::ffi::sqlite3_trace_v2(
++                        db.handle(),
++                        rusqlite::ffi::SQLITE_TRACE_STMT as u32,
++                        Some(count_commit),
++                        Arc::as_ptr(&count).cast_mut().cast(),
++                    )
++                };
++                anyhow::ensure!(rc == rusqlite::ffi::SQLITE_OK, "trace setup failed");
++                Ok(())
++            })
++            .unwrap();
++        Self { store, count }
++    }
++}
++impl Drop for Commits<'_> {
++    fn drop(&mut self) {
++        let _ = self.store.control("one", |db| {
++            unsafe {
++                rusqlite::ffi::sqlite3_trace_v2(db.handle(), 0, None, std::ptr::null_mut());
++            }
++            Ok(())
++        });
++    }
++}
++unsafe extern "C" fn deny_commit(
++    _ctx: *mut c_void,
++    action: std::ffi::c_int,
++    first: *const std::ffi::c_char,
++    _second: *const std::ffi::c_char,
++    _db: *const std::ffi::c_char,
++    _trigger: *const std::ffi::c_char,
++) -> std::ffi::c_int {
++    if action == rusqlite::ffi::SQLITE_TRANSACTION
++        && !first.is_null()
++        && CStr::from_ptr(first).to_bytes() == b"COMMIT"
++    {
++        rusqlite::ffi::SQLITE_DENY
++    } else {
++        rusqlite::ffi::SQLITE_OK
++    }
++}
++fn reject_commit(store: &Store) {
++    store
++        .control("one", |db| {
++            let rc = unsafe {
++                rusqlite::ffi::sqlite3_set_authorizer(
++                    db.handle(),
++                    Some(deny_commit),
++                    std::ptr::null_mut(),
++                )
++            };
++            anyhow::ensure!(rc == rusqlite::ffi::SQLITE_OK, "authorizer setup failed");
++            Ok(())
++        })
++        .unwrap();
++}
++
++#[test]
++fn equal_send_raw_and_fresh_final_need_two_full_commits() {
++    let (_dir, store, intent, snapshot) = setup();
++    let counter = Commits::new(&store);
++    let staged = stage(&store, &intent, &snapshot);
++    assert_eq!(counter.count.load(Ordering::SeqCst), 1);
++    assert_raw(&store, &intent);
++    assert_eq!(
++        store.runtime("one", "account-state").unwrap().as_deref(),
++        Some(OLD)
++    );
++    assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++    assert_blocked(&store);
++    canary(&store);
++    let final_result = finish(&store, &intent, &staged).unwrap();
++    assert!(final_result.authorization_installed);
++    assert_eq!(final_result.intent.state, "accepted");
++    assert_eq!(counter.count.load(Ordering::SeqCst), 2);
++    assert_eq!(
++        store.runtime("one", "account-state").unwrap().as_deref(),
++        Some(FRESH)
++    );
++    assert_eq!(
++        store
++            .runtime("one", "saved-login-accepted-state-generation")
++            .unwrap(),
++        Some(cipher_generation(FRESH))
++    );
++    assert_eq!(
++        store
++            .runtime("one", "saved-login-projected-state-generation")
++            .unwrap(),
++        Some(cipher_generation(FRESH))
++    );
++    assert!(store
++        .runtime("one", NETWORK_BLOCKED_STATE)
++        .unwrap()
++        .is_none());
++    assert!(store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_none());
++    assert!(store
++        .save_network_authorization("one", b"late-push", OLD, None, Some(b"connected"))
++        .is_err());
++    assert_raw(&store, &intent);
++}
++
++#[test]
++fn raw_commit_is_immutable_and_expected_duplicate_preserves_writer() {
++    let (_dir, store, intent, snapshot) = setup();
++    let _stage = stage(&store, &intent, &snapshot);
++    assert!(store
++        .retain_equal_send_receipt("one", &intent.id, b"replacement", None)
++        .is_err());
++    assert_raw(&store, &intent);
++    canary(&store);
++    assert_blocked(&store);
++}
++
++#[test]
++fn optional_metadata_abort_and_outer_rollback_keep_original_raw() {
++    for failure in ["ABORT", "ROLLBACK"] {
++        let (_dir, store, intent, snapshot) = setup();
++        store.control("one",|db| {db.execute_batch(&format!("CREATE TRIGGER reject_optional BEFORE INSERT ON runtime WHEN NEW.key='network-blocked-state' BEGIN SELECT RAISE({failure},'synthetic metadata fault'); END"))?;Ok(())}).unwrap();
++        let staged = store
++            .retain_equal_send_receipt("one", &intent.id, RAW, Some(&snapshot))
++            .unwrap();
++        assert!(matches!(staged, ReceiptDisposition::MetadataFallback));
++        assert_raw(&store, &intent);
++        assert!(store
++            .runtime("one", NETWORK_BLOCKED_STATE)
++            .unwrap()
++            .is_none());
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_none());
++        assert_eq!(
++            store.runtime("one", "account-state").unwrap().as_deref(),
++            Some(OLD)
++        );
++    }
++}
++
++#[test]
++fn raw_commit_error_stays_unknown_without_independent_retry_or_parse() {
++    let (_dir, store, intent, snapshot) = setup();
++    reject_commit(&store);
++    assert!(store
++        .retain_equal_send_receipt("one", &intent.id, RAW, Some(&snapshot))
++        .is_err());
++    assert!(store
++        .runtime("one", &receipt_key(&intent.id))
++        .unwrap()
++        .is_none());
++    assert!(store
++        .runtime("one", NETWORK_BLOCKED_STATE)
++        .unwrap()
++        .is_none());
++    assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++}
++
++#[test]
++fn original_raw_write_fault_is_not_masked_by_metadata_fallback() {
++    let (_dir, store, intent, snapshot) = setup();
++    store.control("one",|db| {db.execute_batch("CREATE TRIGGER reject_raw BEFORE INSERT ON runtime WHEN NEW.key LIKE 'quote-receipt:%' BEGIN SELECT RAISE(ABORT,'synthetic raw fault'); END")?;Ok(())}).unwrap();
++    assert!(store
++        .retain_equal_send_receipt("one", &intent.id, RAW, Some(&snapshot))
++        .is_err());
++    assert!(store
++        .runtime("one", &receipt_key(&intent.id))
++        .unwrap()
++        .is_none());
++    assert!(store
++        .runtime("one", NETWORK_BLOCKED_STATE)
++        .unwrap()
++        .is_none());
++}
++
++#[test]
++fn auth_and_auth_fallback_failure_still_block_old_push_and_keep_send_fact() {
++    let (_dir, store, intent, snapshot) = setup();
++    let staged = stage(&store, &intent, &snapshot);
++    store.control("one",|db| {db.execute_batch("CREATE TRIGGER reject_auth BEFORE INSERT ON runtime WHEN NEW.key='account-state' BEGIN SELECT RAISE(ABORT,'synthetic auth fault'); END")?;Ok(())}).unwrap();
++    let final_result = finish(&store, &intent, &staged).unwrap();
++    assert!(!final_result.authorization_installed);
++    assert_eq!(final_result.intent.state, "accepted");
++    assert!(store.save_accepted_authorization("one", FRESH).is_err());
++    assert_blocked(&store);
++    assert_raw(&store, &intent);
++    assert!(store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_some());
++}
++
++#[test]
++fn final_commit_failure_keeps_raw_recovery_work_and_blocks_old_push() {
++    let (_dir, store, intent, snapshot) = setup();
++    let staged = stage(&store, &intent, &snapshot);
++    reject_commit(&store);
++    assert!(finish(&store, &intent, &staged).is_err());
++    assert_raw(&store, &intent);
++    assert_blocked(&store);
++    assert!(store
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_some());
++    assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++}
++
++#[test]
++fn outbox_or_event_failure_rolls_back_fresh_auth_but_keeps_raw_and_block() {
++    for (table, event) in [("outbox", "UPDATE"), ("events", "INSERT")] {
++        let (_dir, store, intent, snapshot) = setup();
++        let staged = stage(&store, &intent, &snapshot);
++        store.control("one",|db| {db.execute_batch(&format!("CREATE TRIGGER reject_final BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT,'synthetic final fault'); END"))?;Ok(())}).unwrap();
++        assert!(finish(&store, &intent, &staged).is_err());
++        assert_raw(&store, &intent);
++        assert_blocked(&store);
++        assert_eq!(
++            store.runtime("one", "account-state").unwrap().as_deref(),
++            Some(OLD)
++        );
++        assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++    }
++}
++
++#[test]
++fn stale_final_fences_only_suppress_auth_and_never_erase_send_fact() {
++    for change in [
++        "owner",
++        "epoch",
++        "desired",
++        "cipher",
++        "journal",
++        "projected",
++        "token",
++        "logout",
++    ] {
++        let (_dir, store, intent, snapshot) = setup();
++        let staged = stage(&store, &intent, &snapshot);
++        match change {
++            "owner" => store
++                .put_runtime("one", "validated-generation", b"other")
++                .unwrap(),
++            "epoch" => store.put_runtime("one", "logout-epoch", b"new").unwrap(),
++            "desired" => store
++                .put_runtime("one", "desired", b"disconnected")
++                .unwrap(),
++            "cipher" => store
++                .save_accepted_authorization("one", b"changed-cookie-auth")
++                .unwrap(),
++            "journal" => store
++                .put_runtime("one", "saved-login-publication", b"new-journal")
++                .unwrap(),
++            "projected" => store
++                .put_runtime(
++                    "one",
++                    "saved-login-projected-generation",
++                    "b".repeat(64).as_bytes(),
++                )
++                .unwrap(),
++            "token" => store
++                .put_runtime("one", "saved-login-projection-needed", b"other-token")
++                .unwrap(),
++            "logout" => store
++                .put_runtime("one", "logged-out", b"new-epoch")
++                .unwrap(),
++            _ => unreachable!(),
++        }
++        let final_result = finish(&store, &intent, &staged).unwrap();
++        assert!(!final_result.authorization_installed);
++        assert_eq!(final_result.intent.state, "accepted");
++        assert_raw(&store, &intent);
++        assert_ne!(
++            store.runtime("one", "account-state").unwrap().as_deref(),
++            Some(FRESH)
++        );
++        canary(&store);
++    }
++}
++
++#[test]
++fn same_cipher_reinstall_does_not_clear_block_but_new_accepted_and_login_do() {
++    for login in [false, true] {
++        let (_dir, store, intent, snapshot) = setup();
++        let _staged = stage(&store, &intent, &snapshot);
++        store.save_accepted_authorization("one", OLD).unwrap();
++        assert_blocked(&store);
++        if login {
++            store
++                .commit_login_authorization("one", FRESH, None, "new-owner")
++                .unwrap();
++        } else {
++            store.save_accepted_authorization("one", FRESH).unwrap();
++        }
++        assert!(store
++            .runtime("one", NETWORK_BLOCKED_STATE)
++            .unwrap()
++            .is_none());
++        assert!(store
++            .save_network_authorization("one", b"old-result", OLD, None, Some(b"connected"))
++            .is_err());
++        assert_raw(&store, &intent);
++    }
++}
++
++#[test]
++fn blocked_repair_survives_restart_and_preserves_disconnected_owner_marker() {
++    let (dir, store, intent, snapshot) = setup();
++    let _staged = stage(&store, &intent, &snapshot);
++    store
++        .put_runtime("one", "desired", b"disconnected")
++        .unwrap();
++    drop(store);
++    let reopened = Store::open(&dir.path().join("data")).unwrap();
++    reopened.recover_uncertain_sends("one").unwrap();
++    let repair = reopened
++        .blocked_authorization_snapshot("one")
++        .unwrap()
++        .unwrap();
++    assert_eq!(repair.desired.as_deref(), Some(b"disconnected".as_slice()));
++    assert_eq!(repair.validated_owner.as_deref(), Some(b"owner".as_slice()));
++    assert!(reopened
++        .repair_blocked_authorization("one", &repair, FRESH)
++        .unwrap());
++    assert!(reopened
++        .runtime("one", NETWORK_BLOCKED_STATE)
++        .unwrap()
++        .is_none());
++    assert!(reopened
++        .runtime("one", "saved-login-projection-needed")
++        .unwrap()
++        .is_some());
++    assert_eq!(reopened.runtime("one", "desired").unwrap(), repair.desired);
++    assert_eq!(
++        reopened.runtime("one", "validated-generation").unwrap(),
++        repair.validated_owner
++    );
++    assert_eq!(
++        reopened
++            .pending_send_receipt_ids("one", RECEIPT_PREFIX)
++            .unwrap(),
++        vec![intent.id.clone()]
++    );
++    assert_raw(&reopened, &intent);
++}
++
++#[test]
++fn blocked_repair_policy_conflicts_are_typed_and_preserve_writer() {
++    for change in ["owner", "epoch", "desired", "logout", "cipher"] {
++        let (_dir, store, intent, snapshot) = setup();
++        let _staged = stage(&store, &intent, &snapshot);
++        let repair = store
++            .blocked_authorization_snapshot("one")
++            .unwrap()
++            .unwrap();
++        match change {
++            "owner" => store
++                .put_runtime("one", "validated-generation", b"new")
++                .unwrap(),
++            "epoch" => store.put_runtime("one", "logout-epoch", b"new").unwrap(),
++            "desired" => store
++                .put_runtime("one", "desired", b"disconnected")
++                .unwrap(),
++            "logout" => store.put_runtime("one", "logged-out", b"new").unwrap(),
++            "cipher" => store
++                .save_accepted_authorization("one", b"other-auth")
++                .unwrap(),
++            _ => unreachable!(),
++        }
++        assert!(!store
++            .repair_blocked_authorization("one", &repair, FRESH)
++            .unwrap());
++        assert_raw(&store, &intent);
++        canary(&store);
++    }
++}
++
++#[test]
++fn missing_projected_pending_journal_or_current_owner_never_capture_fast_path() {
++    for key in [
++        "saved-login-projection-needed",
++        "saved-login-publication",
++        NETWORK_BLOCKED_STATE,
++        "saved-login-projected-state-generation",
++        "validated-generation",
++    ] {
++        let (_dir, store, intent, _snapshot) = setup();
++        store.put_runtime("one", key, b"unproven").unwrap();
++        assert!(store
++            .capture_equal_send_snapshot("one", "owner")
++            .unwrap()
++            .is_none());
++        assert!(matches!(
++            store
++                .retain_equal_send_receipt("one", &intent.id, RAW, None)
++                .unwrap(),
++            ReceiptDisposition::MetadataFallback
++        ));
++        assert_raw(&store, &intent);
++        canary(&store);
++    }
++}
++
++#[test]
++fn desired_or_pending_changes_allow_fenced_auth_without_dropping_new_cookie() {
++    for change in ["desired", "needed", "journal"] {
++        let (_dir, store, intent, snapshot) = setup();
++        match change {
++            "desired" => store
++                .put_runtime("one", "desired", b"disconnected")
++                .unwrap(),
++            "needed" => store
++                .put_runtime("one", "saved-login-projection-needed", b"pending")
++                .unwrap(),
++            "journal" => store
++                .put_runtime("one", "saved-login-publication", b"pending-journal")
++                .unwrap(),
++            _ => unreachable!(),
++        }
++        assert!(matches!(
++            store
++                .retain_equal_send_receipt("one", &intent.id, RAW, Some(&snapshot))
++                .unwrap(),
++            ReceiptDisposition::MetadataFallback
++        ));
++        let desired = store.runtime("one", "desired").unwrap();
++        assert!(store
++            .save_accepted_equal_fallback("one", &snapshot, b"new-cookie-full-state")
++            .unwrap());
++        assert_eq!(
++            store.runtime("one", "account-state").unwrap().as_deref(),
++            Some(b"new-cookie-full-state".as_slice())
++        );
++        assert_eq!(store.runtime("one", "desired").unwrap(), desired);
++        assert_raw(&store, &intent);
++    }
++}
++
++#[test]
++fn authorization_superseded_during_rpc_never_installs_old_result() {
++    for change in ["owner", "epoch", "cipher", "logout"] {
++        let (_dir, store, intent, snapshot) = setup();
++        match change {
++            "owner" => store
++                .put_runtime("one", "validated-generation", b"new-owner")
++                .unwrap(),
++            "epoch" => store
++                .put_runtime("one", "logout-epoch", b"new-epoch")
++                .unwrap(),
++            "cipher" => store
++                .save_accepted_authorization("one", b"newer-auth")
++                .unwrap(),
++            "logout" => store
++                .put_runtime("one", "logged-out", b"new-epoch")
++                .unwrap(),
++            _ => unreachable!(),
++        }
++        assert!(matches!(
++            store
++                .retain_equal_send_receipt("one", &intent.id, RAW, Some(&snapshot))
++                .unwrap(),
++            ReceiptDisposition::AuthorizationSuperseded
++        ));
++        assert!(!store
++            .save_accepted_equal_fallback("one", &snapshot, b"stale-rpc-result")
++            .unwrap());
++        assert_ne!(
++            store.runtime("one", "account-state").unwrap().as_deref(),
++            Some(b"stale-rpc-result".as_slice())
++        );
++        assert_raw(&store, &intent);
++        canary(&store);
++    }
++}
++
++#[test]
++fn staged_profile_proof_failure_uses_fenced_original_three_commit_path() {
++    let (_dir, store, intent, snapshot) = setup();
++    let counter = Commits::new(&store);
++    let _staged = stage(&store, &intent, &snapshot);
++    assert!(store
++        .save_accepted_equal_fallback("one", &snapshot, FRESH)
++        .unwrap());
++    let final_intent = store
++        .update_send("one", &intent.id, "accepted", Some("17"), None)
++        .unwrap();
++    assert_eq!(final_intent.state, "accepted");
++    assert_eq!(counter.count.load(Ordering::SeqCst), 3);
++    assert!(store
++        .runtime("one", NETWORK_BLOCKED_STATE)
++        .unwrap()
++        .is_none());
++    assert_raw(&store, &intent);
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/lib.rs b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -8,6 +8,7 @@
+ #[cfg(test)]
+ mod control_writer_tests;
+ pub mod copy;
++mod equal_send_persistence;
+ mod event_consumers;
+ mod group_mutations;
+ mod media;
+@@ -25,6 +26,7 @@
+ mod settings;
+ pub mod vault;
+ use anyhow::{bail, Context, Result};
++pub use equal_send_persistence::*;
+ pub use event_consumers::RequiredEventConsumer;
+ use fs2::FileExt;
+ pub use group_mutations::*;

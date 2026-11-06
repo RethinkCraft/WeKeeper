@@ -1,8 +1,9 @@
 # Installation and operation
 
-WeKeeper 0.5.0 is a local Linux WeChat archive. The distribution and import name
+WeKeeper 0.7.0 is a local Linux WeChat archive with an optional web dashboard. The distribution and import name
 remain `chatlog-keeper` and `chatlog_keeper`; the CLI is `chatlog-keeper` and the
-MCP server identifier is `wechat-archive`.
+MCP server identifier is `wechat-archive`. The optional `wekeeper-dashboard` CLI
+and cloud deployment are described in [dashboard operation](dashboard.md).
 
 ## Verified environment
 
@@ -81,7 +82,7 @@ unavailable. Recheck compatibility after a client update.
 
 ## Commands
 
-Run `chatlog-keeper COMMAND --help` for each command's exact flags. All eight
+Run `chatlog-keeper COMMAND --help` for each command's exact flags. The archive
 commands accept optional `--data-root` and `--account` selectors.
 
 | Command | Behavior and command-specific options |
@@ -145,7 +146,7 @@ and state paths in [the MCP template](../examples/mcp-config.toml). The equivale
 Codex registration is:
 
 ```bash
-codex mcp add wechat-archive --env CHATLOG_KEEPER_DATA_DIR=/absolute/private/state --env CHATLOG_KEEPER_RUNTIME_VERSION=0.5.0 -- /absolute/WeKeeper/.venv/bin/python -m chatlog_keeper.mcp_server --state-dir /absolute/private/state
+codex mcp add wechat-archive --env CHATLOG_KEEPER_DATA_DIR=/absolute/private/state --env CHATLOG_KEEPER_RUNTIME_VERSION=0.7.0 -- /absolute/WeKeeper/.venv/bin/python -m chatlog_keeper.mcp_server --state-dir /absolute/private/state
 ```
 
 Initialize the archive with collection before querying. Reload the MCP connection
@@ -200,12 +201,9 @@ type in the composer, use OCR, or invoke a local/third-party ASR service.
 
 ## Upgrade, backup and recovery
 
-Version 0.5.0 uses schema 4 and parser 4. Opening a writable archive from schema
-1, 2 or 3 first creates a private consistent backup under `archive/backups/`.
-Historical reparsing proceeds in batches of at most 500 per collector cycle,
-while retaining message references, first-seen timestamps and source checkpoints.
-Restart the collector and reload MCP after an upgrade; old processes cannot read
-the new schema. Inspect `get_status.semantics` for pending work or source gaps.
+Version 0.7.0 preserves existing archive schema 4 and 5 on both read and write; new archives use schema 5. Older schema 1, 2 or 3 retains the prior explicit backup/migration path. Historical reparsing remains bounded and preserves message references, first-seen timestamps and source checkpoints.
+
+Private questions, sync, avatar writes and protocol control all support the existing schema 4 archive. Upgrading does not require changing its version. Preserve the private source identity, worker queues and authorization. Scheduled summaries and the former UI bot are removed; use the [0.7.0 upgrade procedure](upgrading.md) for local-first service cutover and cloud schema 3 cleanup.
 
 For a full consistent backup, stop the collector, copy the entire private state
 directory including media and decoding material to a protected destination, then

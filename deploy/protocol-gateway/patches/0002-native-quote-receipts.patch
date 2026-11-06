@@ -1,0 +1,800 @@
+diff --git a/.changeset/retain-native-quote-receipts.md b/.changeset/retain-native-quote-receipts.md
+new file mode 100644
+--- /dev/null
++++ b/.changeset/retain-native-quote-receipts.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Keep authenticated native quote responses encrypted before parsing them and bind each response to its original account, send and payload. Reopen retained responses after a restart without sending again. Stop accepting file-shaped success replies as quote receipts: native quote success remains `needs_review` until the supported Linux response schema has independent evidence. Preserve explicit service rejections and keep simulator results separate from native wire evidence.
+diff --git a/docs/src/content/docs/how-it-works/sends.mdx b/docs/src/content/docs/how-it-works/sends.mdx
+--- a/docs/src/content/docs/how-it-works/sends.mdx
++++ b/docs/src/content/docs/how-it-works/sends.mdx
+@@ -41,6 +41,7 @@
+ Stopping the daemon (or disconnecting) doesn't log you out. Only `wx auth logout` does, and after that the daemon won't reconnect on its own until you log in again.
+ 
+ <Aside title="Good to know">
++- **Native quoted replies still need response validation.** A success-shaped reply currently stays `needs_review` with `quote_receipt_schema_unverified`. Its encrypted response is kept for inspection and can be reopened after a restart without sending again. This is not a confirmed rejection; keep the original key.
+ - **Voice longer than 60 seconds is split** into equal notes. A partial result keeps the IDs of the notes that went out.
+ - **Closing the connection doesn't cancel anything.** Ctrl-C on the CLI or a dropped HTTP request leaves the daemon's work running.
+ - **Media writeback repair:** if a sent or downloaded file didn't make it into the profile's own folders, `wx jobs repair-writeback` finishes the job from files the daemon already has. It never downloads or sends anything.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+new file mode 100644
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -0,0 +1,506 @@
++//! Pending send evidence, not another copy of settled message history.
++//! Native quote responses are sealed before parsing and never fetched again.
++use super::*;
++use anyhow::ensure;
++use base64::{engine::general_purpose::STANDARD, Engine};
++use wechat_protocol::media_send::{MediaSendResult, SendStatus};
++use zeroize::{Zeroize, Zeroizing};
++
++const RECEIPT_PREFIX: &str = "quote-receipt:";
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct QuoteReceipt {
++    version: u8,
++    sender: String,
++    payload_sha256: String,
++    response_base64: String,
++}
++
++impl Drop for QuoteReceipt {
++    fn drop(&mut self) {
++        self.sender.zeroize();
++        self.response_base64.zeroize();
++    }
++}
++
++fn payload_hash(payload: &SendPayload) -> Result<String> {
++    let bytes = Zeroizing::new(serde_json::to_vec(payload)?);
++    Ok(format!("{:x}", Sha256::digest(bytes.as_slice())))
++}
++
++fn decoded_receipt(result: MediaSendResult) -> Result<SendReceipt> {
++    match result.status {
++        SendStatus::Rejected if result.service_code != 0 => Ok(SendReceipt {
++            accepted: false,
++            correlated: false,
++            server_message_id: None,
++        }),
++        SendStatus::ServerAccepted
++            if result.service_code == 0
++                && result.client_id_matches == Some(true)
++                && result.server_message_id.as_deref().is_some_and(|id| {
++                    id.parse::<u64>()
++                        .is_ok_and(|value| value > 0 && value.to_string() == id)
++                }) =>
++        {
++            Ok(SendReceipt {
++                accepted: true,
++                correlated: true,
++                server_message_id: result.server_message_id,
++            })
++        }
++        // An uncorrelated reply is not an explicit service rejection.
++        _ => bail!("quote_receipt_unverified"),
++    }
++}
++
++pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
++    let message = error.to_string();
++    match message.as_str() {
++        wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED => {
++            wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED
++        }
++        "quote_receipt_invalid" => "quote_receipt_invalid",
++        "quote_receipt_unverified" => "quote_receipt_unverified",
++        "quote_receipt_persistence_failed" => "quote_receipt_persistence_failed",
++        "quote_receipt_integrity_failed" => "quote_receipt_integrity_failed",
++        _ => "submission_outcome_unknown",
++    }
++}
++
++impl Core {
++    pub(super) fn send_quote_with_receipt(
++        &self,
++        account: &str,
++        id: &str,
++        state: &mut AccountState,
++        payload: &SendPayload,
++    ) -> Result<SendReceipt> {
++        let quote = payload.quote.as_ref().context("missing_quote_intent")?;
++        if self.upstream_kind() == crate::upstream::UpstreamKind::Simulator {
++            // Simulator decoded results remain marked simulator. They do not
++            // create native wire evidence or validate a native receipt schema.
++            return decoded_receipt(self.upstream.send_quote(
++                state,
++                &payload.thread_id,
++                &payload.client_id.to_string(),
++                payload.created_at,
++                &quote.xml,
++            )?);
++        }
++        let sender = state.own_username.clone();
++        let raw = Zeroizing::new(self.upstream.send_quote_raw(
++            state,
++            &payload.thread_id,
++            &payload.client_id.to_string(),
++            payload.created_at,
++            &quote.xml,
++        )?);
++        self.retain_quote_receipt(account, id, payload, &sender, &raw)
++            .map_err(|_| anyhow::anyhow!("quote_receipt_persistence_failed"))?;
++        self.decode_retained_quote_receipt(account, id, payload)
++    }
++
++    fn retain_quote_receipt(
++        &self,
++        account: &str,
++        id: &str,
++        payload: &SendPayload,
++        sender: &str,
++        raw: &[u8],
++    ) -> Result<()> {
++        ensure!(
++            payload.quote.is_some() && raw.len() <= wechat_protocol::MAX_MESSAGE_BYTES,
++            "invalid_quote_receipt"
++        );
++        let purpose = format!("{RECEIPT_PREFIX}{id}");
++        // A second response must not replace the original attempt's evidence.
++        ensure!(
++            self.store.runtime(account, &purpose)?.is_none(),
++            "quote_receipt_already_retained"
++        );
++        let receipt = QuoteReceipt {
++            version: 1,
++            sender: sender.into(),
++            payload_sha256: payload_hash(payload)?,
++            response_base64: STANDARD.encode(raw),
++        };
++        let bytes = Zeroizing::new(serde_json::to_vec(&receipt)?);
++        let sealed = self.vault.seal(account, &purpose, &bytes)?;
++        self.store.put_runtime(account, &purpose, &sealed)
++    }
++
++    fn decode_retained_quote_receipt(
++        &self,
++        account: &str,
++        id: &str,
++        payload: &SendPayload,
++    ) -> Result<SendReceipt> {
++        let load = || -> Result<Zeroizing<Vec<u8>>> {
++            let purpose = format!("{RECEIPT_PREFIX}{id}");
++            let sealed = self
++                .store
++                .runtime(account, &purpose)?
++                .context("missing_quote_receipt")?;
++            let receipt: QuoteReceipt =
++                serde_json::from_slice(&self.vault.open_record(account, &purpose, &sealed)?)?;
++            ensure!(
++                receipt.version == 1
++                    && payload.quote.is_some()
++                    && receipt.payload_sha256 == payload_hash(payload)?,
++                "quote_receipt_intent_mismatch"
++            );
++            let raw = Zeroizing::new(STANDARD.decode(&receipt.response_base64)?);
++            ensure!(
++                raw.len() <= wechat_protocol::MAX_MESSAGE_BYTES,
++                "invalid_quote_receipt"
++            );
++            Ok(raw)
++        };
++        let raw = load().map_err(|_| anyhow::anyhow!("quote_receipt_integrity_failed"))?;
++        let result = wechat_protocol::quote_send::decode_quote_send(&raw).map_err(|error| {
++            if error.to_string() == wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED {
++                error
++            } else {
++                anyhow::anyhow!("quote_receipt_invalid")
++            }
++        })?;
++        decoded_receipt(result)
++    }
++
++    pub(super) fn recover_quote_receipts(&self, account: &str) -> Result<usize> {
++        // Read only pending IDs; each protected response is opened separately.
++        // Unlike replaying a send, this works without credentials or a network.
++        let ids = self
++            .store
++            .pending_send_receipt_ids(account, RECEIPT_PREFIX)?;
++        let mut changed = 0;
++        for id in ids {
++            let old = self.store.send(account, &id)?;
++            let outcome = (|| -> Result<SendReceipt> {
++                let sealed = self.store.send_payload(account, &id)?;
++                let payload: SendPayload = serde_json::from_slice(&self.vault.open_record(
++                    account,
++                    "send-payload",
++                    &sealed,
++                )?)?;
++                self.decode_retained_quote_receipt(account, &id, &payload)
++            })();
++            let (state, server_id, error) = match outcome {
++                Ok(receipt) if receipt.accepted => ("accepted", receipt.server_message_id, None),
++                Ok(_) => ("failed", None, Some("service_rejected")),
++                Err(error) => ("needs_review", None, Some(error_code(&error))),
++            };
++            if old.state != state
++                || server_id
++                    .as_ref()
++                    .is_some_and(|server| old.server_id.as_ref() != Some(server))
++                || old.error_code.as_deref() != error
++            {
++                self.store
++                    .update_send(account, &id, state, server_id.as_deref(), error)?;
++                changed += 1;
++            }
++        }
++        Ok(changed)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::upstream::{Upstream, UpstreamKind};
++    use std::sync::atomic::AtomicUsize;
++    use wechat_protocol::protobuf as p;
++
++    struct RawReply {
++        calls: AtomicUsize,
++        response: Vec<u8>,
++    }
++
++    impl Upstream for RawReply {
++        fn kind(&self) -> UpstreamKind {
++            UpstreamKind::Native
++        }
++
++        fn send_quote_raw(
++            &self,
++            _state: &mut AccountState,
++            _destination: &str,
++            _client_id: &str,
++            _created_at: u32,
++            _content: &str,
++        ) -> Result<Vec<u8>> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            Ok(self.response.clone())
++        }
++    }
++
++    struct Fixture {
++        _directory: tempfile::TempDir,
++        core: Arc<Core>,
++        store: Arc<Store>,
++        upstream: Arc<RawReply>,
++    }
++
++    fn fixture(raw: Vec<u8>) -> Fixture {
++        let directory = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
++        store.create_account("one").unwrap();
++        store.create_account("two").unwrap();
++        let upstream = Arc::new(RawReply {
++            calls: AtomicUsize::new(0),
++            response: raw,
++        });
++        let core = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
++        Fixture {
++            _directory: directory,
++            core,
++            store,
++            upstream,
++        }
++    }
++
++    fn intent(core: &Core, key: &str) -> (SendIntent, SendPayload) {
++        let payload = SendPayload {
++            thread_id: "synthetic-room@chatroom".into(),
++            text: "synthetic reply".into(),
++            created_at: 1234,
++            client_id: wechat_protocol::wire::client_message_id(key.as_bytes()).max(1),
++            share: None,
++            mentions: None,
++            quote: Some(crate::quote_send::ResolvedQuote {
++                target: crate::QuoteSendReference {
++                    message_id: "synthetic-source".into(),
++                    server_id: "999".into(),
++                },
++                xml: "<appmsg><type>57</type><refermsg><svrid>999</svrid></refermsg></appmsg>"
++                    .into(),
++            }),
++        };
++        let sealed = core
++            .vault
++            .seal(
++                "one",
++                "send-payload",
++                &serde_json::to_vec(&payload).unwrap(),
++            )
++            .unwrap();
++        let (intent, _) = core
++            .store
++            .create_send(
++                "one",
++                key,
++                &payload.thread_id,
++                &payload_hash(&payload).unwrap(),
++                &sealed,
++                &payload.client_id.to_string(),
++            )
++            .unwrap();
++        core.store
++            .put_runtime("one", "desired", b"connected")
++            .unwrap();
++        assert!(core.store.claim_send("one", &intent.id).unwrap());
++        (intent, payload)
++    }
++
++    #[test]
++    fn native_quote_response_is_retained_before_parse_and_reopened_without_resending() {
++        // Not a validated quote receipt: even this empty success envelope is
++        // retained, but must not create an accepted outgoing history row.
++        let raw = p::bytes(1, &p::int32(1, 0));
++        let Fixture {
++            _directory,
++            core,
++            store,
++            upstream,
++        } = fixture(raw.clone());
++        let (send, payload) = intent(&core, "restart-quote");
++        let error = core
++            .send_quote_with_receipt("one", &send.id, &mut super::super::tests::state(), &payload)
++            .err()
++            .unwrap();
++        assert_eq!(
++            error_code(&error),
++            wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED
++        );
++        let purpose = format!("{RECEIPT_PREFIX}{}", send.id);
++        let sealed = store.runtime("one", &purpose).unwrap().unwrap();
++        let receipt: QuoteReceipt =
++            serde_json::from_slice(&core.vault.open_record("one", &purpose, &sealed).unwrap())
++                .unwrap();
++        assert_eq!(STANDARD.decode(&receipt.response_base64).unwrap(), raw);
++        assert_eq!(receipt.payload_sha256, payload_hash(&payload).unwrap());
++        assert_eq!(store.send("one", &send.id).unwrap().state, "submitting");
++        drop(core);
++
++        let reopened = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
++        let recovered = store.send("one", &send.id).unwrap();
++        assert_eq!(recovered.state, "needs_review");
++        assert_eq!(
++            recovered.error_code.as_deref(),
++            Some(wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED)
++        );
++        assert_eq!(recovered.server_id, None);
++        assert_eq!(recovered.local_message_id, None);
++        assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
++        assert_eq!(store.runtime("one", &purpose).unwrap().unwrap(), sealed);
++        assert_eq!(reopened.recover_quote_receipts("one").unwrap(), 0);
++        assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
++    }
++
++    #[test]
++    fn retained_quote_response_is_bound_to_account_send_and_payload() {
++        let f = fixture(vec![]);
++        let (first, payload) = intent(&f.core, "first");
++        let (other, _) = intent(&f.core, "other");
++        f.core
++            .retain_quote_receipt(
++                "one",
++                &first.id,
++                &payload,
++                "synthetic_self",
++                b"private response",
++            )
++            .unwrap();
++        let first_key = format!("{RECEIPT_PREFIX}{}", first.id);
++        let sealed = f.store.runtime("one", &first_key).unwrap().unwrap();
++        assert!(!sealed
++            .windows(b"private response".len())
++            .any(|v| v == b"private response"));
++        assert!(f
++            .core
++            .retain_quote_receipt("one", &first.id, &payload, "synthetic_self", b"replacement")
++            .is_err());
++        let other_key = format!("{RECEIPT_PREFIX}{}", other.id);
++        f.store.put_runtime("one", &other_key, &sealed).unwrap();
++        f.store.put_runtime("two", &first_key, &sealed).unwrap();
++        for (account, id) in [("one", other.id.as_str()), ("two", first.id.as_str())] {
++            let error = f
++                .core
++                .decode_retained_quote_receipt(account, id, &payload)
++                .err()
++                .unwrap();
++            assert_eq!(error_code(&error), "quote_receipt_integrity_failed");
++        }
++        let mut changed_payload = payload;
++        changed_payload.quote.as_mut().unwrap().target.server_id = "1000".into();
++        assert_eq!(
++            error_code(
++                &f.core
++                    .decode_retained_quote_receipt("one", &first.id, &changed_payload)
++                    .err()
++                    .unwrap()
++            ),
++            "quote_receipt_integrity_failed"
++        );
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn malformed_native_reply_is_retained_and_store_failure_is_never_acceptance() {
++        let f = fixture(vec![10, 3, 8]);
++        let (first, payload) = intent(&f.core, "malformed");
++        let error = f
++            .core
++            .send_quote_with_receipt(
++                "one",
++                &first.id,
++                &mut super::super::tests::state(),
++                &payload,
++            )
++            .err()
++            .unwrap();
++        assert_eq!(error_code(&error), "quote_receipt_invalid");
++        assert!(f
++            .store
++            .runtime("one", &format!("{RECEIPT_PREFIX}{}", first.id))
++            .unwrap()
++            .is_some());
++
++        let (second, payload) = intent(&f.core, "persistence-failure");
++        let db = rusqlite::Connection::open(f.store.root.join("accounts/one/agent/control.sqlite"))
++            .unwrap();
++        db.execute_batch("CREATE TRIGGER reject_quote_receipt BEFORE INSERT ON runtime WHEN NEW.key LIKE 'quote-receipt:%' BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END;").unwrap();
++        drop(db);
++        let error = f
++            .core
++            .send_quote_with_receipt(
++                "one",
++                &second.id,
++                &mut super::super::tests::state(),
++                &payload,
++            )
++            .err()
++            .unwrap();
++        assert_eq!(error_code(&error), "quote_receipt_persistence_failed");
++        assert!(f
++            .store
++            .runtime("one", &format!("{RECEIPT_PREFIX}{}", second.id))
++            .unwrap()
++            .is_none());
++        assert_eq!(f.store.send("one", &second.id).unwrap().state, "submitting");
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 2);
++    }
++
++    #[test]
++    fn local_recovery_preserves_an_explicit_rejection_and_unknown_without_network() {
++        let f = fixture(vec![]);
++        let (send, payload) = intent(&f.core, "rejected");
++        f.core
++            .retain_quote_receipt(
++                "one",
++                &send.id,
++                &payload,
++                "synthetic_self",
++                &p::bytes(1, &p::int32(1, -13)),
++            )
++            .unwrap();
++        f.store.recover_uncertain_sends("one").unwrap();
++        assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 1);
++        let rejected = f.store.send("one", &send.id).unwrap();
++        assert_eq!(rejected.state, "failed");
++        assert_eq!(rejected.error_code.as_deref(), Some("service_rejected"));
++        assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 0);
++        let uncertain = MediaSendResult {
++            status: SendStatus::NeedsReview,
++            service_code: 0,
++            server_message_id: Some("123".into()),
++            client_id_matches: Some(false),
++        };
++        assert_eq!(
++            error_code(&decoded_receipt(uncertain).err().unwrap()),
++            "quote_receipt_unverified"
++        );
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn decoded_success_requires_correlation_and_exact_positive_server_identity() {
++        for (code, correlated, server) in [
++            (0, true, None),
++            (0, true, Some("0")),
++            (0, true, Some("+123")),
++            (0, true, Some("0123")),
++            (0, true, Some("18446744073709551616")),
++            (0, false, Some("123")),
++            (-13, true, Some("123")),
++        ] {
++            let result = MediaSendResult {
++                status: SendStatus::ServerAccepted,
++                service_code: code,
++                server_message_id: server.map(str::to_owned),
++                client_id_matches: Some(correlated),
++            };
++            assert!(decoded_receipt(result).is_err());
++        }
++        assert!(decoded_receipt(MediaSendResult {
++            status: SendStatus::Rejected,
++            service_code: 0,
++            server_message_id: None,
++            client_id_matches: None,
++        })
++        .is_err());
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -29,6 +29,8 @@
+ mod profile_network;
+ #[path = "push.rs"]
+ mod push;
++#[path = "quote_receipts.rs"]
++mod quote_receipts;
+ #[path = "read_control.rs"]
+ mod read_control;
+ #[path = "read_sync.rs"]
+@@ -343,6 +345,7 @@
+                 core.state_unfenced(&account.id)?;
+             }
+             core.store.recover_uncertain_sends(&account.id)?;
++            core.recover_quote_receipts(&account.id)?;
+             core.store.recover_media_jobs(&account.id)?;
+             core.store.recover_message_recalls(&account.id)?;
+             core.store.recover_group_mutations(&account.id)?;
+@@ -1465,21 +1468,8 @@
+             if !core.store.claim_send(&account, &id)? {
+                 return Ok(());
+             }
+-            let result = if let Some(quote) = &payload.quote {
+-                native
+-                    .send_quote(
+-                        &mut state,
+-                        &payload.thread_id,
+-                        &payload.client_id.to_string(),
+-                        payload.created_at,
+-                        &quote.xml,
+-                    )
+-                    .map(|result| SendReceipt {
+-                        accepted: result.status
+-                            == wechat_protocol::media_send::SendStatus::ServerAccepted,
+-                        correlated: result.client_id_matches == Some(true),
+-                        server_message_id: result.server_message_id,
+-                    })
++            let result = if payload.quote.is_some() {
++                core.send_quote_with_receipt(&account, &id, &mut state, &payload)
+             } else if let Some(share) = &payload.share {
+                 let xml = share.xml(&state.own_username)?;
+                 native
+@@ -1535,6 +1525,12 @@
+                 core.store
+                     .mark_validated_if_active(&account, &core.ownership_generation)?;
+             }
++            let unknown_code = result
++                .as_ref()
++                .err()
++                .filter(|_| payload.quote.is_some())
++                .map(quote_receipts::error_code)
++                .unwrap_or("submission_outcome_unknown");
+             let updated = match result {
+                 Ok(result) if result.accepted && result.correlated => core.store.update_send(
+                     &account,
+@@ -1555,7 +1551,7 @@
+                     &id,
+                     "needs_review",
+                     None,
+-                    Some("submission_outcome_unknown"),
++                    Some(unknown_code),
+                 )?,
+             };
+             if updated.state == "accepted" {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/upstream.rs b/packages/native-client-rust/crates/wechat-core/src/upstream.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/upstream.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/upstream.rs
+@@ -209,6 +209,22 @@
+         content: &str,
+     ) -> Result<MediaSendResult> {
+         self.native(NativeOptions::default())?.send_quote(
++            state,
++            destination,
++            client_id,
++            created_at,
++            content,
++        )
++    }
++    fn send_quote_raw(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++    ) -> Result<Vec<u8>> {
++        self.native(NativeOptions::default())?.send_quote_raw(
+             state,
+             destination,
+             client_id,
+diff --git a/packages/native-client-rust/crates/wechat-protocol/README.md b/packages/native-client-rust/crates/wechat-protocol/README.md
+--- a/packages/native-client-rust/crates/wechat-protocol/README.md
++++ b/packages/native-client-rust/crates/wechat-protocol/README.md
+@@ -66,6 +66,16 @@
+ All write/send methods submit once. A response failure after submission is an
+ uncertain outcome; the service owns durable intents and must not resend blindly.
+ 
++Native quoted sends return authenticated bytes through `send_quote_raw` so the
++owner can seal the response before parsing. Core binds each saved response to its
++account, send and original payload, then reopens it locally after a restart.
++The public quote fixture establishes request fields only. A zero service status
++does not establish a verified quote receipt: successful native quote responses
++currently remain `needs_review` with `quote_receipt_schema_unverified`. The prior
++file-response identity scan is no longer used for quotes. A matching Linux quote
++response and independent recipient evidence are required before enabling success
++decoding; synthetic file-shaped replies do not satisfy that requirement.
++
+ `AccountState` and `LoginAttempt` are serializable **secret state**, with redacted
+ Debug implementations and zeroization on drop. Store them only in the encrypted
+ service vault. Do not return their serialized representation from public APIs.
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/client.rs b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+--- a/packages/native-client-rust/crates/wechat-protocol/src/client.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+@@ -1124,6 +1124,24 @@
+         created_at: u32,
+         content: &str,
+     ) -> Result<crate::media_send::MediaSendResult> {
++        crate::quote_send::decode_quote_send(&self.send_quote_raw(
++            state,
++            destination,
++            client_id,
++            created_at,
++            content,
++        )?)
++    }
++    /// Submit once and return authenticated business-response bytes. The owner
++    /// must persist these bytes before interpreting or projecting the result.
++    pub fn send_quote_raw(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++    ) -> Result<Vec<u8>> {
+         let request = crate::quote_send::quote_send_request(
+             state,
+             destination,
+@@ -1131,10 +1149,7 @@
+             created_at,
+             content,
+         )?;
+-        crate::media_send::decode_file_send(
+-            &self.authenticated_rpc(state, 222, "/cgi-bin/micromsg-bin/sendappmsg", &request)?,
+-            client_id,
+-        )
++        self.authenticated_rpc(state, 222, "/cgi-bin/micromsg-bin/sendappmsg", &request)
+     }
+     /// Reserve one file-upload message. An uncertain response must not be
+     /// retried automatically; retain the returned receipt with the send intent.
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs b/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
+--- a/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
+@@ -1,11 +1,42 @@
+ //! Quoted app-message metadata. Callers resolve the selected message and persist
+ //! this reference and the final XML before submitting a send attempt.
+-use crate::{protobuf as p, wire::base_request, AccountState};
+-use anyhow::{ensure, Result};
++use crate::{
++    media_send::{MediaSendResult, SendStatus},
++    protobuf as p,
++    wire::base_request,
++    AccountState,
++};
++use anyhow::{bail, ensure, Result};
+ use serde::{Deserialize, Serialize};
+ 
+ pub const MAX_QUOTE_CONTENT_BYTES: usize = 128 * 1024;
+ pub const MAX_QUOTE_XML_BYTES: usize = 256 * 1024;
++pub const QUOTE_RECEIPT_SCHEMA_UNVERIFIED: &str = "quote_receipt_schema_unverified";
++
++/// Decode only the shared BaseResponse rejection until the supported Linux
++/// quoted-send response has independent field/presence evidence. A successful
++/// file receipt is not evidence for a quoted-send receipt, even on CGI222.
++/// Callers must retain authenticated bytes before calling this function.
++/// An error is an uncertain submitted send, never permission to resend.
++pub fn decode_quote_send(input: &[u8]) -> Result<MediaSendResult> {
++    let fields = p::decode(input)?;
++    let base = p::decode(p::data(&fields, 1)?)?;
++    let raw_code = p::scalar(&base, 1)?;
++    let code = raw_code as i32;
++    ensure!(
++        raw_code == code as i64 as u64,
++        "invalid_quote_response_status"
++    );
++    if code != 0 {
++        return Ok(MediaSendResult {
++            status: SendStatus::Rejected,
++            service_code: code,
++            server_message_id: None,
++            client_id_matches: None,
++        });
++    }
++    bail!(QUOTE_RECEIPT_SCHEMA_UNVERIFIED)
++}
+ 
+ /// A reference to the immediate selected message. App messages retain raw type
+ /// 49 here; their application subtype belongs in their serialized content.
+@@ -169,6 +200,67 @@
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn quote_success_requires_independent_response_evidence() {
++        // These are adversarial file-shaped inputs, not quote acceptance
++        // fixtures. Matching every candidate identity must still fail closed.
++        for (sender, destination, client, server_id) in [
++            ("self", "room@chatroom", "client", u64::MAX),
++            ("wrong", "room@chatroom", "client", u64::MAX),
++            ("self", "wrong", "client", u64::MAX),
++            ("self", "room@chatroom", "wrong", u64::MAX),
++            ("self", "room@chatroom", "client", 0),
++            ("self", "room@chatroom", "client", 42),
++        ] {
++            let response = p::message(&[
++                p::bytes(1, &p::int32(1, 0)),
++                p::bytes(3, sender.as_bytes()),
++                p::bytes(4, destination.as_bytes()),
++                p::uint(5, 1),
++                p::bytes(6, client.as_bytes()),
++                p::uint(7, 1),
++                p::uint(9, server_id),
++                // The old parser accepted a client ID in an unrelated field.
++                p::bytes(13, b"client"),
++            ])
++            .unwrap();
++            assert_eq!(
++                decode_quote_send(&response).unwrap_err().to_string(),
++                QUOTE_RECEIPT_SCHEMA_UNVERIFIED
++            );
++        }
++        // Missing identities or a duplicate candidate server ID cannot turn
++        // an unverified response into an accepted or explicitly rejected send.
++        for response in [
++            p::bytes(1, &p::int32(1, 0)),
++            p::message(&[p::bytes(1, &p::int32(1, 0)), p::uint(9, 42), p::uint(9, 43)]).unwrap(),
++        ] {
++            assert!(decode_quote_send(&response).is_err());
++        }
++    }
++
++    #[test]
++    fn quote_rejection_requires_an_unambiguous_canonical_base_status() {
++        let result = decode_quote_send(&p::bytes(1, &p::int32(1, -13))).unwrap();
++        assert_eq!(result.status, SendStatus::Rejected);
++        assert_eq!(result.service_code, -13);
++        assert_eq!(result.server_message_id, None);
++        assert_eq!(result.client_id_matches, None);
++        for malformed in [
++            vec![],
++            vec![0],
++            vec![10, 3, 8],
++            p::uint(1, 0),
++            p::bytes(1, &p::bytes(1, b"0")),
++            p::bytes(1, &p::uint(1, 1u64 << 32)),
++            p::bytes(1, &p::uint(1, i32::MAX as u64 + 1)),
++            p::bytes(1, &p::message(&[p::int32(1, -13), p::int32(1, 0)]).unwrap()),
++            p::message(&[p::bytes(1, &p::int32(1, -13)), p::bytes(1, &p::int32(1, 0))]).unwrap(),
++        ] {
++            assert!(decode_quote_send(&malformed).is_err());
++        }
++    }
++
+     fn reference() -> QuoteReference {
+         QuoteReference {
+             message_type: 49,

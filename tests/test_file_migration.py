@@ -25,7 +25,7 @@ def test_schema2_upgrade_and_parser3_backfill_preserve_origins_and_progress(tmp_
         store.conn.execute("PRAGMA user_version=2")
         store.conn.commit()
     with ArchiveStore(tmp_path) as upgraded:
-        assert upgraded.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert upgraded.conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert len(list((upgraded.archive_dir / "backups").glob("schema-2-*.sqlite"))) == 1
         result = upgraded.reparse_batch(500)
         assert result == {"reparsed": 1, "pending": 0}

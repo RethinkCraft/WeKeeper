@@ -1,0 +1,23 @@
+# Replace all three placeholders with absolute paths before installing.
+# @PROJECT_ROOT@: the WeKeeper checkout
+# @PYTHON@: the checkout's .venv/bin/python
+# @STATE_DIR@: the existing private archive directory outside the checkout
+[Unit]
+Description=WeKeeper outgoing dashboard sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart="@PYTHON@" -m chatlog_keeper.dashboard.cli --archive-state "@STATE_DIR@" sync
+EnvironmentFile=-%h/.config/wekeeper/environment
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=70
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

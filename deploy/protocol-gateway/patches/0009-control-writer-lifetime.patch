@@ -1,0 +1,936 @@
+diff --git a/.changeset/native-control-writer-lifetime.md b/.changeset/native-control-writer-lifetime.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..896701fc69614b46cd452c10fb425a9e255e7bff
+--- /dev/null
++++ b/.changeset/native-control-writer-lifetime.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Reuse up to eight idle account-sidecar WAL connections while preserving file-family admission, FULL synchronization and SQLite's default automatic checkpoint. Keep read snapshots separate, invalidate changed or failed connections, and hold ownership until every connection is closed. Unrecoverable connection cleanup requires a daemon restart instead of admitting another writer.
+diff --git a/deploy/native/README.md b/deploy/native/README.md
+index 4f33f2411c3aa026ae8d2a7e553cff93c28bb849..2282d6a9ada089029d5566f6e48c3789b34e2c44 100644
+--- a/deploy/native/README.md
++++ b/deploy/native/README.md
+@@ -117,6 +117,10 @@ The writer is bounded and never makes send workers wait for stdout. Check sequen
+ 
+ An account in managed-copy mode keeps its official tree under `accounts/<id>/profile/` and additional state under `accounts/<id>/agent/`. A directly attached profile stays at its registered external path; its sidecar still lives under the durable root. Installing/upgrading the executable must not remove these directories. A full backup includes durable sidecars and separately attached profile trees; a profile-only export omits consumer receipts and pending operations. Keys/native credentials are separate from the API bearer token; protect every secret reference and do not assume an ordinary sidecar is encrypted.
+ 
++The store reuses at most eight idle account-sidecar WAL connections. Each operation still checks registration, private-file permissions and the current database family before reusing a connection. FULL synchronization and the default 1000-page automatic checkpoint remain enabled; official profile databases and existing non-WAL sidecars keep their prior mode. Read snapshots use separate connections and retain ownership until they close.
++
++Closing or evicting a connection can leave committed `-wal` and `-shm` files. Stop all writers and readers before a filesystem backup, and copy the complete database family, including any `-wal`, `-shm` and `-journal` companions. Never delete companions or copy only the main SQLite file to recover pending work. If connection cleanup cannot finish safely, the account stops accepting storage work and reports that a daemon restart is required; it does not open a replacement writer beside the failed handle.
++
+ ## Compose example: review before applying
+ 
+ `compose.yaml` deliberately uses Linux host networking with a loopback listener, no published port, no capabilities, a read-only image and an explicit persistent volume. The service does not restart automatically by default. Use a verified TLS reverse proxy or authenticated encrypted tunnel for cross-host access; do not bypass the daemon's protected transport policy to expose plaintext bearer authentication.
+diff --git a/packages/native-client-rust/crates/wechat-store/src/account_removal.rs b/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
+index 5253de244c817824b9488159b363c035dc2a1f7a..b33b95671fb14c09ecabf15a8b33187c293b8014 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
+@@ -13,22 +13,22 @@ impl Store {
+         if !fs::symlink_metadata(&path)?.is_file() || !wechat_platform::private_path(&path)? {
+             bail!("invalid account sidecar permissions");
+         }
+-        let mut admitted = self
++        let mut connections = self
+             .admitted
+             .lock()
+             .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
+-        let (control, ()) =
+-            admission::open_prepared(&path, Some(&admitted), Self::prepare_account)?;
+-        let signed_in: bool = control.query_row("SELECT EXISTS(SELECT 1 FROM runtime WHERE key='account-state') AND NOT EXISTS(SELECT 1 FROM runtime WHERE key='logged-out')", [], |r| r.get(0))?;
+-        if signed_in {
+-            bail!("account_sign_out_required");
+-        }
+-        let pending: bool = control.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state NOT IN ('succeeded','failed','cancelled','rejected','expired','needs_login','needs_review')) OR EXISTS(SELECT 1 FROM runtime WHERE key='logout-pending') OR EXISTS(SELECT 1 FROM media_jobs WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM outbox WHERE state IN ('queued','submitting'))", [], |r| r.get(0))?;
+-        if pending {
+-            bail!("operation_in_progress");
+-        }
+-        control.close().map_err(|(_, error)| error)?;
+-        admission::remember(&mut admitted, &path)?;
++        connections.run(&path, &self._lease, |control| {
++            let signed_in: bool = control.query_row("SELECT EXISTS(SELECT 1 FROM runtime WHERE key='account-state') AND NOT EXISTS(SELECT 1 FROM runtime WHERE key='logged-out')", [], |r| r.get(0))?;
++            if signed_in {
++                bail!("account_sign_out_required");
++            }
++            let pending: bool = control.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state NOT IN ('succeeded','failed','cancelled','rejected','expired','needs_login','needs_review')) OR EXISTS(SELECT 1 FROM runtime WHERE key='logout-pending') OR EXISTS(SELECT 1 FROM media_jobs WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM outbox WHERE state IN ('queued','submitting'))", [], |r| r.get(0))?;
++            if pending {
++                bail!("operation_in_progress");
++            }
++            Ok(())
++        })?;
++        connections.evict(&path, &self._lease)?;
+         let tx = registry.transaction()?;
+         // Retain profile paths, key references and IDs for recovery and prevent reuse
+         // by an old account-scoped token. Only its display alias becomes available.
+diff --git a/packages/native-client-rust/crates/wechat-store/src/admission.rs b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+index 2bf714ec1f19ad8e423c826e89ee4633adfc9dd5..6dd6f21e8b2993e9c316718ad4b1922f95504682 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/admission.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+@@ -51,6 +51,21 @@ fn member_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+     Ok(path.with_file_name(name))
+ }
+ impl Family {
++    pub(crate) fn identities_unchanged(&self, path: &Path, wal_members: bool) -> Result<bool> {
++        let current = Self::read(path)?;
++        for (suffix, member) in &self.0 {
++            if !(suffix.is_empty() || wal_members && matches!(*suffix, "-wal" | "-shm")) {
++                continue;
++            }
++            if !current.0.contains_key(suffix)
++                || !wechat_platform::same_path_file(&member_path(path, suffix)?, &member.file)?
++            {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
+     fn read(path: &Path) -> Result<Self> {
+         let mut members = BTreeMap::new();
+         for suffix in SUFFIXES {
+@@ -218,11 +233,7 @@ fn check(db: &Connection) -> Result<()> {
+     Ok(())
+ }
+ 
+-pub(crate) fn open_prepared<T>(
+-    path: &Path,
+-    cache: Option<&AdmissionCache>,
+-    prepare: impl Fn(&mut Connection) -> Result<T>,
+-) -> Result<(Connection, T)> {
++pub(crate) fn permission_probe(path: &Path) -> Result<()> {
+     // Permission failures should be rejected before SQLite can recover or clean
+     // companions. This check opens a handle without writing any source bytes.
+     let permission_probe = wechat_platform::OpenOptions::new()
+@@ -236,10 +247,30 @@ pub(crate) fn open_prepared<T>(
+         "database must be private and stable"
+     );
+     drop(permission_probe);
+-    if cache
+-        .and_then(|c| c.get(path))
++    Ok(())
++}
++
++pub(crate) fn known_unchanged(cache: &AdmissionCache, path: &Path) -> Result<bool> {
++    Ok(cache
++        .get(path)
+         .map(|known| known.unchanged(path))
+         .transpose()?
++        .unwrap_or(false))
++}
++
++pub(crate) fn pin_family(path: &Path) -> Result<Family> {
++    Family::read(path)
++}
++
++pub(crate) fn open_prepared<T>(
++    path: &Path,
++    cache: Option<&AdmissionCache>,
++    prepare: impl Fn(&mut Connection) -> Result<T>,
++) -> Result<(Connection, T)> {
++    permission_probe(path)?;
++    if cache
++        .map(|known| known_unchanged(known, path))
++        .transpose()?
+         .unwrap_or(false)
+     {
+         let mut db = connect(path)?;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/control_connections.rs b/packages/native-client-rust/crates/wechat-store/src/control_connections.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad69a267f7feb72cd0aef61f12a9b9ab727822be
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/control_connections.rs
+@@ -0,0 +1,246 @@
++//! Owned operational connections, never official-profile connections.
++use crate::*;
++use rusqlite::config::DbConfig;
++use std::{collections::BTreeMap, mem::ManuallyDrop};
++
++const CAPACITY: usize = 8;
++
++#[derive(Default)]
++pub(crate) struct ControlConnections {
++    pub(crate) admitted: admission::AdmissionCache,
++    writers: BTreeMap<PathBuf, Writer>,
++    sequence: u64,
++}
++
++enum Writer {
++    Idle { db: Connection, used: u64 },
++    Unavailable { _held: Quarantined },
++}
++
++// An unknown family must never be rolled back/checkpointed by a destructor.
++// A failed close also must not release ownership while its handle is live.
++// Such an account requires process restart; OS cleanup then releases both.
++struct Quarantined {
++    _db: ManuallyDrop<Connection>,
++    _lease: ManuallyDrop<Arc<Lease>>,
++}
++
++fn no_close_checkpoint(db: &Connection) -> Result<()> {
++    anyhow::ensure!(
++        db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?,
++        "cannot disable account close checkpoint"
++    );
++    Ok(())
++}
++
++fn full_defaults(db: &Connection) -> Result<()> {
++    let synchronous: i64 = db.pragma_query_value(None, "synchronous", |row| row.get(0))?;
++    let checkpoint: i64 = db.pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))?;
++    anyhow::ensure!(
++        synchronous == 2 && checkpoint == 1000,
++        "account connection durability settings changed"
++    );
++    Ok(())
++}
++
++impl ControlConnections {
++    fn quarantine(&mut self, path: &Path, db: Connection, lease: &Arc<Lease>) {
++        self.admitted.remove(path);
++        self.writers.insert(
++            path.into(),
++            Writer::Unavailable {
++                _held: Quarantined {
++                    _db: ManuallyDrop::new(db),
++                    _lease: ManuallyDrop::new(lease.clone()),
++                },
++            },
++        );
++    }
++
++    fn close_idle(&mut self, path: &Path, db: Connection, lease: &Arc<Lease>) -> Result<()> {
++        // This function can run after an external path change. Only connection
++        // configuration and autocommit inspection are allowed before close.
++        if no_close_checkpoint(&db).is_err() || !db.is_autocommit() {
++            self.quarantine(path, db, lease);
++            bail!("account connection unavailable; process restart required");
++        }
++        match db.close() {
++            Ok(()) => Ok(()),
++            Err((db, error)) => {
++                self.quarantine(path, db, lease);
++                Err(error).context("account connection close failed; process restart required")
++            }
++        }
++    }
++
++    pub(crate) fn evict(&mut self, path: &Path, lease: &Arc<Lease>) -> Result<()> {
++        match self.writers.remove(path) {
++            Some(Writer::Idle { db, .. }) => self.close_idle(path, db, lease)?,
++            Some(entry @ Writer::Unavailable { .. }) => {
++                self.writers.insert(path.into(), entry);
++                bail!("account connection unavailable; process restart required");
++            }
++            None => {}
++        }
++        self.admitted.remove(path);
++        Ok(())
++    }
++
++    fn make_room(&mut self, lease: &Arc<Lease>) -> Result<()> {
++        if self.writers.len() < CAPACITY {
++            return Ok(());
++        }
++        let path = self
++            .writers
++            .iter()
++            .filter_map(|(path, entry)| match entry {
++                Writer::Idle { used, .. } => Some(((*used, path), path.clone())),
++                Writer::Unavailable { .. } => None,
++            })
++            .min_by_key(|(key, _)| *key)
++            .map(|(_, path)| path)
++            .context("account connection capacity unavailable; process restart required")?;
++        self.evict(&path, lease)
++    }
++
++    fn checkout(&mut self, path: &Path, lease: &Arc<Lease>) -> Result<Connection> {
++        if matches!(self.writers.get(path), Some(Writer::Unavailable { .. })) {
++            bail!("account connection unavailable; process restart required");
++        }
++        // Use exactly the original RW probe and family predicate before any
++        // SQLite work, including on a long-lived handle.
++        let unchanged = admission::permission_probe(path)
++            .and_then(|()| admission::known_unchanged(&self.admitted, path));
++        match self.writers.remove(path) {
++            Some(Writer::Idle { db, .. }) if matches!(unchanged, Ok(true)) => {
++                if !db.is_autocommit() {
++                    self.quarantine(path, db, lease);
++                    bail!("account connection unavailable; process restart required");
++                }
++                return Ok(db);
++            }
++            Some(Writer::Idle { db, .. }) => {
++                self.close_idle(path, db, lease)?;
++                self.admitted.remove(path);
++            }
++            Some(Writer::Unavailable { .. }) => unreachable!("checked above"),
++            None => {}
++        }
++        unchanged?;
++        self.make_room(lease)?;
++        let (db, ()) =
++            admission::open_prepared(path, Some(&self.admitted), Store::prepare_account)?;
++        if let Err(error) = no_close_checkpoint(&db) {
++            self.close_idle(path, db, lease)?;
++            return Err(error);
++        }
++        Ok(db)
++    }
++
++    pub(crate) fn run<T>(
++        &mut self,
++        path: &Path,
++        lease: &Arc<Lease>,
++        f: impl FnOnce(&mut Connection) -> Result<T>,
++    ) -> Result<T> {
++        let mut db = self.checkout(path, lease)?;
++        let pin = match admission::pin_family(path) {
++            Ok(pin) => pin,
++            Err(error) => {
++                self.admitted.remove(path);
++                self.close_idle(path, db, lease)?;
++                return Err(error);
++            }
++        };
++        let initial_wal =
++            match db.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0)) {
++                Ok(mode) => mode == "wal",
++                Err(error) => {
++                    self.admitted.remove(path);
++                    self.close_idle(path, db, lease)?;
++                    return Err(error.into());
++                }
++            };
++        // Preserve preparation on cache hits as well as fresh connections.
++        let result = Store::prepare_account(&mut db)
++            .and_then(|()| full_defaults(&db))
++            .and_then(|()| f(&mut db));
++        let same_files = pin.identities_unchanged(path, initial_wal && !db.is_autocommit());
++        if !matches!(same_files, Ok(true)) {
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            same_files?;
++            bail!("account database family changed during operation; existing files preserved");
++        }
++        if !db.is_autocommit() {
++            if db.execute_batch("ROLLBACK").is_err() || !db.is_autocommit() {
++                self.quarantine(path, db, lease);
++                bail!("account transaction cleanup failed; process restart required");
++            }
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            return Err(result.err().unwrap_or_else(|| {
++                anyhow::anyhow!("account callback left an unfinished transaction")
++            }));
++        }
++        let value = match result {
++            Ok(value) => value,
++            Err(error) => {
++                self.admitted.remove(path);
++                self.close_idle(path, db, lease)?;
++                return Err(error);
++            }
++        };
++        let settings = full_defaults(&db);
++        if let Err(error) = settings {
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            return Err(error);
++        }
++        if let Err(error) = no_close_checkpoint(&db) {
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            return Err(error);
++        }
++        let mode: String = match db.pragma_query_value(None, "journal_mode", |row| row.get(0)) {
++            Ok(mode) => mode,
++            Err(error) => {
++                self.admitted.remove(path);
++                self.close_idle(path, db, lease)?;
++                return Err(error.into());
++            }
++        };
++        let same_files = pin.identities_unchanged(path, initial_wal && mode == "wal");
++        if !matches!(same_files, Ok(true)) {
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            same_files?;
++            bail!("account database family changed during operation; existing files preserved");
++        }
++        if mode != "wal" {
++            // DELETE and other existing modes retain their previous lifetime.
++            self.close_idle(path, db, lease)?;
++            admission::remember(&mut self.admitted, path)?;
++            return Ok(value);
++        }
++        if let Err(error) = admission::remember(&mut self.admitted, path) {
++            self.admitted.remove(path);
++            self.close_idle(path, db, lease)?;
++            return Err(error);
++        }
++        self.sequence = self.sequence.saturating_add(1);
++        self.writers.insert(
++            path.into(),
++            Writer::Idle {
++                db,
++                used: self.sequence,
++            },
++        );
++        Ok(value)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn cached_writers(&self) -> usize {
++        self.writers.len()
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs b/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4fe6625f68ae18f4cbdaa5d0d9c33aba6bc55a5
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs
+@@ -0,0 +1,470 @@
++use super::*;
++use std::collections::{BTreeMap, BTreeSet};
++
++fn control_path(store: &Store, account: &str) -> PathBuf {
++    store
++        .account_dir(account)
++        .unwrap()
++        .join("agent/control.sqlite")
++}
++
++fn member(path: &Path, suffix: &str) -> PathBuf {
++    path.with_file_name(format!(
++        "{}{}",
++        path.file_name().unwrap().to_str().unwrap(),
++        suffix
++    ))
++}
++
++fn family(path: &Path) -> BTreeMap<String, Vec<u8>> {
++    ["", "-wal", "-shm", "-journal"]
++        .into_iter()
++        .filter_map(|suffix| {
++            let path = member(path, suffix);
++            path.exists()
++                .then(|| (suffix.into(), fs::read(path).unwrap()))
++        })
++        .collect()
++}
++
++fn private_write(path: &Path, bytes: &[u8]) {
++    use std::io::Write;
++    let mut file = wechat_platform::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(path)
++        .unwrap();
++    file.write_all(bytes).unwrap();
++}
++
++fn wal_store() -> (tempfile::TempDir, Arc<Store>) {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    drop(store.read_snapshot("one").unwrap());
++    (directory, store)
++}
++
++#[test]
++fn wal_control_operations_reuse_the_owned_connection() {
++    let (_directory, store) = wal_store();
++    store
++        .control("one", |db| {
++            db.execute_batch("CREATE TEMP TABLE connection_canary(value); INSERT INTO connection_canary VALUES(7)")?;
++            Ok(())
++        })
++        .unwrap();
++    let value = store
++        .control("one", |db| {
++            Ok(
++                db.query_row("SELECT value FROM connection_canary", [], |row| {
++                    row.get::<_, i64>(0)
++                })?,
++            )
++        })
++        .unwrap();
++    assert_eq!(value, 7);
++}
++
++#[test]
++fn unfinished_control_transaction_is_not_reported_successful() {
++    let (_directory, store) = wal_store();
++    let result = store.control("one", |db| {
++        db.execute_batch("BEGIN; INSERT INTO runtime VALUES('unfinished',x'01')")?;
++        Ok(())
++    });
++    assert!(result.is_err());
++    assert_eq!(store.runtime("one", "unfinished").unwrap(), None);
++    store.put_runtime("one", "after", b"committed").unwrap();
++    assert_eq!(
++        store.runtime("one", "after").unwrap().unwrap(),
++        b"committed"
++    );
++}
++
++#[test]
++fn wal_reuses_checkpointed_log_and_survives_cold_store_reopen() {
++    let (directory, store) = wal_store();
++    let path = control_path(&store, "one");
++    let mut salts = BTreeSet::new();
++    let mut max_wal = 0;
++    for index in 0..12 {
++        store
++            .put_runtime("one", "large", &vec![index; 1024 * 1024])
++            .unwrap();
++        let wal = fs::read(member(&path, "-wal")).unwrap();
++        salts.insert(wal[16..24].to_vec());
++        max_wal = max_wal.max(wal.len());
++    }
++    store
++        .put_runtime("one", "tail", b"last committed value")
++        .unwrap();
++    assert!(salts.len() >= 2, "checkpointed WAL was not reused");
++    assert!(max_wal < 6 * 1024 * 1024, "unpinned WAL kept growing");
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 1);
++    store
++        .control("one", |db| {
++            assert_eq!(
++                db.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))?,
++                2
++            );
++            assert_eq!(
++                db.pragma_query_value(None, "wal_autocheckpoint", |r| r.get::<_, i64>(0))?,
++                1000
++            );
++            Ok(())
++        })
++        .unwrap();
++    drop(store);
++    let reopened = Store::open_existing(&directory.path().join("data")).unwrap();
++    assert_eq!(
++        reopened.runtime("one", "large").unwrap().unwrap(),
++        vec![11; 1024 * 1024]
++    );
++    assert_eq!(
++        reopened.runtime("one", "tail").unwrap().unwrap(),
++        b"last committed value"
++    );
++}
++
++#[test]
++fn callback_error_rolls_back_but_committed_error_reconciles_by_original_key() {
++    let (_directory, store) = wal_store();
++    let error = store.control("one", |db| -> Result<()> {
++        let tx = db.transaction()?;
++        tx.execute("INSERT INTO runtime VALUES('rolled-back',x'01')", [])?;
++        bail!("synthetic callback failure");
++    });
++    assert!(error.is_err());
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++    assert_eq!(store.runtime("one", "rolled-back").unwrap(), None);
++    let error = store.control("one", |db| -> Result<()> {
++        db.execute(
++            "INSERT INTO runtime VALUES('committed-before-error',x'02')",
++            [],
++        )?;
++        bail!("synthetic error after commit");
++    });
++    assert!(error.is_err());
++    assert_eq!(
++        store.runtime("one", "committed-before-error").unwrap(),
++        Some(vec![2])
++    );
++}
++
++#[test]
++fn external_bad_wal_is_not_checkpointed_or_changed_by_cached_close() {
++    let (_directory, store) = wal_store();
++    store.put_runtime("one", "durable", b"old").unwrap();
++    let path = control_path(&store, "one");
++    let wal_path = member(&path, "-wal");
++    let mut bytes = fs::read(&wal_path).unwrap();
++    bytes[32 + 24] ^= 1;
++    fs::write(&wal_path, bytes).unwrap();
++    let before = family(&path);
++    assert!(store.put_runtime("one", "must-not-write", b"no").is_err());
++    assert_eq!(family(&path), before);
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++    drop(store);
++    assert_eq!(family(&path), before);
++}
++
++#[test]
++fn external_main_replacement_and_callback_replacement_never_rebind_a_writer() {
++    for inside_callback in [false, true] {
++        let (_directory, store) = wal_store();
++        store.put_runtime("one", "old", b"durable").unwrap();
++        let path = control_path(&store, "one");
++        let previous = path.with_extension("previous");
++        let old_main = fs::read(&path).unwrap();
++        let replace = || {
++            fs::rename(&path, &previous).unwrap();
++            private_write(&path, b"unknown replacement database");
++        };
++        let mut before = None;
++        if inside_callback {
++            let result = store.control("one", |_| {
++                replace();
++                before = Some(family(&path));
++                Ok(())
++            });
++            assert!(result.is_err());
++        } else {
++            replace();
++            before = Some(family(&path));
++            assert!(store.runtime("one", "old").is_err());
++        }
++        let before = before.unwrap();
++        assert_eq!(family(&path), before);
++        assert_eq!(fs::read(&previous).unwrap(), old_main);
++        assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++        drop(store);
++        assert_eq!(family(&path), before);
++    }
++}
++
++#[test]
++fn valid_external_commit_is_read_after_original_admission() {
++    let (_directory, store) = wal_store();
++    store.put_runtime("one", "old", b"old").unwrap();
++    let path = control_path(&store, "one");
++    let external = Connection::open(&path).unwrap();
++    external
++        .execute("INSERT INTO runtime VALUES('external',x'03')", [])
++        .unwrap();
++    external.close().unwrap();
++    assert_eq!(store.runtime("one", "external").unwrap(), Some(vec![3]));
++    assert_eq!(store.runtime("one", "old").unwrap().unwrap(), b"old");
++}
++
++#[test]
++fn pinned_reader_delays_checkpoint_then_releases_log_for_reuse() {
++    let (_directory, store) = wal_store();
++    store.put_runtime("one", "value", b"old").unwrap();
++    let old = store.read_snapshot("one").unwrap();
++    let path = control_path(&store, "one");
++    for index in 0..12 {
++        store
++            .put_runtime("one", "large", &vec![index; 1024 * 1024])
++            .unwrap();
++    }
++    assert_eq!(old.runtime("one", "value").unwrap().unwrap(), b"old");
++    let before = fs::read(member(&path, "-wal")).unwrap()[16..24].to_vec();
++    drop(old);
++    store
++        .put_runtime("one", "value", b"checkpoint can finish")
++        .unwrap();
++    store
++        .put_runtime("one", "value", b"log can restart")
++        .unwrap();
++    let after = fs::read(member(&path, "-wal")).unwrap()[16..24].to_vec();
++    assert_ne!(before, after);
++    assert_eq!(
++        store.runtime("one", "large").unwrap().unwrap(),
++        vec![11; 1024 * 1024]
++    );
++}
++
++#[test]
++fn delete_mode_retains_old_lifetime_and_consumes_its_rollback_journal() {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Store::open(&directory.path().join("data")).unwrap();
++    store.create_account("one").unwrap();
++    let path = control_path(&store, "one");
++    private_write(&member(&path, "-journal"), &[0; 512]);
++    store.put_runtime("one", "value", b"committed").unwrap();
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++    assert!(!member(&path, "-journal").exists());
++    assert_eq!(
++        store.runtime("one", "value").unwrap().unwrap(),
++        b"committed"
++    );
++}
++
++#[test]
++fn eviction_read_snapshots_and_account_removal_keep_ownership_and_fences() {
++    let (directory, store) = wal_store();
++    store.put_runtime("one", "value", b"old").unwrap();
++    let old = store.read_snapshot("one").unwrap();
++    for index in 0..9 {
++        let account = format!("account-{index}");
++        store.create_account(&account).unwrap();
++        drop(store.read_snapshot(&account).unwrap());
++        store.put_runtime(&account, "value", b"other").unwrap();
++        assert!(store.admitted.lock().unwrap().cached_writers() <= 8);
++    }
++    store.put_runtime("one", "value", b"new").unwrap();
++    assert_eq!(old.runtime("one", "value").unwrap().unwrap(), b"old");
++    assert_eq!(store.runtime("one", "value").unwrap().unwrap(), b"new");
++    store.remove_account("account-8").unwrap();
++    assert!(store.account("account-8").is_err());
++    assert!(store.put_runtime("account-8", "no", b"no").is_err());
++    assert!(store.create_account("account-8").is_err());
++    drop(store);
++    assert!(Store::open_existing(&directory.path().join("data")).is_err());
++    assert_eq!(old.runtime("one", "value").unwrap().unwrap(), b"old");
++    drop(old);
++    let reopened = Store::open_existing(&directory.path().join("data")).unwrap();
++    assert_eq!(reopened.runtime("one", "value").unwrap().unwrap(), b"new");
++}
++
++#[test]
++fn abrupt_child_exit_retains_receipts_send_identity_and_consumer_ack() {
++    for stage in ["receipt", "accepted", "poison"] {
++        let directory = tempfile::tempdir().unwrap();
++        let root = directory.path().join("data");
++        let status = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "control_writer_tests::writer_child",
++                "--nocapture",
++            ])
++            .env("WX_CONTROL_TEST_ROOT", &root)
++            .env("WX_CONTROL_TEST_STAGE", stage)
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .status()
++            .unwrap();
++        assert!(status.success());
++        let expected: serde_json::Value =
++            serde_json::from_slice(&fs::read(directory.path().join("result.json")).unwrap())
++                .unwrap();
++        let store = Store::open_existing(&root).unwrap();
++        if stage == "poison" {
++            assert_eq!(
++                store.runtime("one", "value").unwrap().unwrap(),
++                b"committed"
++            );
++            continue;
++        }
++        assert_eq!(store.server_id, expected["server_id"].as_str().unwrap());
++        let id = expected["id"].as_str().unwrap();
++        let state = if stage == "accepted" {
++            "accepted"
++        } else {
++            "submitting"
++        };
++        let intent = store.send("one", id).unwrap();
++        assert_eq!(intent.state, state);
++        assert_eq!(intent.client_id, "7");
++        assert_eq!(store.reserve_client_id("one", "fixed-key", 99).unwrap(), 7);
++        let (same, created) = store
++            .create_send(
++                "one",
++                "fixed-key",
++                "synthetic-peer",
++                "fixed-hash",
++                b"sealed",
++                "7",
++            )
++            .unwrap();
++        assert!(!created);
++        assert_eq!(same.id, id);
++        assert_eq!(
++            store
++                .runtime("one", &format!("quote-receipt:{id}"))
++                .unwrap()
++                .unwrap(),
++            b"sealed retained receipt"
++        );
++        assert_eq!(
++            store.runtime("one", "received-cursor").unwrap().unwrap(),
++            b"native cursor"
++        );
++        assert_eq!(
++            store
++                .required_consumer("one", "bot")
++                .unwrap()
++                .acknowledged_cursor,
++            expected["ack"].as_str().unwrap()
++        );
++        assert!(store.queued_sends("one").unwrap().is_empty());
++        if stage == "accepted" {
++            assert_eq!(intent.server_id.as_deref(), Some("701"));
++            assert_eq!(store.recover_uncertain_sends("one").unwrap(), 0);
++        } else {
++            assert_eq!(store.recover_uncertain_sends("one").unwrap(), 1);
++            assert_eq!(store.send("one", id).unwrap().state, "needs_review");
++            assert_eq!(
++                store
++                    .pending_send_receipt_ids("one", "quote-receipt:")
++                    .unwrap(),
++                [id]
++            );
++        }
++    }
++}
++
++#[test]
++fn writer_child() {
++    let Some(root) = std::env::var_os("WX_CONTROL_TEST_ROOT") else {
++        return;
++    };
++    let root = PathBuf::from(root);
++    let stage = std::env::var("WX_CONTROL_TEST_STAGE").unwrap();
++    let store = Arc::new(Store::open(&root).unwrap());
++    store.create_account("one").unwrap();
++    drop(store.read_snapshot("one").unwrap());
++    store.put_runtime("one", "value", b"committed").unwrap();
++    let value = if stage == "poison" {
++        store
++            .control("one", |db| {
++                std::mem::forget(db.prepare("SELECT 1")?);
++                Ok(())
++            })
++            .unwrap();
++        assert!(store
++            .remove_account("one")
++            .unwrap_err()
++            .to_string()
++            .contains("process restart required"));
++        drop(store);
++        assert!(
++            Store::open_existing(&root).is_err(),
++            "poisoned handle released ownership"
++        );
++        serde_json::json!({"poisoned_lease_retained":true})
++    } else {
++        if stage == "accepted" {
++            for index in 0..12 {
++                store
++                    .put_runtime("one", "cross-checkpoint", &vec![index; 1024 * 1024])
++                    .unwrap();
++            }
++        }
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        assert_eq!(store.reserve_client_id("one", "fixed-key", 7).unwrap(), 7);
++        let (intent, _) = store
++            .create_send(
++                "one",
++                "fixed-key",
++                "synthetic-peer",
++                "fixed-hash",
++                b"sealed",
++                "7",
++            )
++            .unwrap();
++        assert!(store.claim_send("one", &intent.id).unwrap());
++        store
++            .put_runtime(
++                "one",
++                &format!("quote-receipt:{}", intent.id),
++                b"sealed retained receipt",
++            )
++            .unwrap();
++        if stage == "accepted" {
++            store
++                .update_send("one", &intent.id, "accepted", Some("701"), None)
++                .unwrap();
++        }
++        store
++            .stage_native_ingress(
++                "one",
++                NativeIngressBatch {
++                    batch_id: "batch-one".into(),
++                    payload: Some(b"sealed ingress".to_vec()),
++                    cursor: Some(b"native cursor".to_vec()),
++                    ownership_generation: "generation-one".into(),
++                    historical: false,
++                    caught_up: true,
++                    origin: "push".into(),
++                    messages: vec![],
++                    recalls: vec![],
++                },
++            )
++            .unwrap();
++        store.register_required_consumer("one", "bot", 0).unwrap();
++        let (events, _) = store.consumer_events("one", "bot", None, 200).unwrap();
++        let ack = events.last().unwrap().cursor.clone();
++        store
++            .acknowledge("one", "bot", ack.parse().unwrap())
++            .unwrap();
++        serde_json::json!({"id":intent.id,"server_id":store.server_id,"ack":ack})
++    };
++    let path = root.parent().unwrap().join("result.json");
++    private_write(&path, &serde_json::to_vec(&value).unwrap());
++    // Deliberately bypass every Rust/SQLite destructor, as abrupt termination
++    // does. Each preceding API return must already represent a FULL commit.
++    std::process::exit(0);
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/lib.rs b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+index 381d45d9f53728d9a7c1d68bc74ae164e056abc0..a86b625380298766af0088d358380841090940dd 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -4,6 +4,9 @@ mod admission;
+ mod authorization;
+ mod checkpoint;
+ mod client_ids;
++mod control_connections;
++#[cfg(test)]
++mod control_writer_tests;
+ pub mod copy;
+ mod event_consumers;
+ mod group_mutations;
+@@ -149,9 +152,10 @@ pub struct Store {
+     pub root: PathBuf,
+     pub server_id: String,
+     db: Mutex<Connection>,
+-    admitted: Mutex<admission::AdmissionCache>,
+-    _lease: Arc<Lease>,
++    admitted: Mutex<control_connections::ControlConnections>,
+     snapshot: Option<(String, Mutex<Connection>)>,
++    // Connection fields must be destroyed before the last ownership handle.
++    _lease: Arc<Lease>,
+ }
+ 
+ impl Store {
+diff --git a/packages/native-client-rust/crates/wechat-store/src/operations.rs b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+index 799050de5660e3237929d45e2d69213586af9866..6275c378bf734f647f00ec3d8e504135104338d5 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/operations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+@@ -233,18 +233,11 @@ impl Store {
+         if !m.is_file() || !wechat_platform::private_path(&path)? {
+             bail!("invalid account sidecar permissions");
+         }
+-        let mut admitted = self
++        let mut connections = self
+             .admitted
+             .lock()
+             .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
+-        let (mut db, ()) =
+-            crate::admission::open_prepared(&path, Some(&admitted), Self::prepare_account)?;
+-        let result = f(&mut db);
+-        db.close().map_err(|(_, error)| error)?;
+-        if result.is_ok() {
+-            crate::admission::remember(&mut admitted, &path)?;
+-        }
+-        result
++        connections.run(&path, &self._lease, f)
+     }
+     pub(crate) fn prepare_account(db: &mut Connection) -> Result<()> {
+         db.busy_timeout(std::time::Duration::from_secs(2))?;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs b/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
+index d79840b96e71fa8c7ac129d002dd6a322960df17..9225981c8d0d882c49d4bdbac3849c35d3b56e8c 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
+@@ -14,6 +14,13 @@ fn pin(path: &Path) -> Result<Connection> {
+             | OpenFlags::SQLITE_OPEN_NO_MUTEX
+             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+     )?;
++    anyhow::ensure!(
++        db.set_db_config(
++            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
++            true
++        )?,
++        "cannot disable snapshot close checkpoint"
++    );
+     db.busy_timeout(std::time::Duration::from_secs(2))?;
+     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;")?;
+     // BEGIN alone does not establish a WAL snapshot.

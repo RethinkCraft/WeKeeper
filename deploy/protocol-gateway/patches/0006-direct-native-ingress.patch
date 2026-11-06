@@ -1,0 +1,2687 @@
+diff --git a/.changeset/native-receive-journal.md b/.changeset/native-receive-journal.md
+new file mode 100644
+index 0000000..f029780
+--- /dev/null
++++ b/.changeset/native-receive-journal.md
+@@ -0,0 +1,7 @@
++---
++"@agent-wechat/cli": minor
++---
++
++Persist authenticated received commands, immutable source snapshots and receive events in one transaction before writing the official profile. Register consumers at an immutable first-use receive boundary so retained historical batches are not treated as new requests after upgrades or restarts. Keep unsupported commands and identity conflicts visible for review after event acknowledgement, and record incoming recalls before admitting a quote of the target.
++
++The receive journal is an operational receipt store, separate from the official archive. Its raw batches and snapshots are retained without automatic pruning; deployments must monitor disk usage. Official profile writes run one command per account-gate acquisition, allowing received-message reads and queued sends to proceed between writes.
+diff --git a/docs/src/content/docs/use/api.mdx b/docs/src/content/docs/use/api.mdx
+index 45b907e..5178632 100644
+--- a/docs/src/content/docs/use/api.mdx
++++ b/docs/src/content/docs/use/api.mdx
+@@ -224,10 +224,22 @@ await client.sendText(accountId, threadId, "Agreed", key, { messageId, serverId
+ 
+ See [quoted replies in the CLI guide](/use/cli/#quoted-replies) for supported originals and limits.
+ 
++For a source from the native receive journal, pass `quote: {"receivedId":"recv_...","serverId":"...","sourceSha256":"..."}` instead. Copy these three strings from `GET /received/messages/{receivedId}`. The two quote source forms are mutually exclusive. The daemon uses the sealed source snapshot and rechecks its account, thread, server ID, hash and recall state before submission; callers cannot supply XML or original content. This form does not require an official profile message row. Existing profile-ID sources remain supported.
++
+ For files, images, video and voice, stage bytes with `POST /uploads` and send the returned source ID. [Send attachments](/use/media/) covers the request, SDK methods, per-kind capability limits and longer job polling.
+ 
+ ## Receive
+ 
++Bots that need receive custody independent of official profile writes use the native receive journal:
++
++1. `POST /consumers/{name}/activate` with `{"ownUsername":"EXPECTED_ACCOUNT_USERNAME"}` registers a required consumer at its first-use receive boundary. The daemon verifies the account and a terminal native catch-up checkpoint from the current process generation. Callers cannot supply a readiness flag or a cursor. Before that checkpoint exists, the request returns `409 native_ingress_not_ready`. Repeating an established activation preserves its original boundary and progress.
++2. Read `GET /consumers/{name}/events?limit=100`. A `message.received` event supplies `receivedId`, `firstReceivedSequence` and `disposition`. Fetch `GET /received/messages/{receivedId}` for the immutable source facts, including `sourceSha256`, string server ID, sender, body and native mention metadata.
++3. Commit the event and its source to a local inbox before acknowledging its event cursor. `firstReceivedSequence` and the activation checkpoint's `receivedBoundary` are separate from event cursors. Retained historical batches keep their original receive classification across restarts.
++
++The receive response has `ready`, `outgoing`, `system` or `quarantined` disposition. Unsupported message types, incomplete content, unknown group mention metadata and identity conflicts remain visible with a reason; an event ACK only transfers custody and does not mean a business request was completed. Direct messages without mention metadata preserve `mentions.state: "unknown"` and nullable flags. Ready incoming text and supported complete app-message content can be quote sources when `quoteEligible` is true. Raw receipt storage is retained without automatic pruning, so consumers and deployments must monitor pending work and disk use.
++
++Official profile projection runs separately. The following archive stream remains available for profile-backed clients:
++
+ ```bash
+ curl -N -H "Authorization: Bearer $TOKEN" "$WX/accounts/$ACCOUNT/events/stream"
+ ```
+@@ -256,6 +268,7 @@ All account routes start with `/v1/accounts/{account}`.
+ | Accounts | `GET /v1/accounts`, `GET /`, `GET /capabilities`, `POST /connect`, `POST /disconnect`, `POST /logout` |
+ | Login | `POST /login-attempts`, `GET /login-attempts/{id}`, `GET /login-attempts/{id}/qr`, `POST /login-attempts/{id}/cancel` |
+ | Chats and messages | `GET /threads`, `GET /threads/{id}/messages`, `GET /messages?query=`, `GET /messages/{id}` |
++| Native receive custody | `POST /consumers/{name}/activate`, `GET /received/messages/{receivedId}` |
+ | [Contacts](#contacts) | `GET /contacts`, `GET /contacts/{username}`, `POST /contacts/{username}/refresh`, `POST /contact-sync`, `POST /contacts/lookup` |
+ | [Groups](/use/groups/) | `GET /groups`, `GET /groups/{id}`, `GET /groups/{id}/members`, `GET /groups/{id}/members/{username}` |
+ | [Group edits](/use/groups/) and chat settings (admin) | `POST /groups`, `PATCH /groups/{id}`, `POST /groups/{id}/leave`, `POST/DELETE /groups/{id}/members`, `PUT /groups/{id}/my-name`, `DELETE /groups/{id}/announcement`, `PUT /threads/{id}/notifications`, `PUT /threads/{id}/pin` |
+diff --git a/packages/native-client-rust/crates/wechat-api/src/actions.rs b/packages/native-client-rust/crates/wechat-api/src/actions.rs
+index fa42bae..cdda5bd 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/actions.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/actions.rs
+@@ -133,11 +133,11 @@ async fn capabilities(
+     app.core.store.account(&a)?;
+     if app.core.upstream_kind() == wechat_core::upstream::UpstreamKind::Simulator {
+         return Ok(Json(
+-            json!({"nativeRuntime":true,"upstream":"simulator","officialBinaryRequired":false,"textMentions":true,"inlineTextMentions":true,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"mediaUploadMaxBytes":wechat_core::MediaKind::Image.max_source_bytes(),"mediaSendMaxBytes":{"file":wechat_core::MediaKind::Image.max_source_bytes(),"image":wechat_core::MediaKind::Image.max_source_bytes(),"voice":wechat_core::MediaKind::Image.max_source_bytes(),"video":wechat_core::MediaKind::Image.max_source_bytes()},"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["direct","group"],"threadPinningTargets":["direct","group"],"threadPinningScope":"admin","incomingGroupUpdates":"partial","mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some()}),
++            json!({"nativeRuntime":true,"upstream":"simulator","officialBinaryRequired":false,"textMentions":true,"inlineTextMentions":true,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"nativeReceivedMessages":true,"nativeReceivedQuoteSources":true,"build":{"upstreamCommit":option_env!("WEKEEPER_GATEWAY_UPSTREAM_COMMIT").unwrap_or("unrecorded"),"sourceTree":option_env!("WEKEEPER_GATEWAY_SOURCE_TREE").unwrap_or("unrecorded")},"requiredConsumerReplay":true,"persistentClientIdReservation":true,"retainedQuoteReceiptRecovery":true,"sendStatusByIdempotencyKey":true,"unknownOutcomeAutoResend":false,"mediaUploadMaxBytes":wechat_core::MediaKind::Image.max_source_bytes(),"mediaSendMaxBytes":{"file":wechat_core::MediaKind::Image.max_source_bytes(),"image":wechat_core::MediaKind::Image.max_source_bytes(),"voice":wechat_core::MediaKind::Image.max_source_bytes(),"video":wechat_core::MediaKind::Image.max_source_bytes()},"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["direct","group"],"threadPinningTargets":["direct","group"],"threadPinningScope":"admin","incomingGroupUpdates":"partial","mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some()}),
+         ));
+     }
+     Ok(Json(
+-        json!({"nativeRuntime":true,"officialBinaryRequired":false,"textMentions":true,"inlineTextMentions":true,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"mediaUploadMaxBytes":wechat_core::MAX_SOURCE_BYTES,"mediaSendMaxBytes":media_send_max_bytes(),"mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some(),"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["direct","group"],"threadPinningTargets":["direct","group"],"threadPinningScope":"admin","incomingGroupUpdates":"partial"}),
++        json!({"nativeRuntime":true,"officialBinaryRequired":false,"textMentions":true,"inlineTextMentions":true,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"nativeReceivedMessages":true,"nativeReceivedQuoteSources":true,"build":{"upstreamCommit":option_env!("WEKEEPER_GATEWAY_UPSTREAM_COMMIT").unwrap_or("unrecorded"),"sourceTree":option_env!("WEKEEPER_GATEWAY_SOURCE_TREE").unwrap_or("unrecorded")},"requiredConsumerReplay":true,"persistentClientIdReservation":true,"retainedQuoteReceiptRecovery":true,"sendStatusByIdempotencyKey":true,"unknownOutcomeAutoResend":false,"mediaUploadMaxBytes":wechat_core::MAX_SOURCE_BYTES,"mediaSendMaxBytes":media_send_max_bytes(),"mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some(),"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["direct","group"],"threadPinningTargets":["direct","group"],"threadPinningScope":"admin","incomingGroupUpdates":"partial"}),
+     ))
+ }
+ fn media_send_max_bytes() -> Value {
+@@ -398,6 +398,25 @@ mod tests {
+         assert_eq!(body["quotedTextSend"], true);
+         assert_eq!(body["quotedTextSendScopes"], json!(["read", "send"]));
+         assert_eq!(body["quotedTextSendLiveValidated"], false);
++        assert_eq!(body["nativeReceivedMessages"], true);
++        assert_eq!(body["nativeReceivedQuoteSources"], true);
++        for capability in [
++            "requiredConsumerReplay",
++            "persistentClientIdReservation",
++            "retainedQuoteReceiptRecovery",
++            "sendStatusByIdempotencyKey",
++        ] {
++            assert_eq!(body[capability], true);
++        }
++        assert_eq!(body["unknownOutcomeAutoResend"], false);
++        assert_eq!(
++            body["build"]["upstreamCommit"],
++            option_env!("WEKEEPER_GATEWAY_UPSTREAM_COMMIT").unwrap_or("unrecorded")
++        );
++        assert_eq!(
++            body["build"]["sourceTree"],
++            option_env!("WEKEEPER_GATEWAY_SOURCE_TREE").unwrap_or("unrecorded")
++        );
+         assert_eq!(body["textMentions"], true);
+         assert_eq!(body["inlineTextMentions"], true);
+         assert_eq!(body["mediaSendMaxBytes"]["file"], 536_870_912);
+diff --git a/packages/native-client-rust/crates/wechat-api/src/contracts.rs b/packages/native-client-rust/crates/wechat-api/src/contracts.rs
+index aece127..ef9f849 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/contracts.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/contracts.rs
+@@ -48,6 +48,34 @@ pub struct NativeMessage {
+ }
+ #[derive(Serialize, Deserialize, TS)]
+ #[serde(rename_all = "camelCase")]
++pub struct NativeReceivedMessage {
++    pub received_id: String,
++    pub first_received_sequence: String,
++    pub account_id: String,
++    pub own_username: String,
++    pub source_sha256: String,
++    pub disposition: String,
++    pub reason: Option<String>,
++    pub thread_id: Option<String>,
++    pub server_id: Option<String>,
++    pub sender_id: Option<String>,
++    pub direction: Option<String>,
++    #[serde(rename = "type")]
++    pub message_type: Option<i32>,
++    pub app_message_type: Option<i32>,
++    pub created_at: Option<String>,
++    pub body: Option<String>,
++    pub mentions: NativeMentions,
++    pub quote: Option<NativeQuoteReference>,
++    pub quote_eligible: bool,
++}
++#[derive(Serialize, Deserialize, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeReceivedActivationRequest {
++    pub own_username: String,
++}
++#[derive(Serialize, Deserialize, TS)]
++#[serde(rename_all = "camelCase")]
+ pub struct NativeRecallInfo {
+     pub observed_at: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -364,7 +392,7 @@ pub struct NativeTextSendRequest {
+     pub text: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     #[ts(optional)]
+-    pub quote: Option<wechat_core::QuoteSendReference>,
++    pub quote: Option<wechat_core::QuoteSourceReference>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     #[ts(optional)]
+     pub mentions: Option<wechat_core::TextMentions>,
+@@ -470,6 +498,10 @@ pub fn typescript() -> String {
+         NativeAccountRemovalRequest::decl(),
+         NativeAccountRemoval::decl(),
+         wechat_core::QuoteSendReference::decl(),
++        wechat_core::ReceivedQuoteReference::decl(),
++        wechat_core::QuoteSourceReference::decl(),
++        NativeReceivedMessage::decl(),
++        NativeReceivedActivationRequest::decl(),
+         wechat_core::TextMentionPosition::decl(),
+         wechat_core::TextMentions::decl(),
+         NativeTextSendRequest::decl(),
+@@ -621,7 +653,7 @@ mod tests {
+         assert!(generated.contains("serverId: string | null"));
+         assert!(generated.contains("unreadCount: number | null"));
+         assert!(generated.contains("type NativePage<T>"));
+-        assert!(generated.contains("quote?: QuoteSendReference"));
++        assert!(generated.contains("quote?: QuoteSourceReference"));
+         assert!(
+             generated.contains("type QuoteSendReference = { messageId: string, serverId: string,")
+         );
+@@ -672,6 +704,29 @@ mod tests {
+             assert!(serde_json::from_value::<NativeTextSendRequest>(invalid).is_err());
+         }
+     }
++    #[test]
++    fn native_received_quote_contract_requires_the_immutable_source_hash() {
++        let source = serde_json::json!({"receivedId":"recv_source","serverId":"18446744073709551615","sourceSha256":"a".repeat(64)});
++        let request = serde_json::json!({"threadId":"room@chatroom","text":"Reply","quote":source});
++        let parsed: NativeTextSendRequest = serde_json::from_value(request.clone()).unwrap();
++        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
++        for extra in ["messageId", "content", "xml"] {
++            let mut invalid = request.clone();
++            invalid["quote"][extra] = serde_json::json!("caller supplied");
++            assert!(serde_json::from_value::<NativeTextSendRequest>(invalid).is_err());
++        }
++        let mut missing = request;
++        missing["quote"]
++            .as_object_mut()
++            .unwrap()
++            .remove("sourceSha256");
++        assert!(serde_json::from_value::<NativeTextSendRequest>(missing).is_err());
++        let generated = typescript();
++        assert!(generated.contains("type NativeReceivedMessage"));
++        assert!(generated.contains("firstReceivedSequence: string"));
++        assert!(generated
++            .contains("type QuoteSourceReference = QuoteSendReference | ReceivedQuoteReference"));
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/packages/native-client-rust/crates/wechat-api/src/lib.rs b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+index 8fa2e76..5e5a133 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+@@ -390,6 +390,26 @@ impl From<anyhow::Error> for ApiError {
+                 StatusCode::CONFLICT,
+                 "consumer_registration_conflict",
+             ),
++            (
++                "native_ingress_identity_mismatch",
++                StatusCode::CONFLICT,
++                "native_ingress_identity_mismatch",
++            ),
++            (
++                "native_ingress_not_ready",
++                StatusCode::CONFLICT,
++                "native_ingress_not_ready",
++            ),
++            (
++                "received_message_quarantined",
++                StatusCode::CONFLICT,
++                "received_message_quarantined",
++            ),
++            (
++                "native_message_identity_conflict",
++                StatusCode::CONFLICT,
++                "native_message_identity_conflict",
++            ),
+             (
+                 "consumer_cursor_not_delivered",
+                 StatusCode::CONFLICT,
+@@ -1010,7 +1030,7 @@ struct TextSend {
+     thread_id: String,
+     text: String,
+     #[serde(default)]
+-    quote: Option<wechat_core::QuoteSendReference>,
++    quote: Option<wechat_core::QuoteSourceReference>,
+     #[serde(default)]
+     mentions: Option<wechat_core::TextMentions>,
+ }
+@@ -1133,6 +1153,28 @@ async fn register_consumer(
+         decimal(Some(&input.after))?,
+     )?))
+ }
++async fn activate_received_consumer(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path((a, consumer)): Path<(String, String)>,
++    Json(input): Json<contracts::NativeReceivedActivationRequest>,
++) -> ApiResult<Json<Value>> {
++    c.require(Some(&a), "read")?;
++    Ok(Json(
++        app.core
++            .activate_native_consumer(&a, &consumer, &input.own_username)
++            .await?,
++    ))
++}
++async fn received_message(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path((a, id)): Path<(String, String)>,
++) -> ApiResult<Json<Value>> {
++    c.require(Some(&a), "read")?;
++    let value = work(move || app.core.received_message(&a, &id)).await?;
++    checked::<contracts::NativeReceivedMessage>(value)
++}
+ async fn consumer_status(
+     State(app): State<App>,
+     Extension(c): Extension<Claims>,
+@@ -1277,6 +1319,10 @@ pub fn router(core: Arc<Core>, token: &str) -> Router {
+         .route("/v1/accounts/{a}/threads/{thread}/messages", get(messages))
+         .route("/v1/accounts/{a}/messages", get(archive_messages))
+         .route("/v1/accounts/{a}/messages/{id}", get(message))
++        .route(
++            "/v1/accounts/{a}/received/messages/{id}",
++            get(received_message),
++        )
+         .route("/v1/accounts/{a}/avatars/{id}", get(avatar))
+         .route("/v1/accounts/{a}/messages/{id}/image", get(image))
+         .route("/v1/accounts/{a}/sends", post(media::send))
+@@ -1297,6 +1343,10 @@ pub fn router(core: Arc<Core>, token: &str) -> Router {
+             get(consumer_events),
+         )
+         .route("/v1/accounts/{a}/consumers/{consumer}/ack", post(ack))
++        .route(
++            "/v1/accounts/{a}/consumers/{consumer}/activate",
++            post(activate_received_consumer),
++        )
+         .layer(DefaultBodyLimit::max(128 * 1024))
+         .merge(media::routes())
+         .merge(actions::routes())
+@@ -2580,6 +2630,71 @@ mod tests {
+         );
+     }
+     #[tokio::test]
++    async fn received_routes_require_account_read_scope_and_reject_claimed_barriers() {
++        let (_t, core, app) = setup();
++        let token = "native-receive-synthetic-read-token-1234";
++        core.store
++            .issue_token(
++                "native read one",
++                &format!("{:x}", Sha256::digest(token.as_bytes())),
++                &["one".into()],
++                &["read".into()],
++                None,
++            )
++            .unwrap();
++        for (method, path, body) in [
++            ("GET", "/v1/accounts/two/received/messages/missing", None),
++            (
++                "POST",
++                "/v1/accounts/two/consumers/bot/activate",
++                Some(json!({"ownUsername":"self"})),
++            ),
++        ] {
++            assert_eq!(
++                call(app.clone(), method, path, None, body.clone()).await.0,
++                StatusCode::UNAUTHORIZED
++            );
++            assert_eq!(
++                call(app.clone(), method, path, Some(token), body).await.0,
++                StatusCode::FORBIDDEN
++            );
++        }
++        assert_eq!(
++            call(
++                app.clone(),
++                "GET",
++                "/v1/accounts/one/received/messages/missing",
++                Some(token),
++                None
++            )
++            .await
++            .0,
++            StatusCode::NOT_FOUND
++        );
++        for claim in [
++            json!({"initialSyncReady":true}),
++            json!({"after":"100"}),
++            json!({"receivedBoundary":"100"}),
++        ] {
++            let mut body = json!({"ownUsername":"self"});
++            body.as_object_mut()
++                .unwrap()
++                .extend(claim.as_object().unwrap().clone());
++            assert!(call(
++                app.clone(),
++                "POST",
++                "/v1/accounts/one/consumers/bot/activate",
++                Some(token),
++                Some(body)
++            )
++            .await
++            .0
++            .is_client_error());
++        }
++        assert!(core.store.required_consumer("one", "bot").is_err());
++        assert!(core.store.events("one", 0, 100).unwrap().is_empty());
++    }
++    #[tokio::test]
+     async fn required_consumer_must_fetch_before_ack_and_cannot_skip_or_reset() {
+         let (_t, core, app) = setup();
+         for _ in 0..3 {
+diff --git a/packages/native-client-rust/crates/wechat-api/src/media.rs b/packages/native-client-rust/crates/wechat-api/src/media.rs
+index 58756a2..9a21a8e 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/media.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/media.rs
+@@ -443,7 +443,7 @@ pub(super) async fn send(
+     let send = if let Some(reference) = request.quote {
+         c.require(Some(&a), "read")?;
+         app.core
+-            .send_quoted_text(&a, key, &request.thread_id, &request.text, reference)
++            .send_quoted_source_text(&a, key, &request.thread_id, &request.text, reference)
+             .await?
+     } else if let Some(mentions) = request.mentions {
+         app.core
+diff --git a/packages/native-client-rust/crates/wechat-core/src/lib.rs b/packages/native-client-rust/crates/wechat-core/src/lib.rs
+index d1316a3..c6bda83 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/lib.rs
+@@ -6,6 +6,7 @@ mod forwarded;
+ mod links;
+ pub use links::{LinkCard, ShareSendRequest};
+ mod locations;
++mod native_ingress_message;
+ pub use locations::{LocationCard, LocationCoordinateSystem};
+ mod media;
+ mod mention_send;
+@@ -27,7 +28,7 @@ mod quotes;
+ mod read_view;
+ pub use read_view::ReadTimings;
+ mod stickers;
+-pub use quote_send::QuoteSendReference;
++pub use quote_send::{QuoteSendReference, QuoteSourceReference, ReceivedQuoteReference};
+ mod recall_evidence;
+ mod recalls;
+ mod thread_summaries;
+diff --git a/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs b/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs
+new file mode 100644
+index 0000000..26a6103
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs
+@@ -0,0 +1,612 @@
++//! Receive custody does not wait for the official profile projection worker.
++use super::*;
++use crate::native_ingress_message::{
++    normalize_received_message, ReceivedDisposition, ReceivedMessageSnapshot,
++};
++use wechat_store::{NativeIngressBatch, NativeIngressMessageInput, NativeIngressRecallInput};
++
++impl Core {
++    fn native_ingress_recalls(
++        &self,
++        account: &str,
++        own: &str,
++        id: &str,
++        batch: &wechat_protocol::wire::SyncBatch,
++    ) -> Result<Vec<NativeIngressRecallInput>> {
++        let mut recalls = Vec::new();
++        for (index, command) in batch.commands.iter().enumerate().filter(|(_, c)| c.id == 5) {
++            let parse = || -> Result<Option<crate::recalls::IncomingRecall>> {
++                let fields = wechat_protocol::protobuf::decode(&command.payload)?;
++                let mut seen = std::collections::BTreeSet::new();
++                anyhow::ensure!(
++                    fields.iter().all(|f| seen.insert(f.number)),
++                    "ambiguous_received_field"
++                );
++                if wechat_protocol::protobuf::scalar(&fields, 4)? != 10002 {
++                    return Ok(None);
++                }
++                let snapshot = normalize_received_message(account, own, &command.payload);
++                anyhow::ensure!(
++                    snapshot.reason.as_deref() == Some("unsupported_received_type"),
++                    "received_identity_invalid"
++                );
++                let message = wechat_protocol::wire::decode_add_message(&command.payload, own)?;
++                crate::recalls::incoming_recall(&message, own)
++            };
++            if let Ok(Some(recall)) = parse() {
++                let receipt = format!("projected:{id}:{index}");
++                recalls.push(NativeIngressRecallInput {
++                    thread_id: recall.thread,
++                    server_id: recall.server,
++                    recalled_at: recall.recalled_at,
++                    sealed_control: self.vault.seal(
++                        account,
++                        &format!("sync-control:{receipt}"),
++                        &command.payload,
++                    )?,
++                    control_receipt: receipt,
++                });
++            }
++        }
++        Ok(recalls)
++    }
++    fn native_ingress_items(
++        &self,
++        account: &str,
++        own: &str,
++        batch_id: &str,
++        batch: &wechat_protocol::wire::SyncBatch,
++    ) -> Result<Vec<NativeIngressMessageInput>> {
++        let mut items = Vec::new();
++        for (index, command) in batch.commands.iter().enumerate().filter(|(_, c)| c.id == 5) {
++            let snapshot = normalize_received_message(account, own, &command.payload);
++            let identity = match (&snapshot.thread_id, &snapshot.server_id) {
++                (Some(thread), Some(server)) => serde_json::to_vec(&(account, thread, server))?,
++                _ => serde_json::to_vec(&(account, batch_id, index))?,
++            };
++            let id = format!("recv_{:x}", Sha256::digest(identity));
++            let plain = zeroize::Zeroizing::new(serde_json::to_vec(&snapshot)?);
++            items.push(NativeIngressMessageInput {
++                received_id: id.clone(),
++                command_index: index,
++                thread_id: snapshot.thread_id.clone(),
++                server_id: snapshot.server_id.clone(),
++                disposition: serde_json::to_value(&snapshot.disposition)?
++                    .as_str()
++                    .context("invalid native disposition")?
++                    .into(),
++                reason: snapshot.reason.clone(),
++                source_sha256: snapshot.source_sha256.clone(),
++                identity_fingerprint: snapshot.identity_fingerprint(),
++                sealed_snapshot: self.vault.seal(
++                    account,
++                    &format!("native-received:{id}"),
++                    plain.as_slice(),
++                )?,
++            });
++        }
++        Ok(items)
++    }
++
++    /// Index every pre-existing sealed message batch as historical, including
++    /// projected and blocked ones. Never reinterpret migration time as arrival.
++    pub(super) fn catalogue_native_history(&self, account: &str, own: &str) -> Result<()> {
++        loop {
++            let batches = self.store.uncatalogued_native_batches(account)?;
++            if batches.is_empty() {
++                return Ok(());
++            }
++            for (id, sealed) in batches {
++                let raw = self
++                    .vault
++                    .open_record(account, &format!("apply:{id}"), &sealed)?;
++                let batch: wechat_protocol::wire::SyncBatch = serde_json::from_slice(&raw)?;
++                let messages = self.native_ingress_items(account, own, &id, &batch)?;
++                let recalls = self.native_ingress_recalls(account, own, &id, &batch)?;
++                self.store.stage_native_ingress(
++                    account,
++                    NativeIngressBatch {
++                        batch_id: id,
++                        payload: None,
++                        cursor: None,
++                        ownership_generation: self.ownership_generation.clone(),
++                        historical: true,
++                        caught_up: false,
++                        origin: "catchup".into(),
++                        messages,
++                        recalls,
++                    },
++                )?;
++            }
++        }
++    }
++
++    pub(super) fn commit_native_ingress(
++        &self,
++        account: &str,
++        id: &str,
++        batch: &wechat_protocol::wire::SyncBatch,
++        origin: &str,
++    ) -> Result<String> {
++        let own = self.account_state(account)?.own_username.clone();
++        self.catalogue_native_history(account, &own)?;
++        let messages = self.native_ingress_items(account, &own, id, batch)?;
++        let recalls = self.native_ingress_recalls(account, &own, id, batch)?;
++        self.store.stage_native_ingress(
++            account,
++            NativeIngressBatch {
++                batch_id: id.into(),
++                payload: Some(self.vault.seal(
++                    account,
++                    &format!("apply:{id}"),
++                    &serde_json::to_vec(batch)?,
++                )?),
++                cursor: Some(self.vault.seal(account, "received-cursor", &batch.cursor)?),
++                ownership_generation: self.ownership_generation.clone(),
++                historical: false,
++                caught_up: !batch.continuation,
++                origin: origin.into(),
++                messages,
++                recalls,
++            },
++        )
++    }
++
++    fn load_received_snapshot(
++        &self,
++        account: &str,
++        id: &str,
++    ) -> Result<(wechat_store::NativeIngressRecord, ReceivedMessageSnapshot)> {
++        let record = self.store.native_ingress_record(account, id)?;
++        let raw = self.vault.open_record(
++            account,
++            &format!("native-received:{id}"),
++            &record.sealed_snapshot,
++        )?;
++        let snapshot: ReceivedMessageSnapshot = serde_json::from_slice(&raw)?;
++        anyhow::ensure!(
++            snapshot.account_id == account && snapshot.source_sha256 == record.source_sha256,
++            "native_ingress_identity_mismatch"
++        );
++        Ok((record, snapshot))
++    }
++    pub(crate) fn received_snapshot(
++        &self,
++        account: &str,
++        id: &str,
++    ) -> Result<ReceivedMessageSnapshot> {
++        let (record, snapshot) = self.load_received_snapshot(account, id)?;
++        anyhow::ensure!(
++            record.disposition != "quarantined"
++                && snapshot.disposition != ReceivedDisposition::Quarantined,
++            "received_message_quarantined"
++        );
++        Ok(snapshot)
++    }
++    pub fn received_message(&self, account: &str, id: &str) -> Result<Value> {
++        let (record, mut snapshot) = self.load_received_snapshot(account, id)?;
++        if record.disposition == "quarantined" {
++            snapshot.disposition = ReceivedDisposition::Quarantined;
++            snapshot.reason = record.reason;
++            snapshot.quote_reference = None;
++        }
++        Ok(snapshot.to_public(id, &record.first_received_sequence))
++    }
++    pub async fn activate_native_consumer(
++        self: &Arc<Self>,
++        account: &str,
++        consumer: &str,
++        expected_own: &str,
++    ) -> Result<Value> {
++        let guard = self.lock_account(account).await?;
++        let core = self.clone();
++        let account = account.to_owned();
++        let consumer = consumer.to_owned();
++        let expected = expected_own.to_owned();
++        blocking(move || {
++            let _guard = guard;
++            let own = core.account_state(&account)?.own_username.clone();
++            anyhow::ensure!(own == expected, "native_ingress_identity_mismatch");
++            core.store.activate_native_consumer(
++                &account,
++                &consumer,
++                &own,
++                &core.ownership_generation,
++            )
++        })
++        .await
++    }
++
++    /// One command per gate acquisition: incoming commits and queued sends can
++    /// acquire the FIFO account gate between profile writes. Failed commands
++    /// remain in the original batch and never hold up receive custody.
++    fn project_one_native_command(&self, account: &str) -> Result<()> {
++        if let Some((id, sealed)) = self.store.pending_sync(account)?.into_iter().next() {
++            let raw = self
++                .vault
++                .open_record(account, &format!("apply:{id}"), &sealed)?;
++            let batch: wechat_protocol::wire::SyncBatch = serde_json::from_slice(&raw)?;
++            let scan = format!("native-profile-scan:{id}");
++            let mut index = self
++                .store
++                .runtime(account, &scan)?
++                .and_then(|v| String::from_utf8(v).ok())
++                .and_then(|v| v.parse::<usize>().ok())
++                .unwrap_or(0);
++            let origin = self
++                .store
++                .runtime(account, &format!("apply-origin:{id}"))?
++                .and_then(|v| String::from_utf8(v).ok())
++                .unwrap_or_else(|| "catchup".into());
++            while index < batch.commands.len() {
++                let receipt = format!("projected:{id}:{index}");
++                let command = &batch.commands[index];
++                index += 1;
++                if self.store.runtime(account, &receipt)?.is_some() {
++                    continue;
++                }
++                let outcome = self.apply_received_sync_command(account, command, &receipt, &origin);
++                self.store
++                    .put_runtime(account, &scan, index.to_string().as_bytes())?;
++                if let Err(error) = outcome {
++                    let detail=sync_projection::projection_blocker(&error).unwrap_or_else(||json!({"commandId":command.id,"reason":"unsupported_or_unavailable_profile"}));
++                    self.store.append_event_once(account,&format!("native-profile-blocked:{id}:{}",index-1),"projection.blocked",&json!({"batchId":id,"commands":[detail],"blockedCommandCount":1,"truncated":false}))?;
++                }
++                return Ok(());
++            }
++            let mut complete = true;
++            for index in 0..batch.commands.len() {
++                complete &= self
++                    .store
++                    .runtime(account, &format!("projected:{id}:{index}"))?
++                    .is_some();
++            }
++            if complete {
++                self.store.finish_sync(account, &id)?;
++            } else {
++                self.store.block_sync(account, &id)?;
++            }
++            self.store.clear_runtime(account, &scan)?;
++            if complete && self.store.pending_sync_count(account)? == 0 {
++                let _ = self.publish_profile_checkpoint(account);
++            }
++            return Ok(());
++        }
++        Ok(())
++    }
++
++    pub(super) fn start_native_ingress_worker(self: &Arc<Self>, account: &str) -> Result<()> {
++        let core = self.clone();
++        let account = account.to_owned();
++        tokio::spawn(async move {
++            let mut next_send_projection = std::time::Instant::now();
++            loop {
++                if core.stopping.load(Ordering::SeqCst) {
++                    break;
++                }
++                let send_projection = if std::time::Instant::now() >= next_send_projection {
++                    next_send_projection = std::time::Instant::now() + Duration::from_secs(1);
++                    core.store
++                        .next_pending_text_projection(&account)
++                        .ok()
++                        .flatten()
++                } else {
++                    None
++                };
++                if send_projection.is_none()
++                    && !core
++                        .store
++                        .native_projection_work_pending(&account)
++                        .unwrap_or(false)
++                {
++                    tokio::time::sleep(Duration::from_millis(250)).await;
++                    continue;
++                }
++                let Ok(guard) = core.lock_account(&account).await else {
++                    break;
++                };
++                let worker = core.clone();
++                let owned = account.clone();
++                let _ = blocking(move || {
++                    let _guard = guard;
++                    let own = worker.account_state(&owned)?.own_username.clone();
++                    worker.catalogue_native_history(&owned, &own)?;
++                    if worker.store.queued_sends(&owned)?.is_empty() {
++                        if let Some(id) = send_projection {
++                            // Local repair only: accepted sends never re-enter
++                            // the network submission path, even after failure.
++                            let _ = worker.project_message_send(&owned, &id);
++                        } else {
++                            worker.project_one_native_command(&owned)?;
++                        }
++                    }
++                    Ok(())
++                })
++                .await;
++                tokio::time::sleep(Duration::from_millis(25)).await;
++            }
++        });
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use wechat_protocol::{
++        protobuf as p,
++        wire::{SyncBatch, SyncCommand},
++    };
++
++    fn fixture() -> (tempfile::TempDir, Arc<Core>) {
++        let directory = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
++        store.create_account("one").unwrap();
++        let core = Core::new(store, None).unwrap();
++        core.save_state("one", &super::super::tests::state())
++            .unwrap();
++        (directory, core)
++    }
++    fn message(server: u64, content: &[u8], kind: u64) -> SyncCommand {
++        SyncCommand {
++            id: 5,
++            payload: p::message(&[
++                p::uint(1, 1),
++                p::bytes(2, &p::bytes(1, b"room@chatroom")),
++                p::bytes(3, &p::bytes(1, b"synthetic_self")),
++                p::uint(4, kind),
++                p::bytes(5, &p::bytes(1, content)),
++                p::uint(6, 0),
++                p::uint(7, 0),
++                p::bytes(8, &p::buffer(&[])),
++                p::uint(9, 1700000000),
++                p::bytes(
++                    10,
++                    b"<msgsource><atuserlist>synthetic_self</atuserlist></msgsource>",
++                ),
++                p::uint(12, server),
++            ])
++            .unwrap(),
++        }
++    }
++    fn batch(commands: Vec<SyncCommand>, continuation: bool) -> SyncBatch {
++        SyncBatch {
++            code: 0,
++            flags: 0,
++            cursor: p::uint(1, 7),
++            commands,
++            continuation,
++        }
++    }
++    fn received_ids(core: &Core) -> Vec<String> {
++        core.store
++            .events("one", 0, 100)
++            .unwrap()
++            .iter()
++            .filter(|e| e.kind == "message.received")
++            .map(|e| e.data["receivedId"].as_str().unwrap().to_owned())
++            .collect()
++    }
++
++    #[tokio::test]
++    async fn native_source_and_cutover_work_without_any_profile_projection() {
++        let (_directory, core) = fixture();
++        let old = batch(vec![message(71, b"member:\nold question", 1)], false);
++        core.store
++            .stage_sync(
++                "one",
++                "old",
++                &core
++                    .vault
++                    .seal("one", "apply:old", &serde_json::to_vec(&old).unwrap())
++                    .unwrap(),
++                b"old sealed cursor",
++            )
++            .unwrap();
++        core.store.block_sync("one", "old").unwrap();
++        assert!(core
++            .activate_native_consumer("one", "bot", "synthetic_self")
++            .await
++            .is_err());
++        core.commit_native_ingress("one", "terminal", &batch(vec![], false), "catchup")
++            .unwrap();
++        let activation = core
++            .activate_native_consumer("one", "bot", "synthetic_self")
++            .await
++            .unwrap();
++        assert_eq!(activation["checkpoint"]["receivedBoundary"], "2");
++        assert_eq!(core.store.pending_sync_count("one").unwrap(), 2);
++        assert!(core.store.pending_cursor_projection("one").unwrap());
++        core.commit_native_ingress(
++            "one",
++            "future",
++            &batch(vec![message(72, b"member:\nnew question", 1)], false),
++            "live",
++        )
++        .unwrap();
++        let (events, _) = core.store.consumer_events("one", "bot", None, 100).unwrap();
++        assert_eq!(events.len(), 1);
++        let id = events[0].data["receivedId"].as_str().unwrap();
++        let public = core.received_message("one", id).unwrap();
++        assert_eq!(public["body"], "new question");
++        assert_eq!(public["disposition"], "ready");
++        assert_eq!(public["firstReceivedSequence"], "3");
++        assert!(core.received_snapshot("one", id).is_ok());
++        let reference = crate::ReceivedQuoteReference {
++            received_id: id.into(),
++            server_id: "72".into(),
++            source_sha256: public["sourceSha256"].as_str().unwrap().into(),
++        };
++        let source = crate::QuoteSourceReference::Received(reference.clone());
++        let quote = core
++            .resolve_quote_source("one", "room@chatroom", "reply", &source, "synthetic_self")
++            .unwrap();
++        assert!(quote.xml.contains("<fromusr>room@chatroom</fromusr>"));
++        assert!(quote.xml.contains("<chatusr>member</chatusr>"));
++        assert!(core
++            .resolve_quote_source("one", "other@chatroom", "reply", &source, "synthetic_self")
++            .is_err());
++        for wrong in [
++            crate::ReceivedQuoteReference {
++                server_id: "73".into(),
++                ..reference.clone()
++            },
++            crate::ReceivedQuoteReference {
++                source_sha256: "0".repeat(64),
++                ..reference
++            },
++        ] {
++            assert!(core
++                .resolve_quote_source(
++                    "one",
++                    "room@chatroom",
++                    "reply",
++                    &crate::QuoteSourceReference::Received(wrong),
++                    "synthetic_self"
++                )
++                .is_err());
++        }
++        assert!(!core
++            .store
++            .events("one", 0, 100)
++            .unwrap()
++            .iter()
++            .any(|e| e.kind == "message.committed"));
++        let id = id.to_owned();
++        let store = core.store.clone();
++        drop(core);
++        let reopened = Core::new(store, None).unwrap();
++        assert_eq!(reopened.received_message("one", &id).unwrap(), public);
++        assert_eq!(
++            reopened
++                .activate_native_consumer("one", "bot", "synthetic_self")
++                .await
++                .unwrap()["checkpoint"],
++            activation["checkpoint"]
++        );
++        assert!(reopened
++            .activate_native_consumer("one", "bot", "wrong_identity")
++            .await
++            .is_err());
++    }
++
++    #[test]
++    fn conflicting_identity_cannot_replace_the_first_authenticated_source() {
++        let (_directory, core) = fixture();
++        let first = batch(vec![message(71, b"member:\nfirst", 1)], false);
++        core.commit_native_ingress("one", "first", &first, "live")
++            .unwrap();
++        let id = received_ids(&core).remove(0);
++        let original = core
++            .store
++            .native_ingress_record("one", &id)
++            .unwrap()
++            .sealed_snapshot;
++        core.commit_native_ingress("one", "duplicate", &first, "live")
++            .unwrap();
++        assert_eq!(received_ids(&core).len(), 1);
++        core.commit_native_ingress(
++            "one",
++            "conflict",
++            &batch(vec![message(71, b"member:\nchanged", 1)], false),
++            "live",
++        )
++        .unwrap();
++        let public = core.received_message("one", &id).unwrap();
++        assert_eq!(public["disposition"], "quarantined");
++        assert_eq!(public["reason"], "native_message_identity_conflict");
++        assert_eq!(public["body"], "first");
++        assert!(core.received_snapshot("one", &id).is_err());
++        assert_eq!(
++            core.store
++                .native_ingress_record("one", &id)
++                .unwrap()
++                .sealed_snapshot,
++            original
++        );
++    }
++
++    #[test]
++    fn native_recall_blocks_the_source_before_the_profile_worker_runs() {
++        let (_directory, core) = fixture();
++        let recall=b"member:\n<sysmsg type=\"revokemsg\"><revokemsg><session>room@chatroom</session><newmsgid>71</newmsgid><replacemsg>recalled</replacemsg></revokemsg></sysmsg>";
++        core.commit_native_ingress(
++            "one",
++            "first",
++            &batch(
++                vec![
++                    message(71, b"member:\nfirst", 1),
++                    message(72, recall, 10002),
++                ],
++                false,
++            ),
++            "live",
++        )
++        .unwrap();
++        let id = received_ids(&core).remove(0);
++        assert!(core
++            .store
++            .recall_marker("one", "room@chatroom", "71")
++            .unwrap()
++            .is_some());
++        assert_eq!(
++            core.received_message("one", &id).unwrap()["reason"],
++            "message_recalled"
++        );
++        assert!(core.received_snapshot("one", &id).is_err());
++        assert_eq!(core.store.pending_sync_count("one").unwrap(), 1);
++        assert!(core
++            .store
++            .runtime("one", "projected:first:1")
++            .unwrap()
++            .is_none());
++    }
++
++    #[test]
++    fn each_profile_worker_step_attempts_only_one_command_and_keeps_failures() {
++        let (_directory, core) = fixture();
++        core.commit_native_ingress(
++            "one",
++            "pending",
++            &batch(
++                vec![
++                    message(71, b"member:\nfirst", 1),
++                    message(72, b"member:\nsecond", 1),
++                ],
++                false,
++            ),
++            "live",
++        )
++        .unwrap();
++        core.project_one_native_command("one").unwrap();
++        assert_eq!(
++            core.store
++                .runtime("one", "native-profile-scan:pending")
++                .unwrap()
++                .as_deref(),
++            Some(b"1".as_slice())
++        );
++        // Metadata refresh during the scan must revisit an earlier failure.
++        core.store.retry_blocked("one").unwrap();
++        core.project_one_native_command("one").unwrap();
++        assert_eq!(
++            core.store
++                .runtime("one", "native-profile-scan:pending")
++                .unwrap()
++                .as_deref(),
++            Some(b"1".as_slice())
++        );
++        core.project_one_native_command("one").unwrap();
++        assert_eq!(
++            core.store
++                .runtime("one", "native-profile-scan:pending")
++                .unwrap()
++                .as_deref(),
++            Some(b"2".as_slice())
++        );
++        core.project_one_native_command("one").unwrap();
++        assert!(core.store.pending_sync("one").unwrap().is_empty());
++        assert_eq!(core.store.pending_sync_count("one").unwrap(), 1);
++        assert_eq!(received_ids(&core).len(), 2);
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/native_ingress_message.rs b/packages/native-client-rust/crates/wechat-core/src/native_ingress_message.rs
+new file mode 100644
+index 0000000..6c91e9e
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/native_ingress_message.rs
+@@ -0,0 +1,554 @@
++//! Immutable authenticated AddMsg facts, independent of official profile writes.
++//! A quarantined observation is retained work, never a silently completed item.
++use anyhow::{bail, ensure, Context, Result};
++use base64::{engine::general_purpose::STANDARD, Engine};
++use serde::{Deserialize, Serialize};
++use serde_json::{json, Value};
++use sha2::{Digest, Sha256};
++use wechat_protocol::{protobuf as p, quote_send::QuoteReference};
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub(crate) enum ReceivedDisposition {
++    Ready,
++    Outgoing,
++    System,
++    Quarantined,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub(crate) struct ReceivedMessageSnapshot {
++    pub schema_version: u8,
++    pub account_id: String,
++    pub own_username: String,
++    pub source_sha256: String,
++    pub raw_payload_base64: String,
++    pub thread_id: Option<String>,
++    pub sender_id: Option<String>,
++    pub server_id: Option<String>,
++    pub direction: Option<String>,
++    pub message_type: Option<i32>,
++    pub app_message_type: Option<i32>,
++    pub created_at: Option<u32>,
++    pub body: Option<String>,
++    pub mentions: Value,
++    pub quote: Option<Value>,
++    pub disposition: ReceivedDisposition,
++    pub reason: Option<String>,
++    pub raw_content_base64: String,
++    pub raw_msgsource_base64: Option<String>,
++    pub quote_reference: Option<QuoteReference>,
++}
++
++impl ReceivedMessageSnapshot {
++    /// Stable message facts, excluding receive time, batch, session and raw
++    /// transport counters. Duplicate observations never replace the first seal.
++    pub(crate) fn identity_fingerprint(&self) -> String {
++        let facts = json!({"account":self.account_id,"own":self.own_username,
++            "thread":self.thread_id,"sender":self.sender_id,"server":self.server_id,
++            "direction":self.direction,"type":self.message_type,"subtype":self.app_message_type,
++            "createdAt":self.created_at,"rawContent":self.raw_content_base64,
++            "rawMsgsource":self.raw_msgsource_base64});
++        format!(
++            "{:x}",
++            Sha256::digest(serde_json::to_vec(&facts).expect("JSON facts"))
++        )
++    }
++
++    pub(crate) fn to_public(&self, received_id: &str, first_received_sequence: &str) -> Value {
++        json!({"receivedId":received_id,"firstReceivedSequence":first_received_sequence,
++            "accountId":self.account_id,"ownUsername":self.own_username,"sourceSha256":self.source_sha256,
++            "disposition":self.disposition,"reason":self.reason,"threadId":self.thread_id,
++            "serverId":self.server_id,"senderId":self.sender_id,"direction":self.direction,
++            "type":self.message_type,"appMessageType":self.app_message_type,
++            "createdAt":self.created_at.and_then(|n|chrono::DateTime::from_timestamp(i64::from(n),0)).map(|t|t.to_rfc3339()),
++            "body":self.body,"mentions":self.mentions,"quote":self.quote,
++            "quoteEligible":self.disposition==ReceivedDisposition::Ready && self.quote_reference.is_some()})
++    }
++}
++
++fn received_mentions(source: Option<&str>, own: &str) -> Result<Value> {
++    let source = source.context("received_mentions_unknown")?;
++    ensure!(
++        source.len() <= 256 * 1024
++            && !source.to_ascii_uppercase().contains("<!DOCTYPE")
++            && !source.to_ascii_uppercase().contains("<!ENTITY"),
++        "received_mentions_unknown"
++    );
++    let document = roxmltree::Document::parse_with_options(
++        source,
++        roxmltree::ParsingOptions {
++            allow_dtd: false,
++            nodes_limit: 4096,
++            ..Default::default()
++        },
++    )
++    .map_err(|_| anyhow::anyhow!("received_mentions_unknown"))?;
++    let root = document.root_element();
++    ensure!(
++        root.tag_name().name() == "msgsource"
++            && root.tag_name().namespace().is_none()
++            && document
++                .descendants()
++                .all(|n| n.ancestors().take(65).count() <= 64),
++        "received_mentions_unknown"
++    );
++    let lists: Vec<_> = root
++        .children()
++        .filter(|n| n.is_element() && n.tag_name().name() == "atuserlist")
++        .collect();
++    ensure!(
++        lists.len() <= 1 && lists.iter().all(|n| n.tag_name().namespace().is_none()),
++        "received_mentions_unknown"
++    );
++    let raw = lists
++        .first()
++        .map(|n| crate::quotes::leaf(*n).context("received_mentions_unknown"))
++        .transpose()?
++        .unwrap_or_default();
++    let ids: Vec<_> = raw
++        .split(',')
++        .map(str::trim)
++        .filter(|s| !s.is_empty())
++        .collect();
++    ensure!(
++        ids.len() <= 128 && ids.iter().all(|s| identity(s)),
++        "received_mentions_unknown"
++    );
++    let all = ids.contains(&"notify@all");
++    let users: Vec<_> = ids.into_iter().filter(|id| *id != "notify@all").collect();
++    Ok(
++        json!({"state":"known","userIds":users,"self":users.contains(&own),"all":all,"source":"msgsource.atuserlist"}),
++    )
++}
++
++fn identity(value: &str) -> bool {
++    !value.is_empty()
++        && value.len() <= 256
++        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
++}
++
++pub(crate) fn normalize_received_message(
++    account: &str,
++    own: &str,
++    raw: &[u8],
++) -> ReceivedMessageSnapshot {
++    let mut snapshot = ReceivedMessageSnapshot {
++        schema_version: 1,
++        account_id: account.into(),
++        own_username: own.into(),
++        source_sha256: format!("{:x}", Sha256::digest(raw)),
++        raw_payload_base64: STANDARD.encode(raw),
++        thread_id: None,
++        sender_id: None,
++        server_id: None,
++        direction: None,
++        message_type: None,
++        app_message_type: None,
++        created_at: None,
++        body: None,
++        mentions: crate::profile::mentions(None, Some(own)),
++        quote: None,
++        disposition: ReceivedDisposition::Quarantined,
++        reason: None,
++        raw_content_base64: String::new(),
++        raw_msgsource_base64: None,
++        quote_reference: None,
++    };
++    if let Err(error) = normalize(&mut snapshot, raw) {
++        snapshot.disposition = ReceivedDisposition::Quarantined;
++        snapshot.quote_reference = None;
++        snapshot.reason = Some(
++            match error.to_string().as_str() {
++                "unsupported_received_type" => "unsupported_received_type",
++                "unsupported_received_app_subtype" => "unsupported_received_app_subtype",
++                "received_mentions_unknown" => "received_mentions_unknown",
++                "received_group_sender_invalid" => "received_group_sender_invalid",
++                "received_account_mismatch" => "received_account_mismatch",
++                "received_identity_invalid" => "received_identity_invalid",
++                "received_source_unavailable" => "received_source_unavailable",
++                _ => "received_message_malformed",
++            }
++            .into(),
++        );
++    }
++    snapshot
++}
++
++fn normalize(snapshot: &mut ReceivedMessageSnapshot, raw: &[u8]) -> Result<()> {
++    // This wrapper tightens the general decoder's legacy scalar casts and room
++    // routing allowance. These are identity gates, not profile metadata gates.
++    let fields = p::decode(raw)?;
++    let mut seen = std::collections::BTreeSet::new();
++    for field in &fields {
++        ensure!(seen.insert(field.number), "ambiguous_received_field");
++    }
++    let message_type = i32::try_from(p::scalar(&fields, 4)?)?;
++    ensure!(message_type > 0, "received_identity_invalid");
++    let message = wechat_protocol::wire::decode_add_message(raw, &snapshot.own_username)?;
++    snapshot.message_type = Some(message_type);
++    snapshot.thread_id = Some(message.peer.clone());
++    snapshot.server_id = message.server_message_id.clone();
++    snapshot.created_at = Some(message.created_at);
++    snapshot.raw_content_base64 = STANDARD.encode(&message.content);
++    snapshot.raw_msgsource_base64 = message.msgsource.as_ref().map(|v| STANDARD.encode(v));
++    ensure!(
++        identity(&snapshot.own_username)
++            && identity(&message.from)
++            && identity(&message.to)
++            && identity(&message.peer),
++        "received_identity_invalid"
++    );
++    ensure!(
++        message.from == snapshot.own_username || message.to == snapshot.own_username,
++        "received_account_mismatch"
++    );
++    ensure!(
++        message
++            .server_message_id
++            .as_deref()
++            .is_some_and(|s| s.parse::<u64>().is_ok_and(|n| n > 0 && n.to_string() == s))
++            && message.created_at > 0
++            && message.created_at <= i32::MAX as u32,
++        "received_identity_invalid"
++    );
++    if matches!(message_type, 10000 | 10002) {
++        // 10002 includes controls such as recalls. Its semantic disposition is
++        // owned by ingress control handling; unrecognized controls stay pending.
++        if message_type == 10002 {
++            bail!("unsupported_received_type");
++        }
++        snapshot.disposition = ReceivedDisposition::System;
++        snapshot.body = String::from_utf8(message.content).ok();
++        return Ok(());
++    }
++    let group_incoming =
++        message.from.ends_with("@chatroom") && message.from != snapshot.own_username;
++    let (sender, content) = if group_incoming {
++        ensure!(
++            message.to == snapshot.own_username,
++            "received_account_mismatch"
++        );
++        let end = message
++            .content
++            .windows(2)
++            .take(257)
++            .position(|bytes| bytes == b":\n")
++            .context("received_group_sender_invalid")?;
++        let sender = std::str::from_utf8(&message.content[..end])?;
++        ensure!(
++            identity(sender) && !sender.ends_with("@chatroom"),
++            "received_group_sender_invalid"
++        );
++        (sender, &message.content[end + 2..])
++    } else {
++        (message.from.as_str(), message.content.as_slice())
++    };
++    let outgoing = sender == snapshot.own_username;
++    snapshot.sender_id = Some(sender.into());
++    snapshot.direction = Some(if outgoing { "outgoing" } else { "incoming" }.into());
++    let source = message
++        .msgsource
++        .as_deref()
++        .map(std::str::from_utf8)
++        .transpose()?;
++    snapshot.mentions = crate::profile::mentions(source, Some(&snapshot.own_username));
++    if outgoing {
++        snapshot.disposition = ReceivedDisposition::Outgoing;
++        return Ok(());
++    }
++    if source.is_some() || message.peer.ends_with("@chatroom") {
++        snapshot.mentions = received_mentions(source, &snapshot.own_username)?;
++    }
++    ensure!(
++        !source.is_some_and(|s| s.contains("announcement@all")),
++        "received_source_unavailable"
++    );
++    // An absent or malformed source is not proof of absence of @mentions.
++    // A direct chat does not need @metadata to identify its recipient. Preserve
++    // absent metadata as unknown for policy; never manufacture self=false.
++    ensure!(
++        snapshot.mentions["state"] == "known" || !message.peer.ends_with("@chatroom"),
++        "received_mentions_unknown"
++    );
++    ensure!(
++        snapshot.mentions["userIds"]
++            .as_array()
++            .is_some_and(|ids| ids.iter().all(|id| id.as_str().is_some_and(identity))),
++        "received_mentions_unknown"
++    );
++    let content = std::str::from_utf8(content)?;
++    ensure!(
++        !content.is_empty() && content.len() <= 128 * 1024 && !content.contains('\0'),
++        "received_source_unavailable"
++    );
++    let quote_content = match message_type {
++        1 => {
++            snapshot.body = Some(content.into());
++            content.to_owned()
++        }
++        49 => normalize_app(snapshot, content)?,
++        _ => bail!("unsupported_received_type"),
++    };
++    let reference = QuoteReference {
++        message_type,
++        server_id: snapshot.server_id.clone().unwrap(),
++        from_user: if group_incoming {
++            message.peer.clone()
++        } else {
++            sender.into()
++        },
++        chat_user: sender.into(),
++        display_name: sender.into(),
++        content: quote_content,
++        created_at: message.created_at,
++        msg_source: source.filter(|s| !s.is_empty()).map(str::to_owned),
++    };
++    reference.validate()?;
++    snapshot.quote_reference = Some(reference);
++    snapshot.disposition = ReceivedDisposition::Ready;
++    Ok(())
++}
++
++fn normalize_app(snapshot: &mut ReceivedMessageSnapshot, content: &str) -> Result<String> {
++    // The existing bounded parser is shared with profile reads. Its result is
++    // now derived directly from the retained AddMsg, never a profile row/title.
++    let app = crate::quotes::app_message(content).context("received_source_unavailable")?;
++    snapshot.app_message_type = Some(app.subtype);
++    snapshot.quote = crate::quotes::embedded_quote(&app, Some(&snapshot.own_username));
++    match app.subtype {
++        1 | 87 => {
++            snapshot.body = app.text.filter(|s| !s.is_empty());
++            ensure!(snapshot.body.is_some(), "received_source_unavailable");
++            Ok(content.into())
++        }
++        5 | 51 => {
++            snapshot.body = app.link.as_ref().map(|link| link.card.body());
++            ensure!(
++                snapshot.body.as_deref().is_some_and(|s| !s.is_empty()),
++                "received_source_unavailable"
++            );
++            Ok(content.into())
++        }
++        57 => {
++            ensure!(
++                app.reference.is_some() && snapshot.quote.is_some(),
++                "received_source_unavailable"
++            );
++            ensure!(
++                snapshot
++                    .quote
++                    .as_ref()
++                    .is_some_and(|quote| quote["state"] == "embedded"
++                        && quote["embeddedText"]
++                            .as_str()
++                            .is_some_and(|text| !text.is_empty())),
++                "received_source_unavailable"
++            );
++            let title = app
++                .title
++                .filter(|s| !s.is_empty())
++                .context("received_source_unavailable")?;
++            snapshot.body = Some(title.clone());
++            // Quote the immediate parent comment, as the existing resolver does;
++            // do not recursively include the parent's own quoted payload.
++            let escaped = title
++                .replace('&', "&amp;")
++                .replace('<', "&lt;")
++                .replace('>', "&gt;")
++                .replace('"', "&quot;")
++                .replace('\'', "&apos;");
++            Ok(format!(
++                "<msg><appmsg><title>{escaped}</title><type>57</type></appmsg></msg>"
++            ))
++        }
++        // A file/forward/card title alone is not its full business content.
++        _ => bail!("unsupported_received_app_subtype"),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn add(from: &str, to: &str, kind: u64, content: &[u8], source: Option<&[u8]>) -> Vec<u8> {
++        let mut fields = vec![
++            p::uint(1, 1),
++            p::bytes(2, &p::bytes(1, from.as_bytes())),
++            p::bytes(3, &p::bytes(1, to.as_bytes())),
++            p::uint(4, kind),
++            p::bytes(5, &p::bytes(1, content)),
++            p::uint(6, 0),
++            p::uint(7, 0),
++            p::bytes(8, &p::buffer(b"")),
++            p::uint(9, 1700000000),
++            p::uint(12, u64::MAX),
++        ];
++        if let Some(source) = source {
++            fields.push(p::bytes(10, source));
++        }
++        p::message(&fields).unwrap()
++    }
++    const SOURCE: &[u8] = b"<msgsource><atuserlist>self,other</atuserlist></msgsource>";
++    fn normalized(raw: &[u8]) -> ReceivedMessageSnapshot {
++        normalize_received_message("account", "self", raw)
++    }
++
++    #[test]
++    fn native_group_text_is_complete_without_profile_sequence_or_metadata() {
++        let raw = add(
++            "room@chatroom",
++            "self",
++            1,
++            "member:\n原始正文\n第二行".as_bytes(),
++            Some(SOURCE),
++        );
++        let value = normalized(&raw);
++        assert_eq!(value.disposition, ReceivedDisposition::Ready);
++        assert_eq!(value.sender_id.as_deref(), Some("member"));
++        assert_eq!(value.body.as_deref(), Some("原始正文\n第二行"));
++        assert_eq!(
++            value.server_id.as_deref(),
++            Some(u64::MAX.to_string().as_str())
++        );
++        assert_eq!(value.mentions["self"], true);
++        let quote = value.quote_reference.as_ref().unwrap();
++        assert_eq!(quote.from_user, "room@chatroom");
++        assert_eq!(quote.chat_user, "member");
++        assert_eq!(quote.content, "原始正文\n第二行");
++        assert_eq!(STANDARD.decode(&value.raw_payload_base64).unwrap(), raw);
++        assert_eq!(value.to_public("received-id", "15")["quoteEligible"], true);
++        assert_eq!(
++            value.to_public("received-id", "15")["createdAt"],
++            "2023-11-14T22:13:20+00:00"
++        );
++    }
++
++    #[test]
++    fn received_identity_aliases_and_spoofed_room_routes_are_quarantined() {
++        for raw in [
++            add(
++                "room@chatroom",
++                "other-account",
++                1,
++                b"member:\nhello",
++                Some(SOURCE),
++            ),
++            add(
++                "room@chatroom",
++                "self",
++                1,
++                b"member space:\nhello",
++                Some(SOURCE),
++            ),
++            add(
++                "room@chatroom",
++                "self",
++                1,
++                b"other@chatroom:\nhello",
++                Some(SOURCE),
++            ),
++            add(
++                "room@chatroom",
++                "self",
++                1,
++                b"hello without sender",
++                Some(SOURCE),
++            ),
++            add("member", "self", (1u64 << 32) + 1, b"hello", Some(SOURCE)),
++            p::message(&[
++                add("member", "self", 1, b"hello", Some(SOURCE)),
++                p::uint(12, 123),
++            ])
++            .unwrap(),
++        ] {
++            let value = normalized(&raw);
++            assert_eq!(value.disposition, ReceivedDisposition::Quarantined);
++            assert!(value.reason.is_some());
++            assert!(value.quote_reference.is_none());
++        }
++    }
++
++    #[test]
++    fn source_mentions_are_exact_and_unknown_never_becomes_not_mentioned() {
++        for source in [None,Some(b"<invalid/>".as_slice()),
++            Some(b"<msgsource><atuserlist>self</atuserlist><atuserlist>other</atuserlist></msgsource>".as_slice()),
++            Some(b"<msgsource><atuserlist>member space</atuserlist></msgsource>".as_slice()),
++            Some(b"<msgsource xmlns:x='urn:other'><x:atuserlist>self</x:atuserlist></msgsource>".as_slice())] {
++            let value=normalized(&add("room@chatroom","self",1,b"member:\n@self text is not metadata",source));
++            assert_eq!(value.disposition,ReceivedDisposition::Quarantined);
++            assert!(value.quote_reference.is_none());
++        }
++        let nested = normalized(&add(
++            "member",
++            "self",
++            1,
++            b"@self",
++            Some(b"<msgsource><quote><atuserlist>self</atuserlist></quote></msgsource>"),
++        ));
++        assert_eq!(nested.mentions["self"], false);
++        let exact = normalized(&add(
++            "member",
++            "self",
++            1,
++            b"hello",
++            Some(b"<msgsource><atuserlist>self-other</atuserlist></msgsource>"),
++        ));
++        assert_eq!(exact.mentions["self"], false);
++        let direct = normalized(&add("member", "self", 1, b"direct message", None));
++        assert_eq!(direct.disposition, ReceivedDisposition::Ready);
++        assert_eq!(direct.mentions["state"], "unknown");
++        assert_eq!(direct.mentions["self"], Value::Null);
++        assert!(direct.quote_reference.is_some());
++    }
++
++    #[test]
++    fn app_quote_retains_immediate_text_and_exact_embedded_target() {
++        let content=b"member:\n<msg><appmsg><type>57</type><title>reply</title><refermsg><svrid>9007199254740993</svrid><type>1</type><fromusr>original</fromusr><content>original question</content></refermsg></appmsg></msg>";
++        let value = normalized(&add("room@chatroom", "self", 49, content, Some(SOURCE)));
++        assert_eq!(value.disposition, ReceivedDisposition::Ready);
++        assert_eq!(value.body.as_deref(), Some("reply"));
++        assert_eq!(
++            value.quote.as_ref().unwrap()["serverId"],
++            "9007199254740993"
++        );
++        assert_eq!(
++            value.quote.as_ref().unwrap()["embeddedText"],
++            "original question"
++        );
++        let reference = value.quote_reference.unwrap();
++        assert!(reference.content.contains("<title>reply</title>"));
++        assert!(!reference.content.contains("refermsg"));
++    }
++
++    #[test]
++    fn unsupported_apps_unknown_controls_and_missing_quote_content_remain_visible() {
++        for (kind,content) in [(49,b"<msg><appmsg><type>6</type><title>file name is not file content</title></appmsg></msg>".as_slice()),
++            (49,b"<msg><appmsg><type>57</type><title>reply</title><refermsg><svrid>2</svrid><type>1</type></refermsg></appmsg></msg>".as_slice()),
++            (10002,b"<sysmsg type='unknown'/>".as_slice())] {
++            let raw=add("member","self",kind,content,Some(SOURCE));
++            let value=normalized(&raw);
++            assert_eq!(value.disposition,ReceivedDisposition::Quarantined);
++            assert_eq!(STANDARD.decode(&value.raw_payload_base64).unwrap(),raw);
++            assert_eq!(value.to_public("received-id","1")["quoteEligible"],false);
++        }
++        let system = normalized(&add("member", "self", 10000, b"system notice", None));
++        assert_eq!(system.disposition, ReceivedDisposition::System);
++        let own = normalized(&add("room@chatroom", "self", 1, b"self:\nmy copy", None));
++        assert_eq!(own.disposition, ReceivedDisposition::Outgoing);
++        assert!(own.quote_reference.is_none());
++    }
++
++    #[test]
++    fn duplicate_transport_counters_do_not_change_identity_but_content_does() {
++        let raw = add("member", "self", 1, b"first", Some(SOURCE));
++        let transport = p::message(&[raw.clone(), p::uint(13, 99)]).unwrap();
++        let first = normalized(&raw);
++        let other = normalized(&transport);
++        assert_eq!(first.identity_fingerprint(), other.identity_fingerprint());
++        assert_ne!(first.source_sha256, other.source_sha256);
++        let changed = normalized(&add("member", "self", 1, b"changed", Some(SOURCE)));
++        assert_ne!(first.identity_fingerprint(), changed.identity_fingerprint());
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/push.rs b/packages/native-client-rust/crates/wechat-core/src/push.rs
+index 5bf4235..d0ea053 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/push.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/push.rs
+@@ -252,15 +252,8 @@ impl Core {
+         };
+         let raw = serde_json::to_vec(&batch)?;
+         let id = format!("{:x}", Sha256::digest(&raw));
+-        self.store.stage_sync(
+-            account,
+-            &id,
+-            &self.vault.seal(account, &format!("apply:{id}"), &raw)?,
+-            &self.vault.seal(account, "received-cursor", &batch.cursor)?,
+-        )?;
+-        self.store
+-            .put_runtime(account, &format!("apply-origin:{id}"), origin.as_bytes())?;
+-        let projection = self.project_pending_with_media(account, true)?;
++        let received = self.commit_native_ingress(account, &id, &batch, origin)?;
++        let projection = json!({"state":"queued","receivedSequence":received});
+         if !batch.continuation {
+             self.store.put_runtime(account, "history-caught-up", b"1")?;
+         }
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+index 1643c09..a109818 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -278,7 +278,8 @@ mod tests {
+                 target: crate::QuoteSendReference {
+                     message_id: "synthetic-source".into(),
+                     server_id: "999".into(),
+-                },
++                }
++                .into(),
+                 xml: "<appmsg><type>57</type><refermsg><svrid>999</svrid></refermsg></appmsg>"
+                     .into(),
+             }),
+@@ -498,7 +499,12 @@ mod tests {
+             assert_eq!(error_code(&error), "quote_receipt_integrity_failed");
+         }
+         let mut changed_payload = payload;
+-        changed_payload.quote.as_mut().unwrap().target.server_id = "1000".into();
++        let crate::QuoteSourceReference::Profile(target) =
++            &mut changed_payload.quote.as_mut().unwrap().target
++        else {
++            panic!("profile fixture");
++        };
++        target.server_id = "1000".into();
+         assert_eq!(
+             error_code(
+                 &f.core
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_send.rs b/packages/native-client-rust/crates/wechat-core/src/quote_send.rs
+index 8f77dc9..b67b584 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_send.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_send.rs
+@@ -12,6 +12,55 @@ pub struct QuoteSendReference {
+     // Expected unsigned server identity protects against reused local row IDs.
+     pub server_id: String,
+ }
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct ReceivedQuoteReference {
++    pub received_id: String,
++    pub server_id: String,
++    pub source_sha256: String,
++}
++
++/// Old profile references keep their exact serialized form. Native received
++/// sources are an exclusive alternative; neither accepts caller-supplied XML.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
++#[serde(untagged)]
++pub enum QuoteSourceReference {
++    Profile(QuoteSendReference),
++    Received(ReceivedQuoteReference),
++}
++impl From<QuoteSendReference> for QuoteSourceReference {
++    fn from(reference: QuoteSendReference) -> Self {
++        Self::Profile(reference)
++    }
++}
++impl QuoteSourceReference {
++    pub(crate) fn validate(&self) -> Result<()> {
++        match self {
++            Self::Profile(reference) => reference.validate(),
++            Self::Received(reference) => {
++                ensure!(
++                    !reference.received_id.is_empty()
++                        && reference.received_id.len() <= 256
++                        && !reference
++                            .received_id
++                            .chars()
++                            .any(|c| c.is_control() || c.is_whitespace())
++                        && reference
++                            .server_id
++                            .parse::<u64>()
++                            .is_ok_and(|n| n > 0 && n.to_string() == reference.server_id)
++                        && reference.source_sha256.len() == 64
++                        && reference
++                            .source_sha256
++                            .bytes()
++                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
++                    "invalid_quote_reference"
++                );
++                Ok(())
++            }
++        }
++    }
++}
+ impl QuoteSendReference {
+     pub(crate) fn validate(&self) -> Result<()> {
+         let value = self
+@@ -28,7 +77,7 @@ impl QuoteSendReference {
+ }
+ #[derive(Serialize, Deserialize)]
+ pub(crate) struct ResolvedQuote {
+-    pub target: QuoteSendReference,
++    pub target: QuoteSourceReference,
+     /// Generated once at admission; replay and local repair reuse these bytes.
+     pub xml: String,
+ }
+@@ -135,6 +184,79 @@ fn source_content(message: &Message) -> Result<String> {
+     Ok(raw_content.into())
+ }
+ impl Core {
++    fn received_quote_target(
++        &self,
++        account: &str,
++        thread: &str,
++        reference: &ReceivedQuoteReference,
++    ) -> Result<crate::native_ingress_message::ReceivedMessageSnapshot> {
++        QuoteSourceReference::Received(reference.clone()).validate()?;
++        let snapshot = self.received_snapshot(account, &reference.received_id)?;
++        ensure!(
++            snapshot.schema_version == 1
++                && snapshot.account_id == account
++                && snapshot.own_username == self.account_state(account)?.own_username
++                && snapshot.thread_id.as_deref() == Some(thread)
++                && snapshot.server_id.as_deref() == Some(reference.server_id.as_str())
++                && snapshot.source_sha256 == reference.source_sha256,
++            "quote_target_mismatch"
++        );
++        ensure!(
++            snapshot.disposition == crate::native_ingress_message::ReceivedDisposition::Ready
++                && snapshot.quote_reference.is_some(),
++            "quote_target_unavailable"
++        );
++        ensure!(
++            self.store
++                .recall_marker(account, thread, &reference.server_id)?
++                .is_none(),
++            "message_recalled"
++        );
++        Ok(snapshot)
++    }
++
++    pub(crate) fn require_quote_source(
++        &self,
++        account: &str,
++        thread: &str,
++        source: &QuoteSourceReference,
++    ) -> Result<()> {
++        match source {
++            QuoteSourceReference::Profile(reference) => {
++                self.quote_target(account, thread, reference)?;
++            }
++            QuoteSourceReference::Received(reference) => {
++                self.received_quote_target(account, thread, reference)?;
++            }
++        }
++        Ok(())
++    }
++
++    pub(crate) fn resolve_quote_source(
++        &self,
++        account: &str,
++        thread: &str,
++        text: &str,
++        source: &QuoteSourceReference,
++        own: &str,
++    ) -> Result<ResolvedQuote> {
++        match source {
++            QuoteSourceReference::Profile(reference) => {
++                self.resolve_quote(account, thread, text, reference, own)
++            }
++            QuoteSourceReference::Received(reference) => {
++                let snapshot = self.received_quote_target(account, thread, reference)?;
++                ensure!(snapshot.own_username == own, "quote_target_mismatch");
++                let reference = snapshot
++                    .quote_reference
++                    .context("quote_target_unavailable")?;
++                Ok(ResolvedQuote {
++                    target: source.clone(),
++                    xml: wechat_protocol::quote_send::quote_xml(own, text, &reference)?,
++                })
++            }
++        }
++    }
+     pub(crate) fn quote_target(
+         &self,
+         account: &str,
+@@ -236,7 +358,7 @@ impl Core {
+             msg_source: source,
+         };
+         Ok(ResolvedQuote {
+-            target: target.clone(),
++            target: target.clone().into(),
+             xml: wechat_protocol::quote_send::quote_xml(own, text, &reference)?,
+         })
+     }
+@@ -245,6 +367,40 @@ impl Core {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn quote_source_union_is_exclusive_and_preserves_old_sealed_shape() {
++        let old = serde_json::json!({"messageId":"msg_old", "serverId":"9007199254740993"});
++        let parsed: QuoteSourceReference = serde_json::from_value(old.clone()).unwrap();
++        assert!(matches!(parsed, QuoteSourceReference::Profile(_)));
++        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
++        let new = serde_json::json!({"receivedId":"recv_exact", "serverId":"18446744073709551615", "sourceSha256":"ab".repeat(32)});
++        let parsed: QuoteSourceReference = serde_json::from_value(new.clone()).unwrap();
++        assert!(parsed.validate().is_ok());
++        assert_eq!(serde_json::to_value(parsed).unwrap(), new);
++        for invalid in [
++            serde_json::json!({"messageId":"msg_old","receivedId":"recv_exact","serverId":"1","sourceSha256":"ab".repeat(32)}),
++            serde_json::json!({"receivedId":"recv_exact","serverId":"1","sourceSha256":"ab".repeat(32),"xml":"caller supplied"}),
++            serde_json::json!({"receivedId":"recv_exact","serverId":1,"sourceSha256":"ab".repeat(32)}),
++        ] {
++            assert!(serde_json::from_value::<QuoteSourceReference>(invalid).is_err());
++        }
++        for (sid, hash) in [
++            ("0", "ab".repeat(32)),
++            ("01", "ab".repeat(32)),
++            ("18446744073709551616", "ab".repeat(32)),
++            ("1", "AB".repeat(32)),
++            ("1", "ab".into()),
++        ] {
++            assert!(QuoteSourceReference::Received(ReceivedQuoteReference {
++                received_id: "recv_exact".into(),
++                server_id: sid.into(),
++                source_sha256: hash,
++            })
++            .validate()
++            .is_err());
++        }
++    }
+     fn message(kind: i64, subtype: u64, body: &str) -> Message {
+         Message {
+             id: wechat_profile::SourceMessageId {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/recall_send_author.rs b/packages/native-client-rust/crates/wechat-core/src/recall_send_author.rs
+index 1d50435..46e980d 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/recall_send_author.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/recall_send_author.rs
+@@ -166,11 +166,12 @@ mod tests {
+     }
+ 
+     fn intent(core: &Core, key: &str, message: &wechat_profile::Message) -> SendIntent {
++        let client_id = core.store.reserve_client_id("one", key, 42).unwrap();
+         let payload = SendPayload {
+             thread_id: "peer".into(),
+             text: "original body".into(),
+             created_at: 123,
+-            client_id: 42,
++            client_id,
+             share: None,
+             quote: None,
+             mentions: None,
+@@ -185,7 +186,14 @@ mod tests {
+             .unwrap();
+         let (intent, _) = core
+             .store
+-            .create_send("one", key, "peer", "synthetic-hash", &encrypted, "42")
++            .create_send(
++                "one",
++                key,
++                "peer",
++                "synthetic-hash",
++                &encrypted,
++                &client_id.to_string(),
++            )
+             .unwrap();
+         core.store
+             .update_send(
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+index 20533ea..a59d5fb 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -25,6 +25,8 @@ mod identity;
+ #[path = "official_profile.rs"]
+ mod official_profile;
+ pub use official_profile::{OfficialProfileRequest, OfficialProfileSelection};
++#[path = "native_ingress.rs"]
++mod native_ingress;
+ #[path = "profile_network.rs"]
+ mod profile_network;
+ #[path = "push.rs"]
+@@ -210,7 +212,7 @@ struct SendPayload {
+ #[derive(Default)]
+ struct SendOptions {
+     share: Option<crate::ShareSendRequest>,
+-    quote: Option<crate::QuoteSendReference>,
++    quote: Option<crate::QuoteSourceReference>,
+     mentions: Option<crate::TextMentions>,
+ }
+ #[path = "recall_send_author.rs"]
+@@ -592,6 +594,8 @@ impl Core {
+         };
+         self.persist_state(account, &state, false)?;
+         self.store.clear_runtime(account, "validated-generation")?;
++        self.store
++            .clear_runtime(account, "native-ingress-caught-up")?;
+         self.store
+             .put_runtime(account, "desired", b"disconnected")?;
+         self.store.append_event(
+@@ -647,6 +651,8 @@ impl Core {
+     }
+     pub fn disconnect(&self, account: &str) -> Result<()> {
+         self.store.clear_runtime(account, "validated-generation")?;
++        self.store
++            .clear_runtime(account, "native-ingress-caught-up")?;
+         if let Ok(map) = self.cancels.lock() {
+             if let Some(cancel) = map.get(&format!("login-active:{account}")) {
+                 cancel.store(true, Ordering::SeqCst);
+@@ -1257,6 +1263,17 @@ impl Core {
+         destination: &str,
+         text: &str,
+         quote: crate::QuoteSendReference,
++    ) -> Result<SendIntent> {
++        self.send_quoted_source_text(account, key, destination, text, quote.into())
++            .await
++    }
++    pub async fn send_quoted_source_text(
++        self: &Arc<Self>,
++        account: &str,
++        key: &str,
++        destination: &str,
++        text: &str,
++        quote: crate::QuoteSourceReference,
+     ) -> Result<SendIntent> {
+         quote.validate()?;
+         self.queue_message_send(
+@@ -1341,7 +1358,9 @@ impl Core {
+             share,
+             quote: quote
+                 .as_ref()
+-                .map(|q| self.resolve_quote(account, destination, text, q, &state.own_username))
++                .map(|q| {
++                    self.resolve_quote_source(account, destination, text, q, &state.own_username)
++                })
+                 .transpose()?,
+             mentions: mentions
+                 .as_ref()
+@@ -1451,7 +1470,7 @@ impl Core {
+             }
+             if let Some(quote) = &payload.quote {
+                 if core
+-                    .quote_target(&account, &payload.thread_id, &quote.target)
++                    .require_quote_source(&account, &payload.thread_id, &quote.target)
+                     .is_err()
+                 {
+                     // Compete with cancellation/logout before recording a
+@@ -1557,7 +1576,10 @@ impl Core {
+                     Some(unknown_code),
+                 )?,
+             };
+-            if updated.state == "accepted" {
++            let native_source = payload.quote.as_ref().is_some_and(|quote| {
++                matches!(quote.target, crate::QuoteSourceReference::Received(_))
++            });
++            if updated.state == "accepted" && !native_source {
+                 let _ = core.project_message_send(&account, &id);
+             }
+             Ok(())
+@@ -1892,6 +1914,7 @@ impl Core {
+             self.store.clear_runtime(&account.id, "history-caught-up")?;
+             self.start_push_worker(&account.id)?;
+             self.start_received_media_worker(&account.id);
++            self.start_native_ingress_worker(&account.id)?;
+             let core = self.clone();
+             tokio::spawn(async move {
+                 let mut delay = 1;
+@@ -1960,10 +1983,8 @@ impl Core {
+             let owned = account.to_owned();
+             blocking(move || {
+                 let _guard = guard;
+-                let _ = core.recover_text_projections(&owned)?;
+                 if core.refresh_incoming_groups(&owned, true)? > 0 {
+                     core.store.retry_blocked(&owned)?;
+-                    core.project_pending(&owned)?;
+                 }
+                 if core.store.pending_sync_count(&owned)? == 0 {
+                     core.publish_profile_checkpoint(&owned)?;
+@@ -1983,10 +2004,8 @@ impl Core {
+                     guard: Some(guard),
+                     runtime: tokio::runtime::Handle::current(),
+                 };
+-                let _ = core.recover_text_projections(&account)?;
+                 if core.refresh_incoming_groups(&account, true)? > 0 {
+                     core.store.retry_blocked(&account)?;
+-                    core.project_pending(&account)?;
+                 }
+                 if core.store.pending_sync_count(&account)? == 0 {
+                     let _ = core.publish_profile_checkpoint(&account);
+@@ -3278,7 +3297,7 @@ mod tests {
+         )
+         .unwrap();
+         let quote = payload.quote.as_ref().unwrap();
+-        assert_eq!(quote.target, target);
++        assert_eq!(quote.target, target.clone().into());
+         assert!(quote.xml.contains("18446744073709551610"));
+         assert!(quote.xml.contains("Original &lt;private&gt; &amp; text"));
+         assert!(quote
+diff --git a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+index 7216038..e732019 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+@@ -1746,8 +1746,10 @@ mod encrypted_roundtrip {
+         let result = core
+             .commit_sync_batch("one", batch.clone(), "fixture", "fixture")
+             .unwrap();
+-        assert_eq!(result["projection"]["projectedCommands"], 4);
+-        assert_eq!(result["projection"]["pendingCommands"], 8);
++        assert_eq!(result["projection"]["state"], "queued");
++        let projection = core.recover_projection("one").unwrap();
++        assert_eq!(projection["projectedCommands"], 4);
++        assert_eq!(projection["pendingCommands"], 8);
+         assert_eq!(store.pending_sync_count("one").unwrap(), 1);
+         assert!(store.pending_cursor_projection("one").unwrap());
+         let later = wechat_protocol::wire::SyncBatch {
+@@ -1764,8 +1766,10 @@ mod encrypted_roundtrip {
+         let result = core
+             .commit_sync_batch("one", later, "fixture", "fixture")
+             .unwrap();
+-        assert_eq!(result["projection"]["projectedCommands"], 1);
+-        assert_eq!(result["projection"]["pendingCommands"], 0);
++        assert_eq!(result["projection"]["state"], "queued");
++        let projection = core.recover_projection("one").unwrap();
++        assert_eq!(projection["projectedCommands"], 1);
++        assert_eq!(projection["pendingCommands"], 0);
+         assert_eq!(
+             core.recover_projection("one").unwrap()["pendingCommands"],
+             8
+diff --git a/packages/native-client-rust/crates/wechat-store/migrations/account/V010__native_ingress.sql b/packages/native-client-rust/crates/wechat-store/migrations/account/V010__native_ingress.sql
+new file mode 100644
+index 0000000..51832c8
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/migrations/account/V010__native_ingress.sql
+@@ -0,0 +1,22 @@
++CREATE TABLE native_ingress_batches (
++    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
++    batch_id TEXT NOT NULL UNIQUE REFERENCES apply_intents(id),
++    ownership_generation TEXT NOT NULL,
++    historical INTEGER NOT NULL CHECK(historical IN (0,1)),
++    received_at TEXT NOT NULL
++);
++CREATE TABLE native_ingress_messages (
++    received_id TEXT PRIMARY KEY,
++    first_received_sequence INTEGER NOT NULL REFERENCES native_ingress_batches(sequence),
++    command_index INTEGER NOT NULL,
++    thread_id TEXT,
++    server_id TEXT,
++    disposition TEXT NOT NULL,
++    reason TEXT,
++    source_sha256 TEXT NOT NULL,
++    identity_fingerprint TEXT NOT NULL,
++    sealed_snapshot BLOB NOT NULL,
++    UNIQUE(thread_id,server_id)
++);
++CREATE INDEX native_ingress_pending ON native_ingress_messages(disposition,first_received_sequence);
++PRAGMA user_version=10;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/authorization.rs b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+index 7878b2f..fea9ee1 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/authorization.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+@@ -239,7 +239,7 @@ impl Store {
+             for (key, value) in [("account-state", encrypted), ("validated-generation", ownership_generation.as_bytes()), ("desired", b"connected".as_slice())] {
+                 tx.execute("INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+             }
+-            tx.execute("DELETE FROM runtime WHERE key='logged-out'", [])?;
++            tx.execute("DELETE FROM runtime WHERE key IN ('logged-out','native-ingress-caught-up')", [])?;
+             accepted_projection_needed(&tx, encrypted)?;
+             tx.commit()?;
+             Ok(())
+diff --git a/packages/native-client-rust/crates/wechat-store/src/lib.rs b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+index 30c7086..381d45d 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -9,6 +9,7 @@ mod event_consumers;
+ mod group_mutations;
+ mod media;
+ mod metadata;
++mod native_ingress;
+ mod operations;
+ mod outbox;
+ mod outgoing_recall;
+@@ -22,6 +23,7 @@ pub use event_consumers::RequiredEventConsumer;
+ use fs2::FileExt;
+ pub use group_mutations::*;
+ pub use media::*;
++pub use native_ingress::*;
+ pub use operations::*;
+ pub use outgoing_recall::*;
+ pub use pagination::*;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/logout.rs b/packages/native-client-rust/crates/wechat-store/src/logout.rs
+index ab28356..bbe979f 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/logout.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/logout.rs
+@@ -40,7 +40,7 @@ impl Store {
+             for (key,value) in [("logged-out",epoch),("logout-epoch",epoch),("desired",b"disconnected".as_slice()),("logout-pending",op.id.as_bytes())] {
+                 tx.execute("INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+             }
+-            tx.execute("DELETE FROM runtime WHERE key='validated-generation'", [])?;
++            tx.execute("DELETE FROM runtime WHERE key IN ('validated-generation','native-ingress-caught-up')", [])?;
+             let queued = {
+                 let mut query=tx.prepare("SELECT id FROM outbox WHERE state='queued' ORDER BY created_at,id")?;
+                 let rows=query.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+@@ -63,7 +63,7 @@ impl Store {
+             if !fenced { bail!("logout fence required before forgetting credentials"); }
+             // Device identity, history/cursors and SQLCipher/image references are
+             // independent from native authorization and intentionally retained.
+-            tx.execute("DELETE FROM runtime WHERE key IN ('account-state','validated-generation') OR key LIKE 'qr:%'", [])?;
++            tx.execute("DELETE FROM runtime WHERE key IN ('account-state','validated-generation','native-ingress-caught-up') OR key LIKE 'qr:%'", [])?;
+             tx.commit()?; Ok(())
+         })
+     }
+diff --git a/packages/native-client-rust/crates/wechat-store/src/native_ingress.rs b/packages/native-client-rust/crates/wechat-store/src/native_ingress.rs
+new file mode 100644
+index 0000000..6962a13
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/native_ingress.rs
+@@ -0,0 +1,490 @@
++//! Native receive custody is separate from official-profile projection.
++use super::*;
++use rusqlite::OptionalExtension;
++use serde_json::{json, Value};
++
++pub struct NativeIngressMessageInput {
++    pub received_id: String,
++    pub command_index: usize,
++    pub thread_id: Option<String>,
++    pub server_id: Option<String>,
++    pub disposition: String,
++    pub reason: Option<String>,
++    pub source_sha256: String,
++    pub identity_fingerprint: String,
++    pub sealed_snapshot: Vec<u8>,
++}
++
++pub struct NativeIngressBatch {
++    pub batch_id: String,
++    /// None catalogues an already sealed historical apply journal.
++    pub payload: Option<Vec<u8>>,
++    pub cursor: Option<Vec<u8>>,
++    pub ownership_generation: String,
++    pub historical: bool,
++    pub caught_up: bool,
++    pub origin: String,
++    pub messages: Vec<NativeIngressMessageInput>,
++    pub recalls: Vec<NativeIngressRecallInput>,
++}
++pub struct NativeIngressRecallInput {
++    pub thread_id: String,
++    pub server_id: String,
++    pub recalled_at: Option<i64>,
++    pub control_receipt: String,
++    pub sealed_control: Vec<u8>,
++}
++pub struct NativeIngressRecord {
++    pub received_id: String,
++    pub first_received_sequence: String,
++    pub disposition: String,
++    pub reason: Option<String>,
++    pub source_sha256: String,
++    pub sealed_snapshot: Vec<u8>,
++}
++
++fn append(tx: &rusqlite::Transaction<'_>, kind: &str, data: &Value) -> Result<()> {
++    tx.execute(
++        "INSERT INTO events(kind,data_json,created_at)VALUES(?1,?2,?3)",
++        params![
++            kind,
++            serde_json::to_string(data)?,
++            chrono::Utc::now().to_rfc3339()
++        ],
++    )?;
++    crate::event_consumers::prune_events(tx, tx.last_insert_rowid())?;
++    Ok(())
++}
++
++impl Store {
++    /// Rotate across every accepted send, including failed local projections.
++    /// Advancing this scan never changes the send state or its recovery duty.
++    pub fn next_pending_text_projection(&self, account: &str) -> Result<Option<String>> {
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            let prior: Option<Vec<u8>> = tx.query_row("SELECT value FROM runtime WHERE key='native-send-projection-after'", [], |r| r.get(0)).optional()?;
++            let after: (String, String) = prior.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or_default();
++            let query = "SELECT created_at,id FROM outbox WHERE state='accepted' AND server_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM runtime WHERE key='send-projected:'||outbox.id) AND (created_at,id)>(?1,?2) ORDER BY created_at,id LIMIT 1";
++            let mut row: Option<(String,String)> = tx.query_row(query,params![after.0,after.1],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++            if row.is_none() {
++                row = tx.query_row(query,params!["",""],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++            }
++            if let Some(ref row) = row {
++                tx.execute("INSERT INTO runtime VALUES('native-send-projection-after',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_vec(row)?])?;
++            }
++            tx.commit()?;
++            Ok(row.map(|(_, id)| id))
++        })
++    }
++    pub fn native_projection_work_pending(&self, account: &str) -> Result<bool> {
++        self.control(account,|db|Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM apply_intents a WHERE stream='message' AND (state='pending' OR NOT EXISTS(SELECT 1 FROM native_ingress_batches b WHERE b.batch_id=a.id)))",[],|r|r.get(0))?))
++    }
++    pub fn uncatalogued_native_batches(&self, account: &str) -> Result<Vec<(String, Vec<u8>)>> {
++        self.control(account, |db| {
++            let mut q=db.prepare("SELECT id,payload FROM apply_intents a WHERE stream='message' AND NOT EXISTS(SELECT 1 FROM native_ingress_batches b WHERE b.batch_id=a.id) ORDER BY a.rowid LIMIT 100")?;
++            let rows=q.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
++            Ok(rows)
++        })
++    }
++
++    /// Raw batch, received cursor, immutable message snapshots and public events
++    /// commit together. Profile state is neither completed nor discarded here.
++    pub fn stage_native_ingress(&self, account: &str, batch: NativeIngressBatch) -> Result<String> {
++        anyhow::ensure!(
++            batch.payload.is_some() == batch.cursor.is_some(),
++            "invalid_native_ingress_batch"
++        );
++        self.control(account, |db| {
++            let tx=db.transaction()?;
++            if !batch.historical && batch.payload.is_some() {
++                if batch.caught_up {
++                    tx.execute("INSERT INTO runtime VALUES('native-ingress-caught-up',?1)ON CONFLICT(key)DO UPDATE SET value=excluded.value",[batch.ownership_generation.as_bytes()])?;
++                } else {
++                    tx.execute("DELETE FROM runtime WHERE key='native-ingress-caught-up'",[])?;
++                }
++            }
++            if let Some(sequence)=tx.query_row("SELECT sequence FROM native_ingress_batches WHERE batch_id=?1",[&batch.batch_id],|r|r.get::<_,i64>(0)).optional()? {
++                // Replay never advances the current cursor to an older batch.
++                tx.commit()?;
++                return Ok(sequence.to_string());
++            }
++            if let (Some(payload),Some(cursor))=(&batch.payload,&batch.cursor) {
++                tx.execute("INSERT OR IGNORE INTO apply_intents(id,payload,state,created_at,stream)VALUES(?1,?2,'pending',?3,'message')",params![batch.batch_id,payload,chrono::Utc::now().to_rfc3339()])?;
++                for (key,value) in [("received-cursor".to_owned(),cursor.as_slice()),("cursor-projection-needed".into(),b"1".as_slice()),(format!("apply-origin:{}",batch.batch_id),batch.origin.as_bytes())] {
++                    tx.execute("INSERT INTO runtime VALUES(?1,?2)ON CONFLICT(key)DO UPDATE SET value=excluded.value",params![key,value])?;
++                }
++            } else {
++                anyhow::ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM apply_intents WHERE id=?1 AND stream='message')",[&batch.batch_id],|r|r.get::<_,bool>(0))?,"native_ingress_batch_missing");
++            }
++            tx.execute("INSERT INTO native_ingress_batches(batch_id,ownership_generation,historical,received_at)VALUES(?1,?2,?3,?4)",params![batch.batch_id,batch.ownership_generation,batch.historical,chrono::Utc::now().to_rfc3339()])?;
++            let sequence=tx.last_insert_rowid();
++            for item in &batch.messages {
++                let old:Option<(String,i64,String,String)>=tx.query_row("SELECT received_id,first_received_sequence,identity_fingerprint,disposition FROM native_ingress_messages WHERE received_id=?1 OR (thread_id=?2 AND server_id=?3)",params![item.received_id,item.thread_id,item.server_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
++                if let Some((id,first,fingerprint,status))=old {
++                    if fingerprint!=item.identity_fingerprint && status!="quarantined" {
++                        tx.execute("UPDATE native_ingress_messages SET disposition='quarantined',reason='native_message_identity_conflict' WHERE received_id=?1",[&id])?;
++                        append(&tx,"message.received",&json!({"receivedId":id,"firstReceivedSequence":first.to_string(),"disposition":"quarantined"}))?;
++                    }
++                    continue;
++                }
++                let recalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message_recalls WHERE thread_id=?1 AND server_id=?2)",params![item.thread_id,item.server_id],|r|r.get(0))?;
++                let disposition=if recalled { "quarantined" } else { &item.disposition };
++                let reason=if recalled { Some("message_recalled") } else { item.reason.as_deref() };
++                tx.execute("INSERT INTO native_ingress_messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![item.received_id,sequence,item.command_index as i64,item.thread_id,item.server_id,disposition,reason,item.source_sha256,item.identity_fingerprint,item.sealed_snapshot])?;
++                append(&tx,"message.received",&json!({"receivedId":item.received_id,"firstReceivedSequence":sequence.to_string(),"disposition":disposition}))?;
++            }
++            for recall in &batch.recalls {
++                let control_key=format!("recall-control:{:x}",Sha256::digest(serde_json::to_vec(&(&recall.thread_id,&recall.server_id))?));
++                tx.execute("INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",params![format!("sync-control:{}",recall.control_receipt),recall.sealed_control])?;
++                tx.execute("INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",params![control_key,recall.control_receipt.as_bytes()])?;
++                let inserted=tx.execute("INSERT INTO message_recalls(thread_id,server_id,observed_at,recalled_at,origin)VALUES(?1,?2,?3,?4,'native_ingress') ON CONFLICT(thread_id,server_id) DO NOTHING",params![recall.thread_id,recall.server_id,chrono::Utc::now().to_rfc3339(),recall.recalled_at])?;
++                if inserted==1 {
++                    append(&tx,"message.recalled",&json!({"threadId":recall.thread_id,"serverId":recall.server_id,"origin":"native_ingress"}))?;
++                }
++                let target:Option<(String,i64)>=tx.query_row("SELECT received_id,first_received_sequence FROM native_ingress_messages WHERE thread_id=?1 AND server_id=?2 AND disposition!='quarantined'",params![recall.thread_id,recall.server_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++                if let Some((id,first))=target {
++                    tx.execute("UPDATE native_ingress_messages SET disposition='quarantined',reason='message_recalled' WHERE received_id=?1",[&id])?;
++                    append(&tx,"message.received",&json!({"receivedId":id,"firstReceivedSequence":first.to_string(),"disposition":"quarantined"}))?;
++                }
++            }
++            tx.commit()?;
++            Ok(sequence.to_string())
++        })
++    }
++
++    pub fn native_ingress_record(&self, account: &str, id: &str) -> Result<NativeIngressRecord> {
++        self.control(account,|db| Ok(db.query_row("SELECT received_id,first_received_sequence,disposition,reason,source_sha256,sealed_snapshot FROM native_ingress_messages WHERE received_id=?1",[id],|r|Ok(NativeIngressRecord{received_id:r.get(0)?,first_received_sequence:r.get::<_,i64>(1)?.to_string(),disposition:r.get(2)?,reason:r.get(3)?,source_sha256:r.get(4)?,sealed_snapshot:r.get(5)?}))?))
++    }
++
++    /// Must run under the current account mutation gate. Capture and register
++    /// one immutable first-use boundary; retries can never move it to a new head.
++    pub fn activate_native_consumer(
++        &self,
++        account: &str,
++        consumer: &str,
++        own: &str,
++        generation: &str,
++    ) -> Result<Value> {
++        anyhow::ensure!(
++            !consumer.is_empty()
++                && consumer.len() <= 128
++                && consumer
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
++            "invalid consumer name"
++        );
++        let key = format!("native-consumer-activation:{consumer}");
++        let checkpoint=self.control(account,|db| {
++            let tx=db.transaction()?;
++            if let Some(raw)=tx.query_row("SELECT value FROM runtime WHERE key=?1",[&key],|r|r.get::<_,Vec<u8>>(0)).optional()? {
++                let prior:Value=serde_json::from_slice(&raw)?;
++                anyhow::ensure!(prior["ownUsername"]==own,"native_ingress_identity_mismatch");
++                return Ok(prior);
++            }
++            anyhow::ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM required_event_consumers WHERE consumer_id=?1)",[consumer],|r|r.get::<_,bool>(0))?,"consumer_registration_conflict");
++            let caught:Option<Vec<u8>>=tx.query_row("SELECT value FROM runtime WHERE key='native-ingress-caught-up'",[],|r|r.get(0)).optional()?;
++            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM apply_intents a WHERE stream='message' AND NOT EXISTS(SELECT 1 FROM native_ingress_batches b WHERE b.batch_id=a.id))",[],|r|r.get(0))?;
++            anyhow::ensure!(caught.as_deref()==Some(generation.as_bytes()) && !pending,"native_ingress_not_ready");
++            let received:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM native_ingress_batches",[],|r|r.get(0))?;
++            let head:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM events",[],|r|r.get(0))?;
++            let value=json!({"schemaVersion":1,"accountId":account,"ownUsername":own,"ownershipGeneration":generation,"serverId":self.server_id,"receivedBoundary":received.to_string(),"eventCursor":head.to_string(),"readiness":"native_ingress_caught_up"});
++            tx.execute("INSERT INTO required_event_consumers VALUES(?1,?2,?2,?2)",params![consumer,head])?;
++            tx.execute("INSERT INTO runtime VALUES(?1,?2)",params![key,serde_json::to_vec(&value)?])?;
++            tx.commit()?;Ok(value)
++        })?;
++        Ok(json!({"consumer":self.required_consumer(account,consumer)?,"checkpoint":checkpoint}))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn fixture() -> (tempfile::TempDir, Store) {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Store::open(&temp.path().join("data")).unwrap();
++        store.create_account("one").unwrap();
++        (temp, store)
++    }
++    fn item(id: &str, disposition: &str) -> NativeIngressMessageInput {
++        NativeIngressMessageInput {
++            received_id: id.into(),
++            command_index: 0,
++            thread_id: Some("room@chatroom".into()),
++            server_id: Some(id.into()),
++            disposition: disposition.into(),
++            reason: (disposition == "quarantined").then(|| "unsupported_received_type".into()),
++            source_sha256: "a".repeat(64),
++            identity_fingerprint: "b".repeat(64),
++            sealed_snapshot: b"sealed native snapshot".to_vec(),
++        }
++    }
++    fn batch(
++        id: &str,
++        terminal: bool,
++        messages: Vec<NativeIngressMessageInput>,
++    ) -> NativeIngressBatch {
++        NativeIngressBatch {
++            batch_id: id.into(),
++            payload: Some(b"sealed raw batch".to_vec()),
++            cursor: Some(format!("cursor:{id}").into_bytes()),
++            ownership_generation: "generation-one".into(),
++            historical: false,
++            caught_up: terminal,
++            origin: "live".into(),
++            messages,
++            recalls: vec![],
++        }
++    }
++    #[test]
++    fn native_receive_rolls_back_raw_cursor_messages_and_events_together() {
++        let (_temp, store) = fixture();
++        store.control("one",|db| {db.execute_batch("CREATE TRIGGER fail_receive BEFORE INSERT ON events WHEN NEW.kind='message.received' BEGIN SELECT RAISE(ABORT,'synthetic interruption'); END;")?;Ok(())}).unwrap();
++        assert!(store
++            .stage_native_ingress("one", batch("a", true, vec![item("71", "ready")]))
++            .is_err());
++        assert_eq!(store.pending_sync_count("one").unwrap(), 0);
++        assert!(store.runtime("one", "received-cursor").unwrap().is_none());
++        assert!(store.native_ingress_record("one", "71").is_err());
++        assert!(store.events("one", 0, 100).unwrap().is_empty());
++        assert!(store
++            .activate_native_consumer("one", "bot", "self", "generation-one")
++            .is_err());
++    }
++    #[test]
++    fn native_activation_ignores_profile_backlog_but_requires_current_receive_fence() {
++        let (_temp, store) = fixture();
++        store
++            .stage_sync("one", "old", b"old raw", b"old cursor")
++            .unwrap();
++        store.block_sync("one", "old").unwrap();
++        let mut old = batch("old", false, vec![item("71", "quarantined")]);
++        old.payload = None;
++        old.cursor = None;
++        old.historical = true;
++        assert_eq!(store.stage_native_ingress("one", old).unwrap(), "1");
++        assert!(store
++            .activate_native_consumer("one", "bot", "self", "generation-one")
++            .is_err());
++        store
++            .stage_native_ingress("one", batch("terminal", true, vec![]))
++            .unwrap();
++        let activation = store
++            .activate_native_consumer("one", "bot", "self", "generation-one")
++            .unwrap();
++        assert_eq!(activation["checkpoint"]["receivedBoundary"], "2");
++        assert_eq!(store.pending_sync_count("one").unwrap(), 2);
++        assert!(store.pending_cursor_projection("one").unwrap());
++        store
++            .stage_native_ingress("one", batch("future", true, vec![item("72", "ready")]))
++            .unwrap();
++        let replay = store
++            .activate_native_consumer("one", "bot", "self", "generation-two")
++            .unwrap();
++        assert_eq!(activation["checkpoint"], replay["checkpoint"]);
++        let (page, _) = store.consumer_events("one", "bot", None, 100).unwrap();
++        assert_eq!(page.len(), 1);
++        assert_eq!(page[0].data["receivedId"], "72");
++        store
++            .acknowledge("one", "bot", page[0].cursor.parse().unwrap())
++            .unwrap();
++        assert_eq!(
++            store
++                .native_ingress_record("one", "71")
++                .unwrap()
++                .disposition,
++            "quarantined"
++        );
++        assert!(store.native_ingress_record("one", "72").is_ok());
++        assert!(store
++            .activate_native_consumer("one", "other", "self", "generation-two")
++            .is_err());
++        let mut replay = batch("future", true, vec![item("72", "ready")]);
++        replay.ownership_generation = "generation-two".into();
++        store.stage_native_ingress("one", replay).unwrap();
++        assert!(store
++            .activate_native_consumer("one", "other", "self", "generation-two")
++            .is_ok());
++    }
++    #[test]
++    fn logout_and_new_login_invalidate_fence_but_preserve_existing_cutover() {
++        let (_temp, store) = fixture();
++        store
++            .stage_native_ingress("one", batch("terminal", true, vec![]))
++            .unwrap();
++        let original = store
++            .activate_native_consumer("one", "existing", "self", "generation-one")
++            .unwrap();
++        let op = Operation {
++            id: "logout-test".into(),
++            account_id: "one".into(),
++            kind: "logout".into(),
++            state: "queued".into(),
++            result: Value::Null,
++            created_at: "2026-01-01T00:00:00Z".into(),
++            updated_at: "2026-01-01T00:00:00Z".into(),
++        };
++        store.begin_logout(&op, b"epoch").unwrap();
++        assert!(store
++            .activate_native_consumer("one", "new", "self", "generation-one")
++            .is_err());
++        assert_eq!(
++            store
++                .activate_native_consumer("one", "existing", "self", "generation-one")
++                .unwrap()["checkpoint"],
++            original["checkpoint"]
++        );
++        // A new accepted login independently clears stale same-process evidence.
++        store
++            .put_runtime("one", "native-ingress-caught-up", b"generation-one")
++            .unwrap();
++        store
++            .commit_login_authorization("one", b"sealed-auth", Some(b"epoch"), "generation-one")
++            .unwrap();
++        assert!(store
++            .activate_native_consumer("one", "new", "self", "generation-one")
++            .is_err());
++        store
++            .stage_native_ingress("one", batch("fresh-terminal", true, vec![]))
++            .unwrap();
++        assert!(store
++            .activate_native_consumer("one", "new", "self", "generation-one")
++            .is_ok());
++    }
++    #[test]
++    fn accepted_projection_rotation_cannot_starve_after_a_full_page_of_failures() {
++        let (temp, store) = fixture();
++        store.control("one", |db| {
++            for index in 0..103 {
++                let id=format!("send-{index:03}");
++                db.execute("INSERT INTO outbox VALUES(?1,?1,'hash','peer',x'01','accepted',?2,?2,NULL,'2026-01-01T00:00:00Z')",params![id,(index+1).to_string()])?;
++            }
++            Ok(())
++        }).unwrap();
++        for index in 0..102 {
++            assert_eq!(
++                store.next_pending_text_projection("one").unwrap(),
++                Some(format!("send-{index:03}"))
++            );
++        }
++        drop(store);
++        let store = Store::open_existing(&temp.path().join("data")).unwrap();
++        assert_eq!(
++            store
++                .next_pending_text_projection("one")
++                .unwrap()
++                .as_deref(),
++            Some("send-102")
++        );
++        assert_eq!(
++            store
++                .next_pending_text_projection("one")
++                .unwrap()
++                .as_deref(),
++            Some("send-000")
++        );
++        assert_eq!(store.send("one", "send-000").unwrap().state, "accepted");
++        store
++            .put_runtime("one", "send-projected:send-001", b"synthetic-local-id")
++            .unwrap();
++        assert_eq!(
++            store
++                .next_pending_text_projection("one")
++                .unwrap()
++                .as_deref(),
++            Some("send-002")
++        );
++    }
++    #[test]
++    fn later_continuation_invalidates_a_prior_caught_up_fence() {
++        let (_temp, store) = fixture();
++        store
++            .stage_native_ingress("one", batch("terminal", true, vec![]))
++            .unwrap();
++        let existing = store
++            .activate_native_consumer("one", "existing", "self", "generation-one")
++            .unwrap();
++        store
++            .stage_native_ingress(
++                "one",
++                batch("continuation", false, vec![item("71", "ready")]),
++            )
++            .unwrap();
++        assert!(store
++            .activate_native_consumer("one", "new", "self", "generation-one")
++            .is_err());
++        assert_eq!(
++            store
++                .activate_native_consumer("one", "existing", "self", "generation-one")
++                .unwrap()["checkpoint"],
++            existing["checkpoint"]
++        );
++        store
++            .stage_native_ingress("one", batch("next-terminal", true, vec![]))
++            .unwrap();
++        assert_eq!(
++            store
++                .activate_native_consumer("one", "new", "self", "generation-one")
++                .unwrap()["checkpoint"]["receivedBoundary"],
++            "3"
++        );
++    }
++    #[test]
++    fn repeated_native_identity_preserves_first_seal_sequence_and_conflicts_are_visible() {
++        let (temp, store) = fixture();
++        store
++            .stage_native_ingress("one", batch("first", true, vec![item("71", "ready")]))
++            .unwrap();
++        let original = store.native_ingress_record("one", "71").unwrap();
++        store
++            .stage_native_ingress("one", batch("duplicate", true, vec![item("71", "ready")]))
++            .unwrap();
++        assert_eq!(store.events("one", 0, 100).unwrap().len(), 1);
++        let mut changed = item("71", "ready");
++        changed.identity_fingerprint = "c".repeat(64);
++        changed.sealed_snapshot = b"different snapshot".to_vec();
++        store
++            .stage_native_ingress("one", batch("conflict", true, vec![changed]))
++            .unwrap();
++        drop(store);
++        let store = Store::open_existing(&temp.path().join("data")).unwrap();
++        let actual = store.native_ingress_record("one", "71").unwrap();
++        assert_eq!(
++            actual.first_received_sequence,
++            original.first_received_sequence
++        );
++        assert_eq!(actual.sealed_snapshot, original.sealed_snapshot);
++        assert_eq!(
++            actual.reason.as_deref(),
++            Some("native_message_identity_conflict")
++        );
++        let events = store.events("one", 0, 100).unwrap();
++        assert_eq!(events.len(), 2);
++        assert_eq!(events[1].data["firstReceivedSequence"], "1");
++    }
++    #[test]
++    fn recall_marker_and_quarantine_commit_before_any_profile_write() {
++        let (_temp, store) = fixture();
++        let mut incoming = batch("with-recall", true, vec![item("71", "ready")]);
++        incoming.recalls.push(NativeIngressRecallInput {
++            thread_id: "room@chatroom".into(),
++            server_id: "71".into(),
++            recalled_at: Some(100),
++            control_receipt: "projected:with-recall:1".into(),
++            sealed_control: b"sealed control".to_vec(),
++        });
++        store.stage_native_ingress("one", incoming).unwrap();
++        assert!(store
++            .recall_marker("one", "room@chatroom", "71")
++            .unwrap()
++            .is_some());
++        assert_eq!(
++            store
++                .native_ingress_record("one", "71")
++                .unwrap()
++                .reason
++                .as_deref(),
++            Some("message_recalled")
++        );
++        assert_eq!(store.pending_sync_count("one").unwrap(), 1);
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/operations.rs b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+index 657d174..799050d 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/operations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+@@ -249,7 +249,7 @@ impl Store {
+     pub(crate) fn prepare_account(db: &mut Connection) -> Result<()> {
+         db.busy_timeout(std::time::Duration::from_secs(2))?;
+         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+-        if !(1..=9).contains(&version) {
++        if !(1..=10).contains(&version) {
+             bail!("unsupported account sidecar schema");
+         }
+         if version == 1 {
+@@ -302,6 +302,13 @@ impl Store {
+             ))?;
+             tx.commit()?;
+         }
++        if version < 10 {
++            let tx = db.transaction()?;
++            tx.execute_batch(include_str!(
++                "../migrations/account/V010__native_ingress.sql"
++            ))?;
++            tx.commit()?;
++        }
+         Ok(())
+     }
+     pub fn protected_state_exists(&self) -> Result<bool> {
+@@ -630,10 +637,18 @@ impl Store {
+     }
+     pub fn retry_blocked(&self, account: &str) -> Result<()> {
+         self.control(account, |db| {
+-            db.execute(
++            let tx = db.transaction()?;
++            tx.execute(
+                 "UPDATE apply_intents SET state='pending' WHERE state='blocked'",
+                 [],
+             )?;
++            // A metadata refresh can arrive while a batch is still scanning.
++            // Revisit failed earlier commands; existing receipts are skipped.
++            tx.execute(
++                "DELETE FROM runtime WHERE substr(key,1,length(?1))=?1",
++                ["native-profile-scan:"],
++            )?;
++            tx.commit()?;
+             Ok(())
+         })
+     }
+@@ -1131,7 +1146,7 @@ mod runtime_prefix_tests {
+             .stage_sync("test", "old", b"old sealed commands", b"message cursor")
+             .unwrap();
+         store.control("test", |db| {
+-            db.execute_batch("DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;PRAGMA user_version=7;")?;
++            db.execute_batch("DROP TABLE native_ingress_messages;DROP TABLE native_ingress_batches;DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;PRAGMA user_version=7;")?;
+             Ok(())
+         }).unwrap();
+         drop(store);
+diff --git a/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs b/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
+index 70eb1d8..5c864e2 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/outgoing_recall.rs
+@@ -580,7 +580,7 @@ mod tests {
+         store
+             .control("a", |db| {
+                 db.execute_batch(
+-                    "DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;DROP TABLE group_mutations;DROP TABLE recall_keys;DROP TABLE outgoing_recalls;PRAGMA user_version=5;",
++                    "DROP TABLE native_ingress_messages;DROP TABLE native_ingress_batches;DROP TABLE required_event_consumers;DROP TABLE client_id_reservations;DROP INDEX outbox_client_id;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;DROP TABLE group_mutations;DROP TABLE recall_keys;DROP TABLE outgoing_recalls;PRAGMA user_version=5;",
+                 )?;
+                 Ok(())
+             })
+diff --git a/packages/native-client-rust/crates/wechat-store/src/recalls.rs b/packages/native-client-rust/crates/wechat-store/src/recalls.rs
+index 6c5a086..80caa91 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/recalls.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/recalls.rs
+@@ -457,7 +457,7 @@ mod tests {
+                     |row| row.get::<_, i64>(0)
+                 )?))
+                 .unwrap(),
+-            9
++            10
+         );
+         drop(store);
+         let store = Store::open_existing(&root).unwrap();
+diff --git a/packages/shared/src/native.generated.ts b/packages/shared/src/native.generated.ts
+index 6a02a33..dbdf4a2 100644
+--- a/packages/shared/src/native.generated.ts
++++ b/packages/shared/src/native.generated.ts
+@@ -43,9 +43,13 @@ export type AccountSettings = { autoDownloadMaxBytes: number, };
+ export type NativeAccountRemovalRequest = { confirmAccountId: string, };
+ export type NativeAccountRemoval = { accountId: string, removed: boolean, filesRetained: boolean, };
+ export type QuoteSendReference = { messageId: string, serverId: string, };
++export type ReceivedQuoteReference = { receivedId: string, serverId: string, sourceSha256: string, };
++export type QuoteSourceReference = QuoteSendReference | ReceivedQuoteReference;
++export type NativeReceivedMessage = { receivedId: string, firstReceivedSequence: string, accountId: string, ownUsername: string, sourceSha256: string, disposition: string, reason: string | null, threadId: string | null, serverId: string | null, senderId: string | null, direction: string | null, type: number | null, appMessageType: number | null, createdAt: string | null, body: string | null, mentions: NativeMentions, quote: NativeQuoteReference | null, quoteEligible: boolean, };
++export type NativeReceivedActivationRequest = { ownUsername: string, };
+ export type TextMentionPosition = { start: number, end: number, index: number, };
+ export type TextMentions = { userIds?: Array<string>, all?: boolean, positions?: Array<TextMentionPosition>, };
+-export type NativeTextSendRequest = { threadId: string, text: string, quote?: QuoteSendReference, mentions?: TextMentions, };
++export type NativeTextSendRequest = { threadId: string, text: string, quote?: QuoteSourceReference, mentions?: TextMentions, };
+ export type ShareSendRequest = { "kind": "share", threadId: string, title: string, url: string, description?: string, thumbnailUrl?: string, };
+ export type NativeRecallRequest = { serverId: string, };
+ export type NativeReadRequest = { expectedVersion: string, };

@@ -27,6 +27,7 @@
 /tools/
 /downloads/
 *.log
+*.bak
 
 # --- copies of chat databases / encrypted media ---
 *.db
@@ -53,6 +54,9 @@ venv/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+node_modules/
+*.tsbuildinfo
+/deploy/dashboard/runtime/
 
 # --- OS / editor ---
 .DS_Store

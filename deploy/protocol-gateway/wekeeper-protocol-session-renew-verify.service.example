@@ -1,0 +1,9 @@
+[Unit]
+Description=WeKeeper protocol session renewal diagnostic
+After=wekeeper-protocol-gate1.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+UMask=0077
+ExecStart=@PYTHON@ @PROJECT_ROOT@/scripts/verify_protocol_session_renew.py --events-db @CONTROL_DATABASE@ --account @GATEWAY_ACCOUNT@ --since @OBSERVATION_SINCE@ --json

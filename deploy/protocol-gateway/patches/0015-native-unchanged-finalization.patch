@@ -1,0 +1,906 @@
+--- /dev/null
++++ b/.changeset/native-unchanged-send-finalization.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Complete a proven unchanged saved-login projection with the adjacent native-received quote result in one account-sidecar FULL commit. Keep accepted authorization committed first, all profile/password/credential/routing checks, and raw receipt retention before parsing. Superseded projection proof leaves publication pending while preserving verified send facts; a projection metadata SQL failure retains normal connection cleanup and the original independent local send-final write. Changed projections and other send paths retain their existing completion flow.
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -200,3 +200,18 @@
+ paths. Offline synthetic tests cover overlap, cookie refresh, replay, restart
+ and official-format identity/publication/salt failures; this optimization has no
+ new live latency or recipient-validation claim.
++
++### Unchanged native send finalization
++
++For native-received quoted replies only, an unchanged saved-login proof can
++complete its sidecar markers in the same FULL transaction as the final send
++result/event. Accepted authorization is still committed before profile work,
++and the raw native receipt is still committed before application parsing.
++Current profile/password, saved credentials and routing checks remain; changed
++profile publication follows its original journal and completion path. A stale
++proof leaves projection pending without discarding verified send evidence.
++Metadata SQL failures retain connection cleanup and the independent final-send
++path. A failed shared final transaction retains its receipt for existing local
++recovery without another RPC. The projection timing phase covers its proof;
++the combined completion commit is included in final-state timing. Synthetic
++commit-count and recovery fixtures do not establish a live latency improvement.
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -760,4 +760,76 @@
+         })
+         .is_err());
+     }
++    #[test]
++    fn failed_combined_final_transaction_recovers_accepted_retained_receipt_without_rpc() {
++        let f = fixture(vec![]);
++        drop(f.store.read_snapshot("one").unwrap());
++        let state = super::super::tests::state();
++        f.core.save_state("one", &state).unwrap();
++        f.store
++            .mark_validated_if_active("one", &f.core.ownership_generation)
++            .unwrap();
++        let (send, payload) = intent(&f.core, "combined-final-failure");
++        f.store
++            .mark_validated_if_active("one", &f.core.ownership_generation)
++            .unwrap();
++        *f.upstream.response.lock().unwrap() = accepted_response(&payload);
++        let receipt = f
++            .core
++            .send_quote_with_receipt("one", &send.id, &mut state.clone(), &payload)
++            .unwrap();
++        assert!(receipt.accepted && receipt.correlated);
++        let purpose = format!("{RECEIPT_PREFIX}{}", send.id);
++        let raw = f.store.runtime("one", &purpose).unwrap().unwrap();
++        let cipher = f.store.runtime("one", "account-state").unwrap().unwrap();
++        let generation = "a".repeat(64);
++        f.store
++            .put_runtime(
++                "one",
++                "saved-login-projected-generation",
++                generation.as_bytes(),
++            )
++            .unwrap();
++        f.store
++            .put_runtime("one", "saved-login-projected-state-generation", b"previous")
++            .unwrap();
++        let proof = wechat_store::UnchangedSavedLoginCompletion::new(
++            &cipher,
++            None,
++            &generation,
++            &f.core.ownership_generation,
++        )
++        .unwrap();
++        let path = f.store.root.join("accounts/one/agent/control.sqlite");
++        {
++            let db = rusqlite::Connection::open(&path).unwrap();
++            db.execute_batch("CREATE TRIGGER synthetic_final_rollback BEFORE UPDATE ON outbox WHEN NEW.state='accepted' BEGIN SELECT RAISE(ROLLBACK,'synthetic final rollback'); END").unwrap();
++        }
++        assert!(f
++            .store
++            .update_send_after_unchanged_projection(
++                "one",
++                wechat_store::SendFinalUpdate {
++                    id: &send.id,
++                    state: "accepted",
++                    server_id: receipt.server_message_id.as_deref(),
++                    error: None
++                },
++                &proof
++            )
++            .is_err());
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "submitting");
++        assert_eq!(f.store.runtime("one", &purpose).unwrap().unwrap(), raw);
++        {
++            let db = rusqlite::Connection::open(&path).unwrap();
++            db.execute_batch("DROP TRIGGER synthetic_final_rollback")
++                .unwrap();
++        }
++        f.store.recover_uncertain_sends("one").unwrap();
++        assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 1);
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "accepted");
++        assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 0);
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 1);
++        assert_eq!(f.store.runtime("one", &purpose).unwrap().unwrap(), raw);
++    }
+ }
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -550,6 +550,16 @@
+         accepted: bool,
+         trace: &QuoteTrace,
+     ) -> Result<()> {
++        self.persist_state_with_send_completion(account, state, accepted, trace, None)
++    }
++    fn persist_state_with_send_completion(
++        &self,
++        account: &str,
++        state: &AccountState,
++        accepted: bool,
++        trace: &QuoteTrace,
++        completion: Option<&mut Option<wechat_store::UnchangedSavedLoginCompletion>>,
++    ) -> Result<()> {
+         let sealed = trace.measure(TimingStage::StateValidateSeal, || -> Result<_> {
+             self.upstream.validate_state(state)?;
+             self.check_state_profile(account, state)?;
+@@ -566,7 +576,10 @@
+                 self.store.save_accepted_authorization(account, &sealed)
+             })?;
+             let span = trace.span(TimingStage::SavedLoginProjection);
+-            let projected = self.project_saved_login(account, state);
++            let projected = match completion {
++                Some(slot) => self.project_saved_login_for_send(account, state, slot),
++                None => self.project_saved_login(account, state),
++            };
+             span.finish(match projected.as_ref() {
+                 Err(_) => TimingOutcome::Error,
+                 Ok(value) if value["unchanged"] == true || value["state"] == "unchanged" => {
+@@ -1732,8 +1745,22 @@
+             };
+             // A logout may suppress credential installation during this RPC,
+             // but cannot erase an authenticated, accepted send receipt.
+-            let authorization_saved = core
+-                .persist_state_observed(&account, &state, true, &trace)
++            let native_source = payload.quote.as_ref().is_some_and(|quote| {
++                matches!(quote.target, crate::QuoteSourceReference::Received(_))
++            });
++            let mut completion = None;
++            let authorization_saved =
++                if native_source && core.upstream_kind() == crate::upstream::UpstreamKind::Native {
++                    core.persist_state_with_send_completion(
++                        &account,
++                        &state,
++                        true,
++                        &trace,
++                        Some(&mut completion),
++                    )
++                } else {
++                    core.persist_state_observed(&account, &state, true, &trace)
++                }
+                 .is_ok();
+             if authorization_saved {
+                 trace.measure(TimingStage::ValidatedMarker, || {
+@@ -1748,28 +1775,35 @@
+                 .map(quote_receipts::error_code)
+                 .unwrap_or("submission_outcome_unknown");
+             let update_span = trace.span(TimingStage::FinalStatePersist);
+-            let updated = match result {
+-                Ok(result) if result.accepted && result.correlated => core.store.update_send(
++            let (final_state, server_id, final_error) = match result {
++                Ok(result) if result.accepted && result.correlated => {
++                    ("accepted", result.server_message_id, None)
++                }
++                Ok(result) if !result.accepted => ("failed", None, Some("service_rejected")),
++                _ => ("needs_review", None, Some(unknown_code)),
++            };
++            let updated = if let Some(proof) = completion.as_ref() {
++                core.store.update_send_after_unchanged_projection(
++                    &account,
++                    wechat_store::SendFinalUpdate {
++                        id: &id,
++                        state: final_state,
++                        server_id: server_id.as_deref(),
++                        error: final_error,
++                    },
++                    proof,
++                )
++            } else {
++                core.store.update_send(
+                     &account,
+                     &id,
+-                    "accepted",
+-                    result.server_message_id.as_deref(),
+-                    None,
+-                ),
+-                Ok(result) if !result.accepted => {
+-                    core.store
+-                        .update_send(&account, &id, "failed", None, Some("service_rejected"))
+-                }
+-                _ => {
+-                    core.store
+-                        .update_send(&account, &id, "needs_review", None, Some(unknown_code))
+-                }
++                    final_state,
++                    server_id.as_deref(),
++                    final_error,
++                )
+             };
+             update_span.send_result(&updated);
+             let updated = updated?;
+-            let native_source = payload.quote.as_ref().is_some_and(|quote| {
+-                matches!(quote.target, crate::QuoteSourceReference::Received(_))
+-            });
+             if updated.state == "accepted" && !native_source {
+                 let _ = core.project_message_send(&account, &id);
+             }
+--- a/packages/native-client-rust/crates/wechat-core/src/saved_login.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/saved_login.rs
+@@ -297,7 +297,27 @@
+     ) -> Result<Value> {
+         pending_publication(self.project_saved_login_inner(account, accepted))
+     }
++    pub(super) fn project_saved_login_for_send(
++        &self,
++        account: &str,
++        accepted: &AccountState,
++        completion: &mut Option<wechat_store::UnchangedSavedLoginCompletion>,
++    ) -> Result<Value> {
++        pending_publication(self.project_saved_login_with_completion(
++            account,
++            accepted,
++            Some(completion),
++        ))
++    }
+     fn project_saved_login_inner(&self, account: &str, accepted: &AccountState) -> Result<Value> {
++        self.project_saved_login_with_completion(account, accepted, None)
++    }
++    fn project_saved_login_with_completion(
++        &self,
++        account: &str,
++        accepted: &AccountState,
++        completion: Option<&mut Option<wechat_store::UnchangedSavedLoginCompletion>>,
++    ) -> Result<Value> {
+         accepted.validate()?;
+         let Some(binding) = self.identity_binding(account)? else {
+             return Ok(json!({"state":"pending","reason":"profile_identity_unavailable"}));
+@@ -344,13 +364,25 @@
+                 bail!("saved_login_profile_changed");
+             }
+             if self.saved_login_matches(account, accepted, &binding.format_key)? {
+-                self.store.finish_saved_login_publication(
+-                    account,
+-                    None,
+-                    &cipher,
+-                    epoch.as_deref(),
+-                    &generation,
+-                )?;
++                if let Some(slot) = completion {
++                    *slot = Some(wechat_store::UnchangedSavedLoginCompletion::new(
++                        &cipher,
++                        epoch.as_deref(),
++                        &generation,
++                        &self.ownership_generation,
++                    )?);
++                    return Ok(
++                        json!({"state":"pending","unchanged":true,"completionDeferred":true}),
++                    );
++                } else {
++                    self.store.finish_saved_login_publication(
++                        account,
++                        None,
++                        &cipher,
++                        epoch.as_deref(),
++                        &generation,
++                    )?;
++                }
+                 return Ok(json!({"state":"complete","unchanged":true}));
+             }
+         }
+@@ -876,4 +908,107 @@
+             Some([9].as_slice())
+         );
+     }
++    fn finalization_fixture() -> (tempfile::TempDir, Arc<Core>, AccountState) {
++        let dir = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        let core = Core::new(store.clone(), None).unwrap();
++        core.configure_profile_format_key(&[9; 16]).unwrap();
++        let accepted = state();
++        core.install_login_state("one", &accepted, None).unwrap();
++        core.ensure_managed_profile("one", &accepted).unwrap();
++        assert_eq!(
++            core.project_saved_login("one", &accepted).unwrap()["state"],
++            "complete"
++        );
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        store
++            .mark_validated_if_active("one", &core.ownership_generation)
++            .unwrap();
++        (dir, core, accepted)
++    }
++    #[test]
++    fn unchanged_send_completion_defers_only_markers_after_all_actual_profile_checks() {
++        let (_dir, core, accepted) = finalization_fixture();
++        let before = snapshot(&core);
++        let mut completion = None;
++        core.persist_state_with_send_completion(
++            "one",
++            &accepted,
++            true,
++            &QuoteTrace::default(),
++            Some(&mut completion),
++        )
++        .unwrap();
++        assert!(completion.is_some());
++        assert_eq!(snapshot(&core), before);
++        assert!(core
++            .store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_some());
++        let (intent, _) = core
++            .store
++            .create_send("one", "final", "room", "hash", b"sealed", "7")
++            .unwrap();
++        assert!(core.store.claim_send("one", &intent.id).unwrap());
++        let final_intent = core
++            .store
++            .update_send_after_unchanged_projection(
++                "one",
++                wechat_store::SendFinalUpdate {
++                    id: &intent.id,
++                    state: "accepted",
++                    server_id: Some("99"),
++                    error: None,
++                },
++                completion.as_ref().unwrap(),
++            )
++            .unwrap();
++        assert_eq!(final_intent.state, "accepted");
++        assert!(core
++            .store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_none());
++        assert_eq!(snapshot(&core), before);
++    }
++    #[test]
++    fn changed_saved_login_still_publishes_and_commits_its_original_path() {
++        let (_dir, core, mut accepted) = finalization_fixture();
++        let before = snapshot(&core);
++        accepted.cookie = vec![2; 15];
++        let mut completion = None;
++        core.persist_state_with_send_completion(
++            "one",
++            &accepted,
++            true,
++            &QuoteTrace::default(),
++            Some(&mut completion),
++        )
++        .unwrap();
++        assert!(completion.is_none());
++        assert_ne!(snapshot(&core), before);
++        assert!(core
++            .saved_login_matches("one", &accepted, &[9; 16])
++            .unwrap());
++        assert!(core
++            .store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_none());
++    }
++    #[test]
++    fn ordinary_persist_does_not_defer_unchanged_completion() {
++        let (_dir, core, accepted) = finalization_fixture();
++        let before = snapshot(&core);
++        core.persist_state_observed("one", &accepted, true, &QuoteTrace::default())
++            .unwrap();
++        assert!(core
++            .store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_none());
++        assert_eq!(snapshot(&core), before);
++    }
+ }
+--- a/packages/native-client-rust/crates/wechat-store/src/authorization.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/authorization.rs
+@@ -263,7 +263,7 @@
+     }
+     Ok(())
+ }
+-fn saved_login_generation(
++pub(crate) fn saved_login_generation(
+     tx: &rusqlite::Transaction<'_>,
+     expected: &[u8],
+     epoch: Option<&[u8]>,
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -14,6 +14,8 @@
+ mod metadata;
+ mod native_ingress;
+ mod native_send_admission;
++mod native_send_finalization;
++pub use native_send_finalization::*;
+ mod operations;
+ mod outbox;
+ mod outgoing_recall;
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/native_send_finalization.rs
+@@ -0,0 +1,493 @@
++//! Complete an unchanged saved-login projection with a send's final record.
++//! Accepted authorization and raw receipts are already separately committed.
++use crate::*;
++use rusqlite::{OptionalExtension, Transaction};
++
++pub struct UnchangedSavedLoginCompletion {
++    state_cipher: Vec<u8>,
++    logout_epoch: Option<Vec<u8>>,
++    credential_generation: String,
++    owner: String,
++}
++impl UnchangedSavedLoginCompletion {
++    /// Construct only after all existing official-profile/credentials/routing
++    /// checks have proved the unchanged path. This is not a profile cache.
++    pub fn new(cipher: &[u8], epoch: Option<&[u8]>, generation: &str, owner: &str) -> Result<Self> {
++        anyhow::ensure!(
++            generation.len() == 64 && generation.bytes().all(|b| b.is_ascii_hexdigit()),
++            "invalid saved login publication"
++        );
++        Ok(Self {
++            state_cipher: cipher.to_vec(),
++            logout_epoch: epoch.map(Vec::from),
++            credential_generation: generation.into(),
++            owner: owner.into(),
++        })
++    }
++}
++pub struct SendFinalUpdate<'a> {
++    pub id: &'a str,
++    pub state: &'a str,
++    pub server_id: Option<&'a str>,
++    pub error: Option<&'a str>,
++}
++#[derive(Debug)]
++struct ProjectionCompletionFailure(anyhow::Error);
++impl std::fmt::Display for ProjectionCompletionFailure {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("saved_login_completion_failed")
++    }
++}
++impl std::error::Error for ProjectionCompletionFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(self.0.as_ref())
++    }
++}
++fn value(tx: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>> {
++    Ok(tx
++        .query_row("SELECT value FROM runtime WHERE key=?1", [key], |r| {
++            r.get(0)
++        })
++        .optional()?)
++}
++fn complete(tx: &Transaction<'_>, proof: &UnchangedSavedLoginCompletion) -> Result<()> {
++    // A superseded projection cannot erase independently verified send facts.
++    // Expected policy denials remain Ok so the admitted writer stays healthy.
++    if !crate::authorization::saved_login_generation(
++        tx,
++        &proof.state_cipher,
++        proof.logout_epoch.as_deref(),
++    )? || value(tx, "validated-generation")?.as_deref() != Some(proof.owner.as_bytes())
++        || value(tx, "saved-login-publication")?.is_some()
++        || value(tx, "saved-login-projected-generation")?.as_deref()
++            != Some(proof.credential_generation.as_bytes())
++    {
++        return Ok(());
++    }
++    let state_generation = format!("{:x}", Sha256::digest(&proof.state_cipher));
++    for (key, value) in [
++        (
++            "saved-login-projected-generation",
++            proof.credential_generation.as_bytes(),
++        ),
++        (
++            "saved-login-projected-state-generation",
++            state_generation.as_bytes(),
++        ),
++    ] {
++        tx.execute(
++            "INSERT INTO runtime VALUES(?1,?2) ON CONFLICT(key)DO UPDATE SET value=excluded.value",
++            params![key, value],
++        )?;
++    }
++    tx.execute("DELETE FROM runtime WHERE key IN ('saved-login-publication','saved-login-projection-needed')",[])?;
++    Ok(())
++}
++impl Store {
++    pub fn update_send_after_unchanged_projection(
++        &self,
++        account: &str,
++        send: SendFinalUpdate<'_>,
++        proof: &UnchangedSavedLoginCompletion,
++    ) -> Result<SendIntent> {
++        let result=self.control(account,|db| {
++            let tx=db.transaction()?;
++            complete(&tx,proof).map_err(ProjectionCompletionFailure)?;
++            tx.execute("UPDATE outbox SET state=?2,server_id=COALESCE(?3,server_id),error_code=?4 WHERE id=?1 AND state!='cancelled'",params![send.id,send.state,send.server_id,send.error])?;
++            let intent=crate::read_send(&tx,account,send.id)?;
++            tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('send.updated',?1,?2)",params![serde_json::to_string(&intent)?,chrono::Utc::now().to_rfc3339()])?;
++            crate::event_consumers::prune_events(&tx,tx.last_insert_rowid())?;
++            tx.commit()?;
++            Ok(intent)
++        });
++        match result {
++            // The old Core ignored projection metadata errors, then performed
++            // this independent local final write. control has already rolled
++            // back and invalidated the failed writer. No network is retried.
++            Err(error)
++                if error
++                    .downcast_ref::<ProjectionCompletionFailure>()
++                    .is_some() =>
++            {
++                self.update_send(account, send.id, send.state, send.server_id, send.error)
++            }
++            other => other,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::*;
++    use std::{
++        ffi::{c_void, CStr},
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++
++    // Trace observes executed SQL, without replacing SQLite's WAL/checkpoint hooks
++    // or changing synchronization, commit behavior, file format or data values.
++    struct Commits<'a> {
++        store: &'a Store,
++        count: Arc<AtomicUsize>,
++    }
++    unsafe extern "C" fn count_commit(
++        kind: u32,
++        context: *mut c_void,
++        statement: *mut c_void,
++        _sql: *mut c_void,
++    ) -> std::ffi::c_int {
++        if kind == rusqlite::ffi::SQLITE_TRACE_STMT as u32 {
++            let text = rusqlite::ffi::sqlite3_sql(statement.cast());
++            if !text.is_null()
++                && CStr::from_ptr(text)
++                    .to_bytes()
++                    .eq_ignore_ascii_case(b"COMMIT")
++            {
++                // The Arc owner remains alive until this callback is removed.
++                (&*context.cast::<AtomicUsize>()).fetch_add(1, Ordering::SeqCst);
++            }
++        }
++        0
++    }
++    impl<'a> Commits<'a> {
++        fn new(store: &'a Store) -> Self {
++            let count = Arc::new(AtomicUsize::new(0));
++            store
++                .control("one", |db| {
++                    // Test-local owned connection; the callback only counts SQL verbs.
++                    let result = unsafe {
++                        rusqlite::ffi::sqlite3_trace_v2(
++                            db.handle(),
++                            rusqlite::ffi::SQLITE_TRACE_STMT as u32,
++                            Some(count_commit),
++                            Arc::as_ptr(&count).cast_mut().cast(),
++                        )
++                    };
++                    anyhow::ensure!(result == rusqlite::ffi::SQLITE_OK, "trace setup failed");
++                    Ok(())
++                })
++                .unwrap();
++            Self { store, count }
++        }
++        fn count(&self) -> usize {
++            self.count.load(Ordering::SeqCst)
++        }
++    }
++    impl Drop for Commits<'_> {
++        fn drop(&mut self) {
++            let _ = self.store.control("one", |db| {
++                unsafe {
++                    rusqlite::ffi::sqlite3_trace_v2(db.handle(), 0, None, std::ptr::null_mut());
++                }
++                Ok(())
++            });
++        }
++    }
++    fn setup() -> (tempfile::TempDir, Arc<Store>, SendIntent, String) {
++        let directory = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        store.mark_validated_if_active("one", "owner").unwrap();
++        drop(store.read_snapshot("one").unwrap());
++        store
++            .save_accepted_authorization("one", b"accepted-cipher")
++            .unwrap();
++        let generation = "a".repeat(64);
++        store
++            .put_runtime(
++                "one",
++                "saved-login-projected-generation",
++                generation.as_bytes(),
++            )
++            .unwrap();
++        store
++            .put_runtime(
++                "one",
++                "saved-login-projected-state-generation",
++                b"previous-cipher-hash",
++            )
++            .unwrap();
++        store
++            .put_runtime(
++                "one",
++                "quote-receipt:fixture",
++                b"sealed-authenticated-raw-receipt",
++            )
++            .unwrap();
++        let (intent, _) = store
++            .create_send("one", "key", "room", "payload-hash", b"sealed-payload", "7")
++            .unwrap();
++        assert!(store.claim_send("one", &intent.id).unwrap());
++        store
++            .control("one", |db| {
++                db.execute_batch("CREATE TEMP TABLE finalization_canary(value)")?;
++                Ok(())
++            })
++            .unwrap();
++        (directory, store, intent, generation)
++    }
++    // This calls the production baseline's exact adjacent Store operations. The
++    // old Core ignores the projection result and independently persists send final.
++    fn finalize(store: &Store, intent: &SendIntent, generation: &str) -> Result<SendIntent> {
++        let proof =
++            UnchangedSavedLoginCompletion::new(b"accepted-cipher", None, generation, "owner")?;
++        store.update_send_after_unchanged_projection(
++            "one",
++            SendFinalUpdate {
++                id: &intent.id,
++                state: "accepted",
++                server_id: Some("99"),
++                error: None,
++            },
++            &proof,
++        )
++    }
++
++    #[test]
++    fn unchanged_projection_and_accepted_send_should_need_one_full_commit() {
++        let (_directory, store, intent, generation) = setup();
++        let trace = Commits::new(&store);
++        let final_intent = finalize(&store, &intent, &generation).unwrap();
++        assert_eq!(final_intent.state, "accepted");
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_none());
++        assert_eq!(
++            store
++                .runtime("one", "quote-receipt:fixture")
++                .unwrap()
++                .unwrap(),
++            b"sealed-authenticated-raw-receipt"
++        );
++        eprintln!("UNCHANGED_FINAL_COMMIT_COUNT {}", trace.count());
++        assert_eq!(
++            trace.count(),
++            1,
++            "same-account unchanged completion and send final are still two FULL commits"
++        );
++    }
++    #[test]
++    fn failed_projection_metadata_does_not_discard_accepted_send_or_retained_receipt() {
++        let (_directory, store, intent, generation) = setup();
++        store.control("one",|db| {
++        db.execute_batch("CREATE TRIGGER reject_projection_metadata BEFORE UPDATE OF value ON runtime WHEN NEW.key='saved-login-projected-state-generation' BEGIN SELECT RAISE(FAIL,'synthetic projection metadata failure'); END")?;Ok(())
++    }).unwrap();
++        let accepted = finalize(&store, &intent, &generation).unwrap();
++        assert_eq!(accepted.state, "accepted");
++        assert_eq!(accepted.server_id.as_deref(), Some("99"));
++        assert_eq!(
++            store
++                .runtime("one", "quote-receipt:fixture")
++                .unwrap()
++                .unwrap(),
++            b"sealed-authenticated-raw-receipt"
++        );
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_some());
++    }
++    #[test]
++    fn superseded_projection_epoch_does_not_discard_accepted_send_evidence() {
++        let (_directory, store, intent, generation) = setup();
++        store
++            .put_runtime("one", "logout-epoch", b"new-epoch")
++            .unwrap();
++        let accepted = finalize(&store, &intent, &generation).unwrap();
++        assert_eq!(accepted.state, "accepted");
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_some());
++        assert_eq!(
++            store
++                .runtime("one", "quote-receipt:fixture")
++                .unwrap()
++                .unwrap(),
++            b"sealed-authenticated-raw-receipt"
++        );
++    }
++    fn canary(store: &Store) -> bool {
++        store.control("one",|db| Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='finalization_canary')",[],|r|r.get(0))?)).unwrap()
++    }
++    #[test]
++    fn expected_projection_fence_changes_keep_writer_and_send_result() {
++        for mutation in [
++            "logout",
++            "epoch",
++            "owner",
++            "auth",
++            "accepted-marker",
++            "journal",
++            "projected-generation",
++        ] {
++            let (_dir, store, intent, generation) = setup();
++            match mutation {
++                "logout" => store.put_runtime("one", "logged-out", b"epoch").unwrap(),
++                "epoch" => store.put_runtime("one", "logout-epoch", b"epoch").unwrap(),
++                "owner" => store
++                    .put_runtime("one", "validated-generation", b"new-owner")
++                    .unwrap(),
++                "auth" => store
++                    .save_accepted_authorization("one", b"new-accepted-state")
++                    .unwrap(),
++                "accepted-marker" => store
++                    .put_runtime("one", "saved-login-accepted-state-generation", b"wrong")
++                    .unwrap(),
++                "journal" => store
++                    .put_runtime("one", "saved-login-publication", b"new-pending-journal")
++                    .unwrap(),
++                "projected-generation" => store
++                    .put_runtime("one", "saved-login-projected-generation", b"new-generation")
++                    .unwrap(),
++                _ => unreachable!(),
++            }
++            let accepted = finalize(&store, &intent, &generation).unwrap();
++            assert_eq!(accepted.state, "accepted");
++            assert!(store
++                .runtime("one", "saved-login-projection-needed")
++                .unwrap()
++                .is_some());
++            assert_eq!(
++                store
++                    .runtime("one", "saved-login-projected-state-generation")
++                    .unwrap()
++                    .unwrap(),
++                b"previous-cipher-hash"
++            );
++            assert!(
++                canary(&store),
++                "expected fence skip evicted writer: {mutation}"
++            );
++        }
++    }
++    #[test]
++    fn marker_write_error_invalidates_writer_before_original_final_write() {
++        let (_dir, store, intent, generation) = setup();
++        assert!(canary(&store));
++        store.control("one",|db| {db.execute_batch("CREATE TRIGGER reject_projection_metadata BEFORE UPDATE OF value ON runtime WHEN NEW.key='saved-login-projected-state-generation' BEGIN SELECT RAISE(FAIL,'synthetic metadata failure'); END")?;Ok(())}).unwrap();
++        assert_eq!(
++            finalize(&store, &intent, &generation).unwrap().state,
++            "accepted"
++        );
++        assert!(!canary(&store), "actual SQL failure retained failed writer");
++    }
++    #[test]
++    fn final_write_failure_rolls_back_projection_markers_and_retains_receipt() {
++        let (_dir, store, intent, generation) = setup();
++        store.control("one",|db| {db.execute_batch("CREATE TRIGGER reject_final BEFORE UPDATE ON outbox WHEN NEW.state='accepted' BEGIN SELECT RAISE(FAIL,'synthetic final failure'); END")?;Ok(())}).unwrap();
++        assert!(finalize(&store, &intent, &generation).is_err());
++        assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++        assert_eq!(
++            store
++                .runtime("one", "saved-login-projected-state-generation")
++                .unwrap()
++                .unwrap(),
++            b"previous-cipher-hash"
++        );
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_some());
++        assert_eq!(
++            store
++                .runtime("one", "quote-receipt:fixture")
++                .unwrap()
++                .unwrap(),
++            b"sealed-authenticated-raw-receipt"
++        );
++    }
++    #[test]
++    fn rejected_unknown_and_cancelled_send_states_keep_existing_update_semantics() {
++        for (state, error) in [
++            ("failed", Some("service_rejected")),
++            ("needs_review", Some("quote_receipt_unverified")),
++            ("cancelled", None),
++        ] {
++            let (_dir, store, intent, generation) = setup();
++            if state == "cancelled" {
++                store
++                    .update_send("one", &intent.id, "cancelled", None, None)
++                    .unwrap();
++            }
++            let proof =
++                UnchangedSavedLoginCompletion::new(b"accepted-cipher", None, &generation, "owner")
++                    .unwrap();
++            let updated = store
++                .update_send_after_unchanged_projection(
++                    "one",
++                    SendFinalUpdate {
++                        id: &intent.id,
++                        state: if state == "cancelled" {
++                            "accepted"
++                        } else {
++                            state
++                        },
++                        server_id: Some("99"),
++                        error,
++                    },
++                    &proof,
++                )
++                .unwrap();
++            assert_eq!(updated.state, state);
++            assert_eq!(updated.error_code.as_deref(), error);
++        }
++    }
++    unsafe extern "C" fn deny_commit(
++        _context: *mut c_void,
++        action: std::ffi::c_int,
++        first: *const std::ffi::c_char,
++        _second: *const std::ffi::c_char,
++        _database: *const std::ffi::c_char,
++        _trigger: *const std::ffi::c_char,
++    ) -> std::ffi::c_int {
++        if action == rusqlite::ffi::SQLITE_TRANSACTION
++            && !first.is_null()
++            && CStr::from_ptr(first).to_bytes() == b"COMMIT"
++        {
++            rusqlite::ffi::SQLITE_DENY
++        } else {
++            rusqlite::ffi::SQLITE_OK
++        }
++    }
++    #[test]
++    fn shared_final_commit_failure_rolls_back_markers_but_never_erases_durable_receipt() {
++        let (_dir, store, intent, generation) = setup();
++        store
++            .control("one", |db| {
++                let rc = unsafe {
++                    rusqlite::ffi::sqlite3_set_authorizer(
++                        db.handle(),
++                        Some(deny_commit),
++                        std::ptr::null_mut(),
++                    )
++                };
++                anyhow::ensure!(rc == rusqlite::ffi::SQLITE_OK, "authorizer setup failed");
++                Ok(())
++            })
++            .unwrap();
++        assert!(finalize(&store, &intent, &generation).is_err());
++        assert_eq!(store.send("one", &intent.id).unwrap().state, "submitting");
++        assert!(store
++            .runtime("one", "saved-login-projection-needed")
++            .unwrap()
++            .is_some());
++        assert_eq!(
++            store
++                .runtime("one", "saved-login-projected-state-generation")
++                .unwrap()
++                .unwrap(),
++            b"previous-cipher-hash"
++        );
++        assert_eq!(
++            store
++                .runtime("one", "quote-receipt:fixture")
++                .unwrap()
++                .unwrap(),
++            b"sealed-authenticated-raw-receipt"
++        );
++        assert!(!canary(&store));
++    }
++}

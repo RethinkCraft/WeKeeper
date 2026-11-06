@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -190,9 +191,13 @@ def collect(args):
             return health
 
         selected_account = args.account or store.get_status().get("collector", {}).get("account_id")
+        bot_mode = getattr(args, "bot_mode", False)
+        interval = args.interval if args.interval is not None else (3 if bot_mode else 30)
         collector = Collector(store, data_root=args.data_root, account=selected_account,
-                              poll_interval=args.interval, page_size=args.page_size,
-                              after_cycle=archive_media, health_monitor=monitor_client)
+                              poll_interval=interval, page_size=args.page_size,
+                              after_cycle=None if bot_mode else archive_media,
+                              health_monitor=monitor_client, bot_mode=bot_mode,
+                              priority_groups=getattr(args, 'priority_group', ()))
         try:
             if args.once:
                 return collector.collect_once()
@@ -202,12 +207,43 @@ def collect(args):
             collector.close()
 
 
+def enrich(args):
+    from chatlog_keeper.archive import ArchiveStore
+    from chatlog_keeper.collector import EnrichmentWorker
+    state = Path(args.state_dir).expanduser() if args.state_dir else None
+    if state is not None:
+        os.environ["CHATLOG_KEEPER_DATA_DIR"] = str(state)
+    with ArchiveStore(state) as store:
+        selected = args.account or store.get_status().get("collector", {}).get("account_id")
+        worker = EnrichmentWorker(store, data_root=args.data_root, account=selected,
+                                  poll_interval=args.interval)
+        try:
+            if args.once:
+                return worker.run_once()
+            worker.run()
+            return {"ok": True, "stopped": True}
+        finally:
+            worker.close()
+
+
 def bounded_int(low, high):
     def parse(value):
         result = int(value)
         if not low <= result <= high:
             raise argparse.ArgumentTypeError(f"must be {low}..{high}")
         return result
+    return parse
+
+
+def bounded_float(low, high):
+    def parse(value):
+        try:
+            number = float(value)
+        except (ValueError, TypeError):
+            raise argparse.ArgumentTypeError("expected a finite number") from None
+        if not math.isfinite(number) or not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"expected a number between {low} and {high}")
+        return number
     return parse
 
 
@@ -222,6 +258,7 @@ def parser():
         ("image-key", "initialize image-key metadata for the verified Linux build"),
         ("image", "decode one local cached image"),
         ("collect", "continuously archive all groups using cached keys only"),
+        ("enrich", "run cache-only P2 and media enrichment separately from live collection"),
         ("mcp", "serve archive tools and gated native voice requests over stdio"),
     ]:
         c = commands.add_parser(name, help=help_text)
@@ -238,11 +275,20 @@ def parser():
             c.add_argument("--out", required=True)
         elif name == "collect":
             c.add_argument("--state-dir", help="private archive and key directory")
-            c.add_argument("--interval", type=bounded_int(1, 3600), default=30)
+            c.add_argument("--interval", type=bounded_float(.1, 3600), default=None,
+                           help="seconds between live scans (default 30, or 3 with --bot-mode)")
+            c.add_argument("--bot-mode", action="store_true",
+                           help="prioritize live text and move P2/media to the enrich worker")
+            c.add_argument("--priority-group", action="append", default=[],
+                           help="native group ID to prioritize in bot mode; repeat for multiple groups")
             c.add_argument("--page-size", type=bounded_int(1, 1000), default=500)
             c.add_argument("--once", action="store_true", help="run one resumable collection cycle")
         elif name == "mcp":
             c.add_argument("--state-dir", help="existing private archive directory")
+        elif name == "enrich":
+            c.add_argument("--state-dir", help="private archive and key directory")
+            c.add_argument("--interval", type=bounded_int(1, 3600), default=30)
+            c.add_argument("--once", action="store_true", help="run one auxiliary pass")
     return p
 
 
@@ -263,7 +309,7 @@ def main(argv=None):
                 result = {"groups": group_rows(reader)}
         else:
             result = {"probe": probe, "extract-key": extract_key, "messages": messages,
-                      "image-key": image_key, "image": image, "collect": collect}[args.command](args)
+                      "image-key": image_key, "image": image, "collect": collect, "enrich": enrich}[args.command](args)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2 if args.command == "collect" and result.get("errors") else 0
     except ReaderError as exc:

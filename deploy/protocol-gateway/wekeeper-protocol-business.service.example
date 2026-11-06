@@ -1,0 +1,25 @@
+[Unit]
+Description=WeKeeper protocol group bot
+Requires=wekeeper-protocol-gate1.service
+After=wekeeper-protocol-gate1.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=@PROJECT_ROOT@
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# This private file supplies WEKEEPER_PROTOCOL_ACCOUNT and WEKEEPER_PROTOCOL_OWN.
+EnvironmentFile=@IDENTITY_FILE@
+# Activation is a separate first-install action. Never add --activate here.
+# After cloud-bootstrap succeeds, add --cloud-control to enable dashboard management.
+ExecStart=@PYTHON@ -m chatlog_keeper.bot.cli --state-dir @BOT_STATE_DIR@ --dashboard-dir @DASHBOARD_DIR@ --usage-dir @USAGE_DIR@ run   --archive-state @ARCHIVE_STATE_DIR@   --inbox @INBOX_FILE@ --outbox @OUTBOX_FILE@ --journal @JOURNAL_FILE@   --token-file @GATEWAY_TOKEN_FILE@ --bindings @BINDINGS_FILE@   --status-file @BOT_STATUS_FILE@ --server http://127.0.0.1:@GATEWAY_PORT@   --account ${WEKEEPER_PROTOCOL_ACCOUNT} --own ${WEKEEPER_PROTOCOL_OWN} --consumer @CONSUMER@
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

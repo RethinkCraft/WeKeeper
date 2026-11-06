@@ -1,0 +1,3951 @@
+diff --git a/.changeset/native-background-checkpoints.md b/.changeset/native-background-checkpoints.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4fb078eae9fa5402ba4599398faf5f9f0125655b
+--- /dev/null
++++ b/.changeset/native-background-checkpoints.md
+@@ -0,0 +1,6 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Run owned native WAL checkpoint maintenance separately from request commits while keeping FULL commit durability and send recovery. Expose account-scoped read-only storage maintenance health independently of profile and control-store queries, and stop maintenance when the native runtime shuts down.
++The daemon joins checkpoint maintenance before returning from serve, including setup and server failures, while leaving in-flight result persistence handles open.
+diff --git a/packages/native-client-rust/FEATURES.md b/packages/native-client-rust/FEATURES.md
+index 41e47951dd12f0005a2f7bfa84ffb5a9a625d3c7..0cfda51c08866205934d1db9f6f3959b034b386e 100644
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -227,3 +227,44 @@ writer cleanup and profile recovery remain separate from phone receipt.
+ Synthetic equality, commit, fault, restart and disconnected-session fixtures do
+ not establish a live latency or recipient-validation result. New comparison and
+ proof timing phases are nested in their parent phases and must not be added twice.
++
++### Native background WAL checkpoints
++
++Native Core enables owned account-control checkpoint maintenance after its local
++startup recovery. Standalone Stores, Simulator Core and DELETE-mode connections
++keep the ordinary inline policy. FULL WAL commits still finish before receipt
++parsing or final send acceptance; background maintenance does not grant a new
++network attempt or replace an accepted send receipt.
++
++Maintenance uses a separately admitted connection under the same Store ownership
++lease. Ordinary due work waits for 100ms without control activity on that account;
++read control calls count as activity, but the maintenance health view does not.
++The original frame, pending-age and free-space pressure bounds bypass that delay,
++while retaining foreground exclusion and complete family admission. Other accounts
++and work outside control calls are not a global disk-idle signal. A checkpoint
++already started may still compete with later work for the same disk.
++Its PASSIVE checkpoint IO holds no account, registry or admitted-writer
++mutex. Controlled family epochs preserve current writer identity, exact companion
++membership and private permissions during overlap, then return to full metadata
++admission checks. Removal, eviction, shutdown and uncertain-family cleanup retain
++their ownership and stale-generation guards. Checkpoint pressure or failure is
++maintenance health, not permission to regenerate or resend a completed reply.
++Only the maintenance `blocked` result gates a new remote admission; an ordinary
++checkpoint error alone does not invalidate later FULL commits. An existing
++idempotent reply remains available, and a blocked queued text or quoted reply
++keeps its saved task without claiming it. Results already in flight keep their
++original receipt and completion paths. Sync and metadata APIs check storage
++pressure before creating a new operation. Already-created sync and metadata
++operations keep their existing failure and recovery behavior; this change adds
++no new operation resumer or retry policy.
++
++`GET /v1/accounts/{accountId}/storage-maintenance` requires that account's `read`
++scope and returns maintenance state without reading its control database or
++official profile. Ordinary account status also includes `checkpointMaintenance`;
++the separate endpoint remains usable if those other account reads fail. Shutdown
++signals maintenance without waiting under account locks. The server's owner guard
++joins maintenance on successful or failed serve exits even when another worker
++still retains Core; it leaves in-flight SQLite handles open. Store destruction
++closes handles before releasing ownership. Read snapshots use the live health view
++without owning or stopping a second worker. Timing and fault fixtures do not
++establish phone delivery or a measured end-to-end latency improvement.
+diff --git a/packages/native-client-rust/crates/wechat-api/src/actions.rs b/packages/native-client-rust/crates/wechat-api/src/actions.rs
+index cdda5bd0f748348e67e6c1f6cb500069293a275d..43b660524d9905d1adc348408e283cad461d8b84 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/actions.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/actions.rs
+@@ -10,6 +10,10 @@ pub(super) fn routes() -> Router<App> {
+             post(recall_message),
+         )
+         .route("/v1/accounts/{a}/capabilities", get(capabilities))
++        .route(
++            "/v1/accounts/{a}/storage-maintenance",
++            get(storage_maintenance),
++        )
+         .route("/v1/accounts/{a}/connect", post(connect))
+         .route("/v1/accounts/{a}/disconnect", post(disconnect))
+         .route("/v1/accounts/{a}/logout", post(logout))
+@@ -45,6 +49,14 @@ pub(super) fn routes() -> Router<App> {
+         .route("/v1/accounts/{a}/contact-sync", post(sync_contacts))
+         .route("/v1/accounts/{a}/group-sync", post(sync_groups))
+ }
++async fn storage_maintenance(
++    State(app): State<App>,
++    Extension(c): Extension<Claims>,
++    Path(a): Path<String>,
++) -> ApiResult<Json<Value>> {
++    c.require(Some(&a), "read")?;
++    Ok(Json(app.core.storage_maintenance_health(&a)?))
++}
+ async fn recall_message(
+     State(app): State<App>,
+     Extension(c): Extension<Claims>,
+diff --git a/packages/native-client-rust/crates/wechat-api/src/lib.rs b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+index 9dd3c1e632f33016e837b662b75d8041df50846a..fff63972db10d362ce3619f33b1b73b275c0a6ed 100644
+--- a/packages/native-client-rust/crates/wechat-api/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+@@ -3,6 +3,8 @@ mod actions;
+ pub mod contracts;
+ mod groups;
+ mod media;
++#[cfg(test)]
++mod storage_maintenance_tests;
+ use anyhow::{bail, Context, Result};
+ use axum::{
+     extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
+@@ -145,6 +147,12 @@ impl From<anyhow::Error> for ApiError {
+                 return Self(StatusCode::BAD_REQUEST, code);
+             }
+         }
++        if message == "storage_maintenance_blocked" {
++            return Self(
++                StatusCode::SERVICE_UNAVAILABLE,
++                "storage_maintenance_blocked",
++            );
++        }
+         for code in [
+             "ordinary_group_required",
+             "ordinary_contact_required",
+diff --git a/packages/native-client-rust/crates/wechat-api/src/storage_maintenance_tests.rs b/packages/native-client-rust/crates/wechat-api/src/storage_maintenance_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2e8bc8ddee357b196b0468d63ffb74d54c1b647
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-api/src/storage_maintenance_tests.rs
+@@ -0,0 +1,145 @@
++use super::*;
++use axum::{body::Body, http::Request};
++use http_body_util::BodyExt;
++use tower::ServiceExt;
++
++const OWNER: &str = "0123456789abcdef0123456789abcdef";
++struct NoTransport;
++impl wechat_core::upstream::Upstream for NoTransport {
++    fn kind(&self) -> wechat_core::upstream::UpstreamKind {
++        wechat_core::upstream::UpstreamKind::Native
++    }
++    // The trait's native transport default fails closed; no network client.
++}
++
++fn fixture() -> (tempfile::TempDir, Arc<Core>, Router) {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    store.create_account("two").unwrap();
++    let core = Core::with_upstream(store, None, Arc::new(NoTransport)).unwrap();
++    let app = router(core.clone(), OWNER);
++    (directory, core, app)
++}
++
++async fn health(app: Router, account: &str, token: &str) -> (StatusCode, Value) {
++    let response = app
++        .oneshot(
++            Request::builder()
++                .uri(format!("/v1/accounts/{account}/storage-maintenance"))
++                .header("authorization", format!("Bearer {token}"))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap();
++    let status = response.status();
++    let body = response.into_body().collect().await.unwrap().to_bytes();
++    (status, serde_json::from_slice(&body).unwrap())
++}
++
++#[tokio::test]
++async fn storage_health_requires_read_scope_and_the_correct_account() {
++    let (_directory, core, app) = fixture();
++    let read = "storage-read-one-synthetic-token";
++    let send = "storage-send-one-synthetic-token";
++    let grant = core
++        .store
++        .issue_token(
++            "read",
++            &format!("{:x}", Sha256::digest(read)),
++            &["one".into()],
++            &["read".into()],
++            None,
++        )
++        .unwrap();
++    core.store
++        .issue_token(
++            "send",
++            &format!("{:x}", Sha256::digest(send)),
++            &["one".into()],
++            &["send".into()],
++            None,
++        )
++        .unwrap();
++    let (status, body) = health(app.clone(), "one", read).await;
++    assert_eq!(status, StatusCode::OK);
++    assert_eq!(body["enabled"], true);
++    assert_eq!(body["stopping"], false);
++    assert!(body["state"].is_string());
++    assert_eq!(
++        health(app.clone(), "two", read).await.0,
++        StatusCode::FORBIDDEN
++    );
++    assert_eq!(
++        health(app.clone(), "one", send).await.0,
++        StatusCode::FORBIDDEN
++    );
++    core.store.revoke_token(&grant.id).unwrap();
++    assert_eq!(health(app, "one", read).await.0, StatusCode::UNAUTHORIZED);
++}
++
++#[tokio::test]
++async fn storage_health_avoids_control_queries_and_preserves_accepted_send() {
++    let (_directory, core, app) = fixture();
++    let intent = core
++        .store
++        .create_send("one", "accepted", "room", "hash", b"frozen", "7")
++        .unwrap()
++        .0;
++    core.store
++        .update_send("one", &intent.id, "accepted", Some("17"), None)
++        .unwrap();
++    let before = serde_json::to_value(core.store.send("one", &intent.id).unwrap()).unwrap();
++    core.store
++        .put_runtime(
++            "one",
++            "profile-identity-binding",
++            b"invalid-protected-record",
++        )
++        .unwrap();
++    assert!(core.account_status("one").is_err());
++    let (status, body) = health(app.clone(), "one", OWNER).await;
++    assert_eq!(status, StatusCode::OK);
++    assert_eq!(body["enabled"], true);
++    core.shutdown();
++    let (status, body) = health(app, "one", OWNER).await;
++    assert_eq!(status, StatusCode::OK);
++    assert_eq!(body["stopping"], true);
++    core.store
++        .clear_runtime("one", "profile-identity-binding")
++        .unwrap();
++    assert_eq!(
++        serde_json::to_value(core.store.send("one", &intent.id).unwrap()).unwrap(),
++        before
++    );
++    assert!(core.store.queued_sends("one").unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn new_send_under_storage_pressure_returns_503_without_an_intent() {
++    let (_directory, core, app) = fixture();
++    core.store.request_checkpoint_stop();
++    let response = app
++        .oneshot(
++            Request::builder()
++                .method("POST")
++                .uri("/v1/accounts/one/sends")
++                .header("authorization", format!("Bearer {OWNER}"))
++                .header("content-type", "application/json")
++                .header("idempotency-key", "storage-pressure-new")
++                .body(Body::from(r#"{"threadId":"room","text":"fixed reply"}"#))
++                .unwrap(),
++        )
++        .await
++        .unwrap();
++    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
++    let body: Value =
++        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
++    assert_eq!(body["error"]["code"], "storage_maintenance_blocked");
++    assert!(core
++        .store
++        .send_by_key("one", "storage-pressure-new")
++        .is_err());
++    assert!(core.store.queued_sends("one").unwrap().is_empty());
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/actions.rs b/packages/native-client-rust/crates/wechat-core/src/actions.rs
+index 9e6262125f23ba9e3c961467fc2feb80429e8f31..ab36f1f9eb56cd47a3e578fc7e607571f4382d47 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/actions.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/actions.rs
+@@ -96,6 +96,7 @@ impl Core {
+         Ok(op)
+     }
+     pub fn sync_operation(self: &Arc<Self>, account: &str) -> Result<Operation> {
++        self.require_storage_admission(account)?;
+         self.start_operation(account, "sync", |core, account| async move {
+             core.sync(&account).await
+         })
+diff --git a/packages/native-client-rust/crates/wechat-core/src/checkpoint_lifecycle_tests.rs b/packages/native-client-rust/crates/wechat-core/src/checkpoint_lifecycle_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..56ff0c4dcc70c026f1a0f2a5d2cfa8a852114c40
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/checkpoint_lifecycle_tests.rs
+@@ -0,0 +1,190 @@
++//! Local lifecycle coverage; no real upstream or checkpoint load.
++use super::*;
++use crate::upstream::{Upstream, UpstreamKind};
++use std::{fs, sync::atomic::AtomicUsize};
++
++struct LocalOnly {
++    kind: UpstreamKind,
++    network_calls: AtomicUsize,
++}
++impl LocalOnly {
++    fn new(kind: UpstreamKind) -> Arc<Self> {
++        Arc::new(Self {
++            kind,
++            network_calls: AtomicUsize::new(0),
++        })
++    }
++}
++impl Upstream for LocalOnly {
++    fn kind(&self) -> UpstreamKind {
++        self.kind
++    }
++    fn native(
++        &self,
++        _options: wechat_protocol::NativeOptions,
++    ) -> Result<wechat_protocol::NativeClient> {
++        self.network_calls.fetch_add(1, Ordering::SeqCst);
++        bail!("unexpected_network_operation")
++    }
++}
++
++#[test]
++fn standalone_and_simulator_keep_checkpoint_maintenance_disabled() {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    assert_eq!(store.checkpoint_health("one").unwrap()["enabled"], false);
++    fs::write(
++        store.root.join(crate::upstream::SIMULATOR_MARKER),
++        crate::upstream::SIMULATOR_MARKER_CONTENT,
++    )
++    .unwrap();
++    let upstream = LocalOnly::new(UpstreamKind::Simulator);
++    let core = Core::with_upstream(store, None, upstream.clone()).unwrap();
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["enabled"],
++        false
++    );
++    assert_eq!(
++        core.account_status("one").unwrap()["checkpointMaintenance"]["enabled"],
++        false
++    );
++    core.shutdown();
++    assert_eq!(upstream.network_calls.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn native_snapshot_health_uses_live_manager_and_snapshot_drop_does_not_stop_it() {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    let upstream = LocalOnly::new(UpstreamKind::Native);
++    let core = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["enabled"],
++        true
++    );
++    let snapshot = Arc::new(store.read_snapshot("one").unwrap());
++    assert_eq!(snapshot.checkpoint_health("one").unwrap()["enabled"], false);
++    let view = Core {
++        store: snapshot,
++        shared: core.shared.clone(),
++        snapshot_reader: None,
++        live_store: Some(store.clone()),
++    };
++    assert_eq!(
++        view.storage_maintenance_health("one").unwrap()["enabled"],
++        true
++    );
++    drop(view);
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["stopping"],
++        false
++    );
++    core.shutdown();
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["stopping"],
++        true
++    );
++    assert_eq!(upstream.network_calls.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn native_startup_recovers_submitted_intent_locally_before_enabling_maintenance() {
++    let directory = tempfile::tempdir().unwrap();
++    let root = directory.path().join("data");
++    let store = Arc::new(Store::open(&root).unwrap());
++    store.create_account("one").unwrap();
++    let original =
++        Core::with_upstream(store.clone(), None, LocalOnly::new(UpstreamKind::Native)).unwrap();
++    store.put_runtime("one", "desired", b"connected").unwrap();
++    let intent = store
++        .create_send("one", "pending", "room", "hash", b"frozen", "7")
++        .unwrap()
++        .0;
++    assert!(store.claim_send("one", &intent.id).unwrap());
++    drop(original);
++    drop(store);
++    let reopened = Arc::new(Store::open_existing(&root).unwrap());
++    assert_eq!(reopened.checkpoint_health("one").unwrap()["enabled"], false);
++    let upstream = LocalOnly::new(UpstreamKind::Native);
++    let core = Core::with_upstream(reopened.clone(), None, upstream.clone()).unwrap();
++    let recovered = reopened.send("one", &intent.id).unwrap();
++    assert_eq!(recovered.state, "needs_review");
++    assert_eq!(
++        recovered.error_code.as_deref(),
++        Some("restart_after_submission")
++    );
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["enabled"],
++        true
++    );
++    assert_eq!(upstream.network_calls.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn health_and_shutdown_do_not_replay_accepted_send_when_profile_record_is_unreadable() {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    let upstream = LocalOnly::new(UpstreamKind::Native);
++    let core = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
++    let intent = store
++        .create_send("one", "accepted", "room", "hash", b"frozen", "7")
++        .unwrap()
++        .0;
++    store
++        .update_send("one", &intent.id, "accepted", Some("17"), None)
++        .unwrap();
++    let before = serde_json::to_value(store.send("one", &intent.id).unwrap()).unwrap();
++    store
++        .put_runtime(
++            "one",
++            "profile-identity-binding",
++            b"invalid-protected-record",
++        )
++        .unwrap();
++    assert!(core.account_status("one").is_err());
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["enabled"],
++        true
++    );
++    core.shutdown();
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["stopping"],
++        true
++    );
++    store
++        .clear_runtime("one", "profile-identity-binding")
++        .unwrap();
++    assert_eq!(
++        serde_json::to_value(store.send("one", &intent.id).unwrap()).unwrap(),
++        before
++    );
++    assert_eq!(upstream.network_calls.load(Ordering::SeqCst), 0);
++}
++
++#[tokio::test]
++async fn stopped_storage_maintenance_blocks_new_session_before_upstream() {
++    let directory = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&directory.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    let upstream = LocalOnly::new(UpstreamKind::Native);
++    let core = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
++    store.request_checkpoint_stop();
++    let entered = AtomicBool::new(false);
++    let error = core
++        .session_request("one", "checkpoint-test", |_| async {
++            entered.store(true, Ordering::SeqCst);
++            Ok(())
++        })
++        .await
++        .unwrap_err();
++    assert_eq!(error.to_string(), "storage_maintenance_blocked");
++    assert_eq!(
++        core.sync_operation("one").unwrap_err().to_string(),
++        "storage_maintenance_blocked"
++    );
++    assert!(!entered.load(Ordering::SeqCst));
++    assert_eq!(upstream.network_calls.load(Ordering::SeqCst), 0);
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/groups.rs b/packages/native-client-rust/crates/wechat-core/src/groups.rs
+index a8656a73f13f4ff4378c85aef40e10809b35cf37..3a1f3105391a27ac6c111e4b6df686df00aa7db2 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/groups.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/groups.rs
+@@ -236,6 +236,7 @@ impl Core {
+         {
+             return Ok((prior.operation, false));
+         }
++        self.require_storage_admission(account)?;
+         let mut state = self.account_state(account)?;
+         action.validate(&state.own_username)?;
+         let mut minimized = false;
+@@ -424,6 +425,9 @@ impl Core {
+         if record.phase != "queued" {
+             return Ok(record.operation);
+         }
++        if self.storage_admission_blocked(account)? {
++            return Ok(record.operation);
++        }
+         let (attempt, mut receipts) = self.load_group_attempt(&record)?;
+         let mut op = record.operation;
+         let preflight = (|| -> Result<(AccountState, Vec<u8>)> {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/media.rs b/packages/native-client-rust/crates/wechat-core/src/media.rs
+index 291104390964df7d10ecd5c793a830e68461e365..69d4c724a3af1da31bb1e1ae8f80ca51727c98a7 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/media.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/media.rs
+@@ -498,6 +498,7 @@ impl Core {
+                 && no_final_media_submission(&expected),
+             "completed_upload_retry_not_admitted"
+         );
++        self.require_storage_admission(account)?;
+         let mut plan: SendPlan = serde_json::from_slice(&self.vault.open_record(
+             account,
+             &format!("media-job:{id}"),
+@@ -912,6 +913,9 @@ impl Core {
+             );
+         }
+         let key = format!("download:{}", asset.id);
++        if asset.state != "available" && self.store.media_job_by_key(account, &key).is_err() {
++            self.require_storage_admission(account)?;
++        }
+         let id = format!("job_{}", uuid::Uuid::new_v4());
+         let hash = digest(asset.id.as_bytes());
+         let (row, created) = self.store.create_media_job(
+@@ -1006,6 +1010,23 @@ impl Core {
+             thumbnail.as_ref().map(|source| source.sha256.as_str()),
+             (request.kind == MediaKind::File).then_some(source.name.as_str()),
+         )?;
++        let job_key = format!("send:{key}");
++        if let Ok(existing) = self.store.media_job_by_key(account, &job_key) {
++            // Reuse the original transactional hash/conflict validation. The
++            // existing key is retained; no new task or remote attempt is made.
++            let (row, created) = self.store.create_media_job(
++                account,
++                &existing.id,
++                &job_key,
++                &hash,
++                "send",
++                &existing.data,
++                &existing.payload,
++            )?;
++            ensure!(!created, "media_replay_missing");
++            return Ok(public_job(account, &row));
++        }
++        self.require_storage_admission(account)?;
+         let id = format!("job_{}", uuid::Uuid::new_v4());
+         let mut plan = SendPlan {
+             request: request.clone(),
+@@ -1032,7 +1053,7 @@ impl Core {
+         let (row, new) = self.store.create_media_job(
+             account,
+             &id,
+-            &format!("send:{key}"),
++            &job_key,
+             &hash,
+             "send",
+             &json!({"threadId":request.thread_id,"sourceId":request.source_id,"completedBytes":0}),
+@@ -1180,6 +1201,9 @@ impl Core {
+                 guard: Some(guard),
+                 runtime,
+             };
++            if core.storage_admission_blocked(&account)? {
++                return Ok(());
++            }
+             if !core.store.claim_media_job(&account, &id)? {
+                 return Ok(());
+             }
+diff --git a/packages/native-client-rust/crates/wechat-core/src/metadata.rs b/packages/native-client-rust/crates/wechat-core/src/metadata.rs
+index 4ed0db604dd3a001fdf9607b60ca09fe39209383..52eb7f369826cb6961dbec9d48bf0d923c1ead2b 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/metadata.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/metadata.rs
+@@ -457,6 +457,7 @@ impl Core {
+                 }
+             }
+         }
++        self.require_storage_admission(account)?;
+         self.account_state(account)?;
+         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+         let op = self.start_operation(account, "metadata", move |core, account| async move {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/outgoing_recall.rs b/packages/native-client-rust/crates/wechat-core/src/outgoing_recall.rs
+index 6d2dfdb5ab9c50db86413396212423df9bfbda9b..4b17ce33b3d4609eb5610e90e8512dbd2f544a62 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/outgoing_recall.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/outgoing_recall.rs
+@@ -136,6 +136,7 @@ impl Core {
+         {
+             return Ok((self.reconcile_recall(prior)?, false));
+         }
++        self.require_storage_admission(&account)?;
+         let state = self.account_state(&account)?;
+         let reader = self.profile_reader(&account)?;
+         let target = reader.message(
+@@ -286,6 +287,9 @@ impl Core {
+         if record.phase != "queued" {
+             return self.reconcile_recall(record);
+         }
++        if self.storage_admission_blocked(account)? {
++            return Ok(record.operation);
++        }
+         let attempt = self.recall_attempt(&record)?;
+         let mut op = record.operation;
+         let preflight = (|| -> Result<(AccountState, Vec<u8>)> {
+diff --git a/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs b/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs
+index f1a85f7b309918e909c3f73638acc22193c27a43..d891b50c727217580ee3ffcae44d24b2cb7a4fe4 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/post_rpc_equal_tests.rs
+@@ -1,4 +1,95 @@
+ use super::*;
++
++#[tokio::test]
++async fn blocked_storage_maintenance_keeps_quote_queued_without_remote_claim() {
++    let fixture = equal_fixture(false);
++    fixture.core.stopping.store(true, Ordering::SeqCst);
++    let intent = fixture
++        .core
++        .send_quoted_source_text(
++            "one",
++            "maintenance-blocked",
++            "room@chatroom",
++            "fixed reply",
++            QuoteSourceReference::Received(fixture.reference.clone()),
++        )
++        .await
++        .unwrap();
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    fixture.core.stopping.store(false, Ordering::SeqCst);
++    fixture.core.store.request_checkpoint_stop();
++    assert_eq!(
++        fixture.core.storage_maintenance_health("one").unwrap()["blocked"],
++        true
++    );
++    let (timings, receiver) = quote_timing::Timings::test_channel(256);
++    let trace = timings.recovered_worker(&intent.id, quote_timing::Runtime::Native);
++    fixture
++        .core
++        .perform_send_inner("one", &intent.id, trace)
++        .await
++        .unwrap();
++    let rows: Vec<Value> = receiver
++        .try_iter()
++        .map(|row| serde_json::to_value(row).unwrap())
++        .collect();
++    let replay = fixture
++        .core
++        .send_quoted_source_text(
++            "one",
++            "maintenance-blocked",
++            "room@chatroom",
++            "fixed reply",
++            QuoteSourceReference::Received(fixture.reference.clone()),
++        )
++        .await
++        .unwrap();
++    assert_eq!(replay.id, intent.id);
++    let error = fixture
++        .core
++        .send_quoted_source_text(
++            "one",
++            "maintenance-new",
++            "room@chatroom",
++            "fixed reply",
++            QuoteSourceReference::Received(fixture.reference.clone()),
++        )
++        .await
++        .unwrap_err();
++    assert_eq!(error.to_string(), "storage_maintenance_blocked");
++    assert!(fixture
++        .core
++        .store
++        .send_by_key("one", "maintenance-new")
++        .is_err());
++    let intent = fixture.core.store.send("one", &intent.id).unwrap();
++    assert_eq!(intent.state, "queued");
++    assert!(intent.server_id.is_none());
++    assert_eq!(fixture.native.calls.load(Ordering::SeqCst), 0);
++    assert!(rows.iter().any(|row| {
++        row["stage"] == "claim" && row["edge"] == "end" && row["outcome"] == "pending"
++    }));
++}
++
++#[tokio::test]
++async fn native_snapshot_drop_keeps_health_and_next_quote_send_usable() {
++    let fixture = equal_fixture(false);
++    let view = fixture.core.store.read_snapshot("one").unwrap();
++    assert!(view.is_read_snapshot());
++    drop(view);
++    assert_ne!(
++        fixture.core.storage_maintenance_health("one").unwrap()["blocked"],
++        true
++    );
++    let (sent, _) = perform_equal_fixture(&fixture, "after-snapshot").await;
++    assert_eq!(sent.state, "accepted");
++    assert_eq!(sent.server_id.as_deref(), Some("99"));
++    assert_eq!(fixture.native.calls.load(Ordering::SeqCst), 1);
++    assert_ne!(
++        fixture.core.storage_maintenance_health("one").unwrap()["blocked"],
++        true
++    );
++}
+ include!("post_rpc_fixture.rs");
+ 
+ #[tokio::test]
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+index 948a0ca9cec00fdbced044f66ea79477cc593482..a68b3a9612c84b72a6edbe49f48f6ed337da38a6 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -371,6 +371,9 @@ impl Core {
+             let _ = core.repair_group_mutations(&account.id);
+             let _ = core.refresh_incoming_groups(&account.id, false);
+         }
++        if core.upstream_kind() == crate::upstream::UpstreamKind::Native {
++            core.store.enable_background_checkpoints()?;
++        }
+         Ok(core)
+     }
+     pub fn create_account(&self, id: &str) -> Result<wechat_store::Account> {
+@@ -703,6 +706,35 @@ impl Core {
+             None => Ok(vec![]),
+         }
+     }
++    /// This health read avoids account-control/profile queries so maintenance
++    /// faults remain observable independently of ordinary account status.
++    pub fn storage_maintenance_health(&self, account: &str) -> Result<Value> {
++        self.live_store
++            .as_ref()
++            .unwrap_or(&self.store)
++            .checkpoint_health(account)
++    }
++    pub(crate) fn storage_admission_blocked(&self, account: &str) -> Result<bool> {
++        if self.upstream_kind() != crate::upstream::UpstreamKind::Native {
++            return Ok(false);
++        }
++        let mut health = self.storage_maintenance_health(account)?;
++        if health["state"] == "closing" {
++            self.live_store
++                .as_ref()
++                .unwrap_or(&self.store)
++                .wait_checkpoint_retirement(account)?;
++            health = self.storage_maintenance_health(account)?;
++        }
++        Ok(health["blocked"] == true)
++    }
++    pub(crate) fn require_storage_admission(&self, account: &str) -> Result<()> {
++        anyhow::ensure!(
++            !self.storage_admission_blocked(account)?,
++            "storage_maintenance_blocked"
++        );
++        Ok(())
++    }
+     pub fn account_status(&self, account: &str) -> Result<Value> {
+         let record = self.store.account(account)?;
+         let saved = self.account_state(account).is_ok();
+@@ -727,9 +759,9 @@ impl Core {
+         } else {
+             "disconnected"
+         };
+-        Ok(
+-            json!({"id":record.id,"ownUsername":self.profile_username(account)?,"storageMode":record.storage_mode,"schemaCompatibility":record.schema_compatibility,"authenticated":auth,"connection":if auth&&desired==b"connected"{"online"}else if saved&&auto_connect&&desired==b"connected"{"reconnecting"}else{"disconnected"},"incomingTransport":incoming,"contactSyncReady":self.push_connected(account)&&(self.upstream.kind()==crate::upstream::UpstreamKind::Simulator||self.store.runtime(account,"contact-sync-ready")?.as_deref()==Some(self.ownership_generation.as_bytes())),"pendingProjectionBatches":self.store.pending_sync_count(account)?,"pendingCursorProjection":self.store.pending_cursor_projection(account)?,"pendingReadProjections":self.store.pending_reads(account)?,"pendingRecallProjections":self.store.pending_recall_projections(account)?,"pendingMessageRecalls":self.store.pending_message_recalls(account)?,"pendingSavedLoginProjection":self.store.runtime(account,"saved-login-projection-needed")?.is_some()||self.store.runtime(account,"saved-login-publication")?.is_some(),"profileRecoveryPending":self.store.runtime(account,"profile-recovery-pending")?.is_some(),"nativeRuntime":true,"alias":self.store.account_alias(account)?,"autoConnect":auto_connect}),
+-        )
++        let mut status = json!({"id":record.id,"ownUsername":self.profile_username(account)?,"storageMode":record.storage_mode,"schemaCompatibility":record.schema_compatibility,"authenticated":auth,"connection":if auth&&desired==b"connected"{"online"}else if saved&&auto_connect&&desired==b"connected"{"reconnecting"}else{"disconnected"},"incomingTransport":incoming,"contactSyncReady":self.push_connected(account)&&(self.upstream.kind()==crate::upstream::UpstreamKind::Simulator||self.store.runtime(account,"contact-sync-ready")?.as_deref()==Some(self.ownership_generation.as_bytes())),"pendingProjectionBatches":self.store.pending_sync_count(account)?,"pendingCursorProjection":self.store.pending_cursor_projection(account)?,"pendingReadProjections":self.store.pending_reads(account)?,"pendingRecallProjections":self.store.pending_recall_projections(account)?,"pendingMessageRecalls":self.store.pending_message_recalls(account)?,"pendingSavedLoginProjection":self.store.runtime(account,"saved-login-projection-needed")?.is_some()||self.store.runtime(account,"saved-login-publication")?.is_some(),"profileRecoveryPending":self.store.runtime(account,"profile-recovery-pending")?.is_some(),"nativeRuntime":true,"alias":self.store.account_alias(account)?,"autoConnect":auto_connect});
++        status["checkpointMaintenance"] = self.storage_maintenance_health(account)?;
++        Ok(status)
+     }
+     pub fn disconnect(&self, account: &str) -> Result<()> {
+         self.store.clear_runtime(account, "validated-generation")?;
+@@ -845,6 +877,7 @@ impl Core {
+                 return Ok(existing);
+             }
+         }
++        self.require_storage_admission(account)?;
+         let gate = self.gate(account)?;
+         if gate.try_lock().is_err() {
+             bail!("operation_in_progress");
+@@ -1266,7 +1299,7 @@ impl Core {
+         let _guard = gate.lock().await;
+         let core = self.clone();
+         let account = account.to_string();
+-        blocking(move||{let mut state=core.account_state(&account)?;let contacts=core.upstream.native(NativeOptions::default())?.lookup_contacts(&mut state,&ids)?;core.save_state(&account,&state)?;
++        blocking(move||{let mut state=core.account_state(&account)?;core.require_storage_admission(&account)?;let contacts=core.upstream.native(NativeOptions::default())?.lookup_contacts(&mut state,&ids)?;core.save_state(&account,&state)?;
+             Ok(json!({"items":contacts.contacts.into_iter().map(|c|json!({"id":c.username,"displayName":c.remark.or(c.nickname).unwrap_or_else(||c.username.clone()),"alias":c.alias,"profileProjection":"pending"})).collect::<Vec<_>>(),"results":contacts.results}))
+         }).await
+     }
+@@ -1281,7 +1314,7 @@ impl Core {
+         let core = self.clone();
+         let account = account.to_string();
+         let room = room.to_string();
+-        blocking(move||{let mut state=core.account_state(&account)?;let roster=core.upstream.native(NativeOptions::default())?.lookup_room(&mut state,&room,version)?;core.save_state(&account,&state)?;
++        blocking(move||{let mut state=core.account_state(&account)?;core.require_storage_admission(&account)?;let roster=core.upstream.native(NativeOptions::default())?.lookup_room(&mut state,&room,version)?;core.save_state(&account,&state)?;
+             Ok(json!({"id":roster.room_id,"version":roster.version,"items":roster.members.into_iter().map(|m|json!({"id":m.username,"nickname":m.nickname,"roomDisplayName":m.room_display_name})).collect::<Vec<_>>(),"profileProjection":"pending"}))
+         }).await
+     }
+@@ -1438,7 +1471,10 @@ impl Core {
+         };
+         // A replay uses the sealed reference even if the profile row was later
+         // removed or changed. It must never create a second submission.
+-        if quote.is_some() || mentions.is_some() {
++        if quote.is_some()
++            || mentions.is_some()
++            || self.upstream_kind() == crate::upstream::UpstreamKind::Native
++        {
+             let replay = trace.span(TimingStage::QueueReplayCheck);
+             if let Ok(prior) = self.store.send_by_key(account, key) {
+                 let sealed = self.store.send_payload(account, &prior.id)?;
+@@ -1449,7 +1485,7 @@ impl Core {
+                 )?)?;
+                 if old.thread_id != destination
+                     || old.text != text
+-                    || old.share.is_some()
++                    || serde_json::to_value(&old.share)? != serde_json::to_value(&share)?
+                     || old.quote.as_ref().map(|q| &q.target) != quote.as_ref()
+                     || old.mentions.as_ref().map(|m| &m.request) != mentions.as_ref()
+                 {
+@@ -1462,6 +1498,7 @@ impl Core {
+             }
+             replay.finish(TimingOutcome::Ok);
+         }
++        self.require_storage_admission(account)?;
+         let validation = trace.span(TimingStage::QueueAccountValidation);
+         let (state, native_admission) = if let Some(reference) = native_source {
+             let snapshot = self.native_send_snapshot(account, destination, reference)?;
+@@ -1731,6 +1768,15 @@ impl Core {
+                     return Ok(());
+                 }
+             }
++            if core.storage_admission_blocked(&account)? {
++                // The reply is already frozen and queued. Returning an error
++                // here would let the scheduler mark it worker_interrupted.
++                // Leave it recoverable without claiming or calling upstream.
++                trace
++                    .span(TimingStage::Claim)
++                    .finish(TimingOutcome::Pending);
++                return Ok(());
++            }
+             let claim = trace.span(TimingStage::Claim);
+             let claimed = core.store.claim_send(&account, &id);
+             claim.finish(match claimed.as_ref() {
+@@ -2384,13 +2430,28 @@ impl Core {
+     }
+     pub fn shutdown(&self) {
+         self.stopping.store(true, Ordering::SeqCst);
++        self.live_store
++            .as_ref()
++            .unwrap_or(&self.store)
++            .request_checkpoint_stop();
+         if let Ok(cancels) = self.cancels.lock() {
+             for cancel in cancels.values() {
+                 cancel.store(true, Ordering::SeqCst);
+             }
+         }
+     }
++    /// Join local checkpoint maintenance without closing in-flight SQLite handles.
++    pub fn join_checkpoint_worker(&self) {
++        self.live_store
++            .as_ref()
++            .unwrap_or(&self.store)
++            .join_checkpoint_worker();
++    }
+ }
++
++#[cfg(test)]
++#[path = "checkpoint_lifecycle_tests.rs"]
++mod checkpoint_lifecycle_tests;
+ fn login_failure_result(error: &anyhow::Error) -> Value {
+     let message = error.to_string();
+     let code = [
+diff --git a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+index c49b6803cde9e9afa39db72244b3dfbc705f3965..9a41d5a73e7b712d14c8fb2bf13bb8db41efd537 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+@@ -77,6 +77,7 @@ impl Core {
+         let fence = blocking(move || {
+             let _guard = guard;
+             core.repair_blocked_equal_authorization(&owned, &QuoteTrace::default())?;
++            core.require_storage_admission(&owned)?;
+             core.session_fence(&owned)
+         })
+         .await?;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/account_removal.rs b/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
+index b33b95671fb14c09ecabf15a8b33187c293b8014..99b919908b64d2ca6a1ede030b9fc994fc9dffd2 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/account_removal.rs
+@@ -17,7 +17,9 @@ impl Store {
+             .admitted
+             .lock()
+             .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
+-        connections.run(&path, &self._lease, |control| {
++        // Maintenance owns a same-family handle without these global locks.
++        // Refuse an active job instead of joining it while blocking all stores.
++        connections.run_for_removal(&path, &self._lease, |control| {
+             let signed_in: bool = control.query_row("SELECT EXISTS(SELECT 1 FROM runtime WHERE key='account-state') AND NOT EXISTS(SELECT 1 FROM runtime WHERE key='logged-out')", [], |r| r.get(0))?;
+             if signed_in {
+                 bail!("account_sign_out_required");
+diff --git a/packages/native-client-rust/crates/wechat-store/src/admission.rs b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+index 6dd6f21e8b2993e9c316718ad4b1922f95504682..fe9155730eb73a80eaeb5102b80a4f3bedb1f6a9 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/admission.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+@@ -51,6 +51,108 @@ fn member_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+     Ok(path.with_file_name(name))
+ }
+ impl Family {
++    pub(crate) fn try_clone(&self) -> Result<Self> {
++        let mut members = BTreeMap::new();
++        for (suffix, member) in &self.0 {
++            members.insert(
++                *suffix,
++                Member {
++                    file: member.file.try_clone()?,
++                    length: member.length,
++                    modified: member.modified,
++                    #[cfg(unix)]
++                    changed: member.changed,
++                },
++            );
++        }
++        Ok(Self(members))
++    }
++
++    pub(crate) fn exact_control_members(&self) -> bool {
++        self.0.len() == 3
++            && ["", "-wal", "-shm"]
++                .iter()
++                .all(|suffix| self.0.contains_key(suffix))
++    }
++
++    pub(crate) fn exact(&self, path: &Path) -> Result<bool> {
++        self.unchanged(path)
++    }
++
++    pub(crate) fn published_frames(&self, path: &Path) -> Result<u32> {
++        let frames = wal::published_frames(self)?;
++        ensure!(self.exact(path)?, "checkpoint frame family changed");
++        Ok(frames)
++    }
++
++    pub(crate) fn wal_generation(&self, path: &Path) -> Result<Option<[u8; 8]>> {
++        let member = self.0.get("-wal").context("checkpoint WAL missing")?;
++        let name = member_path(path, "-wal")?;
++        // A new descriptor has an independent file offset. File::try_clone
++        // shares offsets on Unix and cannot be used by overlapping observers.
++        let mut file = wechat_platform::OpenOptions::new()
++            .read(true)
++            .custom_flags(wechat_platform::NOFOLLOW)
++            .open(&name)?;
++        ensure!(
++            wechat_platform::private_file(&file)?
++                && wechat_platform::same_path_file(&name, &member.file)?
++                && wechat_platform::same_path_file(&name, &file)?,
++            "checkpoint WAL identity changed"
++        );
++        if member.length == 0 {
++            ensure!(
++                file.metadata()?.len() == 0,
++                "checkpoint WAL changed while reading"
++            );
++            return Ok(None);
++        }
++        let mut header = [0; 32];
++        file.read_exact(&mut header)?;
++        Ok(Some(wal::header_generation(&header)?))
++    }
++
++    /// A finite, already admitted checkpoint epoch can change main and SHM.
++    /// It cannot create companions, replace identities, or write WAL/journal.
++    pub(crate) fn checkpoint_overlap(&self, path: &Path) -> Result<bool> {
++        self.owned_members(path, true)
++    }
++
++    pub(crate) fn control_identities(&self, path: &Path) -> Result<bool> {
++        let current = Self::read(path)?;
++        if !self.exact_control_members() || !current.exact_control_members() {
++            return Ok(false);
++        }
++        for (suffix, member) in &self.0 {
++            if !wechat_platform::same_path_file(&member_path(path, suffix)?, &member.file)? {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    fn owned_members(&self, path: &Path, main_may_change: bool) -> Result<bool> {
++        let current = Self::read(path)?;
++        if !self.exact_control_members() || !current.exact_control_members() {
++            return Ok(false);
++        }
++        for (suffix, before) in &self.0 {
++            let after = &current.0[suffix];
++            if !wechat_platform::same_path_file(&member_path(path, suffix)?, &before.file)? {
++                return Ok(false);
++            }
++            if *suffix == "-shm" || main_may_change && suffix.is_empty() {
++                continue;
++            }
++            let differs = before.length != after.length || before.modified != after.modified;
++            #[cfg(unix)]
++            let differs = differs || before.changed != after.changed;
++            if differs {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
+     pub(crate) fn identities_unchanged(&self, path: &Path, wal_members: bool) -> Result<bool> {
+         let current = Self::read(path)?;
+         for (suffix, member) in &self.0 {
+@@ -186,6 +288,47 @@ impl Family {
+         Ok(format!("{:x}", hash.finalize()))
+     }
+ }
++
++/// Only an extant writer's previously admitted WAL family may gain a second
++/// same-owner maintenance connection. This never copies, recovers or migrates.
++pub(crate) fn open_checkpoint(
++    path: &Path,
++    approved: &Family,
++    lease: &std::sync::Arc<crate::Lease>,
++) -> Result<Connection> {
++    permission_probe(path)?;
++    ensure!(
++        approved.exact_control_members() && approved.exact(path)?,
++        "checkpoint family changed before opening"
++    );
++    let db = connect(path)?;
++    if !matches!(
++        db.set_db_config(
++            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
++            true
++        ),
++        Ok(true)
++    ) {
++        std::mem::forget(db);
++        std::mem::forget(lease.clone());
++        anyhow::bail!("cannot disable checkpoint close maintenance; process restart required");
++    }
++    db.busy_timeout(std::time::Duration::ZERO)?;
++    db.pragma_update(None, "synchronous", "FULL")?;
++    db.pragma_update(None, "wal_autocheckpoint", 0)?;
++    db.pragma_update(None, "trusted_schema", false)?;
++    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
++    let mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
++    ensure!(
++        version == 10 && mode == "wal",
++        "checkpoint requires the admitted current WAL schema"
++    );
++    ensure!(
++        approved.owned_members(path, false)?,
++        "checkpoint family changed while opening"
++    );
++    Ok(db)
++}
+ fn retain_recovery(original: &Path, parent: &Path) -> Result<PathBuf> {
+     let path = original.join("database.sqlite");
+     let family = Family::read(&path)?;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/admission_wal.rs b/packages/native-client-rust/crates/wechat-store/src/admission_wal.rs
+index 283f5c2c398428ec2b1b78c7e6cd8541d9c57e0a..a17d7aef97eab45a20afca5bf98379a207599db2 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/admission_wal.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/admission_wal.rs
+@@ -67,6 +67,27 @@ fn index(member: &Member) -> Result<Option<Published>> {
+     }))
+ }
+ 
++pub(super) fn published_frames(family: &Family) -> Result<u32> {
++    let Some(shm) = family.0.get("-shm") else {
++        return Ok(0);
++    };
++    Ok(index(shm)?.map_or(0, |published| published.frame))
++}
++
++pub(super) fn header_generation(header: &[u8]) -> Result<[u8; 8]> {
++    ensure!(header.len() == 32, "incomplete checkpoint WAL header");
++    let magic = be(header);
++    ensure!(
++        matches!(magic, 0x377f0682 | 0x377f0683) && be(&header[4..]) == 3007000,
++        "unrecognized checkpoint WAL header"
++    );
++    ensure!(
++        checksum(&header[..24], magic & 1 != 0, [0, 0]) == [be(&header[24..]), be(&header[28..])],
++        "invalid checkpoint WAL header checksum"
++    );
++    Ok(header[16..24].try_into().expect("fixed WAL salt slice"))
++}
++
+ /// True requests a durable recovery family for unverified rollback recovery or
+ /// an uninitialized shared index. No source SQLite connection has opened yet.
+ pub(super) fn validate(family: &Family) -> Result<bool> {
+diff --git a/packages/native-client-rust/crates/wechat-store/src/background_checkpoint_tests.rs b/packages/native-client-rust/crates/wechat-store/src/background_checkpoint_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..936ffd54d4619ad0a32a22a2961e44f3eac11016
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/background_checkpoint_tests.rs
+@@ -0,0 +1,762 @@
++use super::*;
++use std::io::{Read, Seek, SeekFrom, Write};
++
++fn until(mut ready: impl FnMut() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while Instant::now() < deadline {
++        if ready() {
++            return;
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    assert!(ready(), "checkpoint condition did not finish");
++}
++
++fn prepared() -> (tempfile::TempDir, Arc<Store>) {
++    let tmp = tempfile::tempdir().unwrap();
++    let store = Arc::new(Store::open(&tmp.path().join("data")).unwrap());
++    store.create_account("one").unwrap();
++    drop(store.read_snapshot("one").unwrap());
++    (tmp, store)
++}
++
++fn resident(store: &Store) -> Arc<Ticket> {
++    let path = store
++        .account_dir("one")
++        .unwrap()
++        .join("agent/control.sqlite");
++    store
++        .checkpoints
++        .as_ref()
++        .unwrap()
++        .shared
++        .tickets
++        .lock()
++        .unwrap()
++        .get(&path)
++        .unwrap()
++        .clone()
++}
++
++fn enabled() -> (tempfile::TempDir, Arc<Store>, Arc<Ticket>) {
++    let (tmp, store) = prepared();
++    store.enable_background_checkpoints().unwrap();
++    let ticket = resident(&store);
++    until(|| {
++        let state = ticket.state.lock().unwrap();
++        state.completed > 0 && state.phase == Phase::Idle
++    });
++    (tmp, store, ticket)
++}
++
++fn request(ticket: &Ticket) {
++    ticket.requested.store(true, Ordering::Release);
++    ticket.wake();
++}
++
++fn arm(slot: &Mutex<Option<Arc<TestGate>>>) -> Arc<TestGate> {
++    let gate = Arc::new(TestGate::default());
++    *slot.lock().unwrap() = Some(gate.clone());
++    gate
++}
++
++#[test]
++fn ordinary_and_snapshot_stores_keep_the_original_policy() {
++    let (_tmp, store) = prepared();
++    assert_eq!(store.checkpoint_health("one").unwrap()["enabled"], false);
++    store
++        .control("one", |db| {
++            assert_eq!(
++                db.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
++                2
++            );
++            assert_eq!(
++                db.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))?,
++                1000
++            );
++            Ok(())
++        })
++        .unwrap();
++    store.enable_background_checkpoints().unwrap();
++    let snapshot = store.read_snapshot("one").unwrap();
++    assert_eq!(snapshot.checkpoint_health("one").unwrap()["enabled"], false);
++    drop(snapshot);
++    store
++        .put_runtime("one", "snapshot-drop", b"preserved")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "snapshot-drop").unwrap().unwrap(),
++        b"preserved"
++    );
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], false);
++}
++
++#[test]
++fn foreground_completes_while_running_maintenance_has_no_global_locks() {
++    let (_tmp, store, ticket) = enabled();
++    let gate = arm(&ticket.gates.before_sql);
++    request(&ticket);
++    gate.entered();
++    assert_eq!(
++        ticket.state.lock().unwrap().phase as u8,
++        Phase::Running as u8
++    );
++    assert!(store.db.try_lock().is_ok());
++    assert!(store.admitted.try_lock().is_ok());
++    store.put_runtime("one", "concurrent-full", b"yes").unwrap();
++    assert_eq!(
++        store.runtime("one", "concurrent-full").unwrap().unwrap(),
++        b"yes"
++    );
++    assert_eq!(
++        store.remove_account("one").unwrap_err().to_string(),
++        "operation_in_progress"
++    );
++    assert!(store.account("one").is_ok());
++    gate.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Idle);
++}
++
++#[test]
++fn finishing_waits_for_last_foreground_and_cannot_start_a_second_job() {
++    let (_tmp, store, ticket) = enabled();
++    let before = arm(&ticket.gates.before_sql);
++    let after = arm(&ticket.gates.after_sql);
++    request(&ticket);
++    before.entered();
++    let callback = Arc::new(TestGate::default());
++    let held = callback.clone();
++    let active = store.clone();
++    let foreground = std::thread::spawn(move || {
++        active.control("one", |db| {
++            db.execute(
++                "INSERT INTO runtime(key,value) VALUES('finishing',X'31')",
++                [],
++            )?;
++            held.pause();
++            Ok(())
++        })
++    });
++    callback.entered();
++    before.release();
++    after.entered();
++    after.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Finishing);
++    let completed = ticket.state.lock().unwrap().completed;
++    request(&ticket);
++    std::thread::sleep(Duration::from_millis(60));
++    assert_eq!(ticket.state.lock().unwrap().completed, completed);
++    callback.release();
++    foreground.join().unwrap().unwrap();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Idle);
++    assert_eq!(store.runtime("one", "finishing").unwrap().unwrap(), b"1");
++}
++
++#[test]
++fn returned_handle_precedes_idle_and_retirement_after_sql() {
++    let (tmp, store, ticket) = enabled();
++    let after = arm(&ticket.gates.after_sql);
++    request(&ticket);
++    after.entered();
++    store.put_runtime("one", "after-sql", b"full").unwrap();
++    assert_eq!(
++        store.remove_account("one").unwrap_err().to_string(),
++        "operation_in_progress"
++    );
++    after.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Idle);
++    assert!(ticket.connection.lock().unwrap().is_some());
++    store.remove_account("one").unwrap();
++    assert!(ticket.connection.lock().unwrap().is_none());
++    drop(ticket);
++    let root = tmp.path().join("data");
++    drop(store);
++    assert!(
++        Store::open_existing(&root).is_ok(),
++        "normal retirement must not leak ownership"
++    );
++}
++
++#[test]
++fn completion_seal_is_consumed_once_without_reopening_the_resident_writer() {
++    let (_tmp, store, ticket) = enabled();
++    store
++        .put_runtime("one", "seal", &vec![7; 32 * 1024])
++        .unwrap();
++    let generation = ticket.generation;
++    let completed = ticket.state.lock().unwrap().completed;
++    request(&ticket);
++    until(|| {
++        let state = ticket.state.lock().unwrap();
++        state.completed > completed && state.phase == Phase::Idle && state.transfer
++    });
++    assert!(
++        !admission::known_unchanged(&store.admitted.lock().unwrap().admitted, &ticket.path)
++            .unwrap()
++    );
++    assert_eq!(
++        store.runtime("one", "seal").unwrap().unwrap(),
++        vec![7; 32 * 1024]
++    );
++    assert_eq!(resident(&store).generation, generation);
++    assert!(!ticket.state.lock().unwrap().transfer);
++}
++
++#[test]
++fn idle_metadata_change_does_not_run_checkpoint_or_bypass_original_admission() {
++    let (_tmp, store, ticket) = enabled();
++    let before = arm(&ticket.gates.before_admission);
++    let completed = ticket.state.lock().unwrap().completed;
++    request(&ticket);
++    before.entered();
++    let mut main = fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(&ticket.path)
++        .unwrap();
++    let mut byte = [0];
++    main.read_exact(&mut byte).unwrap();
++    main.seek(SeekFrom::Start(0)).unwrap();
++    main.write_all(&byte).unwrap();
++    main.sync_all().unwrap();
++    before.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Retired);
++    assert_eq!(ticket.state.lock().unwrap().completed, completed);
++    store.put_runtime("one", "revalidated", b"ok").unwrap();
++    assert_eq!(store.runtime("one", "revalidated").unwrap().unwrap(), b"ok");
++    assert_ne!(resident(&store).generation, ticket.generation);
++}
++
++#[test]
++fn unknown_wal_change_at_completion_is_preserved_and_quarantined() {
++    let (_tmp, store, ticket) = enabled();
++    let after = arm(&ticket.gates.after_sql);
++    request(&ticket);
++    after.entered();
++    let wal = ticket.path.with_file_name("control.sqlite-wal");
++    fs::OpenOptions::new()
++        .append(true)
++        .open(&wal)
++        .unwrap()
++        .write_all(b"unknown-trailing-byte")
++        .unwrap();
++    let retained = fs::read(&wal).unwrap();
++    after.release();
++    until(|| ticket.poisoned());
++    assert!(store.runtime("one", "not-read").is_err());
++    assert_eq!(fs::read(&wal).unwrap(), retained);
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++}
++
++#[test]
++fn silently_clearing_the_notify_hook_is_a_configuration_error() {
++    let (_tmp, store, _ticket) = enabled();
++    let error = store
++        .control("one", |db| {
++            db.pragma_update(None, "wal_autocheckpoint", 0)?;
++            Ok(())
++        })
++        .unwrap_err();
++    assert!(error.to_string().contains("hook changed"));
++    assert!(store.runtime("one", "not-read").is_err());
++}
++
++#[test]
++fn maintenance_io_failure_does_not_change_accepted_send_or_later_full_writes() {
++    let (_tmp, store, ticket) = enabled();
++    let (send, _) = store
++        .create_send("one", "io-case", "peer", "hash", b"cipher", "101")
++        .unwrap();
++    store
++        .put_runtime("one", &format!("quote-receipt:{}", send.id), b"retained")
++        .unwrap();
++    store
++        .update_send("one", &send.id, "accepted", Some("901"), None)
++        .unwrap();
++    ticket
++        .gates
++        .forced_rc
++        .store(rusqlite::ffi::SQLITE_BUSY, Ordering::Release);
++    request(&ticket);
++    until(|| store.checkpoint_health("one").unwrap()["lastOutcome"] == "busy");
++    assert_eq!(
++        store.checkpoint_health("one").unwrap()["lastRc"],
++        rusqlite::ffi::SQLITE_BUSY
++    );
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], false);
++    ticket
++        .gates
++        .forced_rc
++        .store(rusqlite::ffi::SQLITE_IOERR, Ordering::Release);
++    request(&ticket);
++    until(|| store.checkpoint_health("one").unwrap()["state"] == "fault");
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], false);
++    let accepted = store.send("one", &send.id).unwrap();
++    assert_eq!(accepted.state, "accepted");
++    assert_eq!(accepted.server_id.as_deref(), Some("901"));
++    assert_eq!(
++        store
++            .runtime("one", &format!("quote-receipt:{}", send.id))
++            .unwrap()
++            .unwrap(),
++        b"retained"
++    );
++    store
++        .put_runtime("one", "still-full", b"persisted")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "still-full").unwrap().unwrap(),
++        b"persisted"
++    );
++    ticket.gates.forced_rc.store(0, Ordering::Release);
++    request(&ticket);
++    until(|| store.checkpoint_health("one").unwrap()["state"] == "ready");
++}
++
++#[test]
++fn long_reader_retries_are_bounded_and_resume_without_another_write() {
++    let (_tmp, store, ticket) = enabled();
++    let reader = store.read_snapshot("one").unwrap();
++    store
++        .put_runtime("one", "reader-held", &vec![8; 64 * 1024])
++        .unwrap();
++    let completed = ticket.state.lock().unwrap().completed;
++    request(&ticket);
++    until(|| ticket.state.lock().unwrap().completed > completed);
++    let first = ticket.state.lock().unwrap().completed;
++    assert_eq!(store.checkpoint_health("one").unwrap()["pending"], true);
++    std::thread::sleep(Duration::from_millis(60));
++    assert_eq!(ticket.state.lock().unwrap().completed, first);
++    drop(reader);
++    until(|| {
++        let state = ticket.state.lock().unwrap();
++        state.completed > first
++            && state.checkpointed_frames == state.log_frames
++            && !ticket.requested.load(Ordering::Acquire)
++    });
++}
++
++#[test]
++fn shutdown_request_keeps_inflight_and_later_local_result_persistence_working() {
++    let (tmp, store, ticket) = enabled();
++    let held = Arc::new(TestGate::default());
++    let callback = held.clone();
++    let writing = store.clone();
++    let task = std::thread::spawn(move || {
++        writing.control("one", |db| {
++            db.execute(
++                "INSERT INTO runtime(key,value) VALUES('shutdown-result',X'31')",
++                [],
++            )?;
++            callback.pause();
++            Ok(())
++        })
++    });
++    held.entered();
++    store.request_checkpoint_stop();
++    assert!(ticket.connection.lock().unwrap().is_some());
++    held.release();
++    task.join().unwrap().unwrap();
++    store
++        .put_runtime("one", "shutdown-followup", b"retained")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "shutdown-result").unwrap().unwrap(),
++        b"1"
++    );
++    assert_eq!(store.checkpoint_health("one").unwrap()["stopping"], true);
++    drop(ticket);
++    let root = tmp.path().join("data");
++    drop(store);
++    let store = Store::open_existing(&root).unwrap();
++    assert_eq!(
++        store.runtime("one", "shutdown-followup").unwrap().unwrap(),
++        b"retained"
++    );
++}
++
++#[test]
++fn valid_wal_generation_salts_prevent_old_backfill_hiding_a_large_reset_transaction() {
++    let (tmp, store, ticket) = enabled();
++    store.request_checkpoint_stop();
++    store
++        .put_runtime("one", "old-generation", &vec![1; 64 * 1024])
++        .unwrap();
++    drop(ticket);
++    let root = tmp.path().join("data");
++    drop(store);
++    let store = Arc::new(Store::open_existing(&root).unwrap());
++    store.enable_background_checkpoints().unwrap();
++    let ticket = resident(&store);
++    until(|| {
++        let state = ticket.state.lock().unwrap();
++        state.completed > 0
++            && state.phase == Phase::Idle
++            && state.checkpointed_frames == state.log_frames
++    });
++    let old_salt = ticket.state.lock().unwrap().wal_salt;
++    let old_frames = ticket.state.lock().unwrap().checkpointed_frames;
++    let reader = store.read_snapshot("one").unwrap();
++    store
++        .put_runtime("one", "large-new-generation", &vec![2; 1024 * 1024])
++        .unwrap();
++    let current_frames = ticket.frames.load(Ordering::Acquire);
++    assert!(current_frames >= old_frames);
++    assert_ne!(ticket.state.lock().unwrap().wal_salt, old_salt);
++    let health = store.checkpoint_health("one").unwrap();
++    assert_eq!(
++        health["uncheckpointedFrames"].as_i64().unwrap(),
++        current_frames
++    );
++    drop(reader);
++}
++
++#[test]
++fn explicit_pressure_blocks_new_admission_without_changing_local_commit_outcomes() {
++    let (_tmp, store, ticket) = enabled();
++    ticket.state.lock().unwrap().free_bytes = Some(0);
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++    store
++        .put_runtime("one", "already-inflight", b"full")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "already-inflight").unwrap().unwrap(),
++        b"full"
++    );
++    ticket.state.lock().unwrap().free_bytes = Some(MIN_FREE + 1);
++    ticket.frames.store(MAX_FRAMES + 1, Ordering::Release);
++    ticket.state.lock().unwrap().checkpointed_frames = 0;
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++}
++
++#[test]
++fn callback_error_during_checkpoint_retires_without_poisoning_a_known_family() {
++    let (_tmp, store, ticket) = enabled();
++    let before = arm(&ticket.gates.before_sql);
++    request(&ticket);
++    before.entered();
++    let error = store
++        .control("one", |_| {
++            Err::<(), _>(anyhow::anyhow!("synthetic_callback_error"))
++        })
++        .unwrap_err();
++    assert_eq!(error.to_string(), "synthetic_callback_error");
++    assert!(!ticket.poisoned());
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++    assert!(store
++        .runtime("one", "busy-before-callback")
++        .unwrap_err()
++        .is::<MaintenanceBusy>());
++    assert!(!ticket.poisoned());
++    before.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Retired);
++    until(|| store.checkpoint_health("one").unwrap()["blocked"] == false);
++    store.put_runtime("one", "after-error", b"full").unwrap();
++    assert_eq!(
++        store.runtime("one", "after-error").unwrap().unwrap(),
++        b"full"
++    );
++    assert_ne!(resident(&store).generation, ticket.generation);
++}
++
++#[test]
++fn active_checkpoint_eviction_is_a_typed_busy_without_removing_the_writer() {
++    let (_tmp, store, ticket) = enabled();
++    let before = arm(&ticket.gates.before_sql);
++    request(&ticket);
++    before.entered();
++    let mut connections = store.admitted.lock().unwrap();
++    let count = connections.cached_writers();
++    let error = connections.evict(&ticket.path, &store._lease).unwrap_err();
++    assert!(error.is::<MaintenanceBusy>());
++    assert_eq!(connections.cached_writers(), count);
++    assert!(!ticket.poisoned());
++    drop(connections);
++    before.release();
++    until(|| ticket.state.lock().unwrap().phase == Phase::Idle);
++    store
++        .admitted
++        .lock()
++        .unwrap()
++        .evict(&ticket.path, &store._lease)
++        .unwrap();
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++}
++
++#[test]
++fn unfinished_transaction_rolls_back_and_recovers_while_checkpoint_is_active() {
++    let (_tmp, store, ticket) = enabled();
++    let before = arm(&ticket.gates.before_sql);
++    request(&ticket);
++    before.entered();
++    let error = store
++        .control("one", |db| {
++            db.execute_batch(
++                "BEGIN; INSERT INTO runtime(key,value) VALUES('must-rollback',X'31');",
++            )?;
++            Ok(())
++        })
++        .unwrap_err();
++    assert!(error.to_string().contains("unfinished transaction"));
++    assert!(!ticket.poisoned());
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++    before.release();
++    until(|| store.checkpoint_health("one").unwrap()["blocked"] == false);
++    assert!(store.runtime("one", "must-rollback").unwrap().is_none());
++    store.put_runtime("one", "after-rollback", b"full").unwrap();
++    assert_eq!(
++        store.runtime("one", "after-rollback").unwrap().unwrap(),
++        b"full"
++    );
++    assert_ne!(resident(&store).generation, ticket.generation);
++}
++
++#[test]
++fn retiring_close_race_waits_outside_global_locks_and_executes_callback_once() {
++    let (_tmp, store, ticket) = enabled();
++    store.create_account("two").unwrap();
++    store.put_runtime("two", "prepared", b"yes").unwrap();
++    let before_sql = arm(&ticket.gates.before_sql);
++    let before_retirement = arm(&ticket.gates.before_retirement);
++    let before_close = arm(&ticket.gates.before_close);
++    let before_revalidation = arm(&ticket.gates.before_revalidation_close);
++    request(&ticket);
++    before_sql.entered();
++    assert_eq!(
++        store
++            .control("one", |_| Err::<(), _>(anyhow::anyhow!("clean_error")))
++            .unwrap_err()
++            .to_string(),
++        "clean_error"
++    );
++    before_sql.release();
++    before_retirement.entered();
++    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let counted = calls.clone();
++    let active = store.clone();
++    let foreground = std::thread::spawn(move || {
++        active.control("one", |db| {
++            counted.fetch_add(1, Ordering::AcqRel);
++            db.execute(
++                "INSERT INTO runtime(key,value) VALUES('after-close-race',X'31')",
++                [],
++            )?;
++            Ok(())
++        })
++    });
++    // begin observed Retired, but the worker wins the subsequent close reservation.
++    before_revalidation.entered();
++    before_retirement.release();
++    before_close.entered();
++    assert!(ticket.state.lock().unwrap().closing);
++    before_revalidation.release();
++    until(|| store.db.try_lock().is_ok() && store.admitted.try_lock().is_ok());
++    assert_eq!(calls.load(Ordering::Acquire), 0);
++    assert_eq!(store.checkpoint_health("one").unwrap()["state"], "closing");
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], true);
++    {
++        // Also exercise begin when closing was already visible, not just the
++        // None-to-close reservation race. The known primary remains cached.
++        let mut connections = store.admitted.lock().unwrap();
++        let count = connections.cached_writers();
++        let error = connections
++            .run::<()>(&ticket.path, &store._lease, |_| {
++                panic!("closing must not execute the callback")
++            })
++            .unwrap_err();
++        assert!(error.is::<MaintenanceBusy>());
++        assert_eq!(connections.cached_writers(), count);
++        assert!(Arc::ptr_eq(
++            &connections.resident_ticket(&ticket.path).unwrap(),
++            &ticket
++        ));
++    }
++    assert!(!ticket.poisoned());
++    store
++        .put_runtime("two", "while-one-closes", b"allowed")
++        .unwrap();
++    assert_eq!(calls.load(Ordering::Acquire), 0);
++    let waited = Arc::new(AtomicBool::new(false));
++    let finished = waited.clone();
++    let waiting = store.clone();
++    let public_wait = std::thread::spawn(move || {
++        waiting.wait_checkpoint_retirement("one")?;
++        finished.store(true, Ordering::Release);
++        Ok::<_, anyhow::Error>(())
++    });
++    assert!(!waited.load(Ordering::Acquire));
++    before_close.release();
++    foreground.join().unwrap().unwrap();
++    public_wait.join().unwrap().unwrap();
++    assert_eq!(calls.load(Ordering::Acquire), 1);
++    assert!(waited.load(Ordering::Acquire));
++    assert!(!ticket.poisoned());
++    assert_eq!(
++        store.runtime("one", "after-close-race").unwrap().unwrap(),
++        b"1"
++    );
++    assert_eq!(store.checkpoint_health("one").unwrap()["blocked"], false);
++    assert_ne!(resident(&store).generation, ticket.generation);
++}
++
++#[test]
++fn concurrent_worker_joins_wait_for_sql_without_closing_inflight_handles() {
++    let (tmp, store, ticket) = enabled();
++    let before_sql = arm(&ticket.gates.before_sql);
++    request(&ticket);
++    before_sql.entered();
++    let held = Arc::new(TestGate::default());
++    let callback = held.clone();
++    let active = store.clone();
++    let foreground = std::thread::spawn(move || {
++        active.control("one", |db| {
++            db.execute(
++                "INSERT INTO runtime(key,value) VALUES('before-worker-join',X'31')",
++                [],
++            )?;
++            callback.pause();
++            db.execute(
++                "INSERT INTO runtime(key,value) VALUES('after-worker-join',X'32')",
++                [],
++            )?;
++            Ok(())
++        })
++    });
++    held.entered();
++    let returned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let first_store = store.clone();
++    let first_returned = returned.clone();
++    let first = std::thread::spawn(move || {
++        first_store.join_checkpoint_worker();
++        first_returned.fetch_add(1, Ordering::AcqRel);
++    });
++    let manager = store.checkpoints.as_ref().unwrap();
++    until(|| manager.shared.stopping.load(Ordering::Acquire) && manager.worker.try_lock().is_err());
++    let second_started = Arc::new(AtomicBool::new(false));
++    let second_entered = second_started.clone();
++    let second_store = store.clone();
++    let second_returned = returned.clone();
++    let second = std::thread::spawn(move || {
++        second_entered.store(true, Ordering::Release);
++        second_store.join_checkpoint_worker();
++        second_returned.fetch_add(1, Ordering::AcqRel);
++    });
++    until(|| second_started.load(Ordering::Acquire));
++    assert_eq!(returned.load(Ordering::Acquire), 0);
++    before_sql.release();
++    first.join().unwrap();
++    second.join().unwrap();
++    assert_eq!(returned.load(Ordering::Acquire), 2);
++    assert!(ticket.connection.lock().unwrap().is_some());
++    assert!(store.db.try_lock().is_err(), "foreground is still active");
++    held.release();
++    foreground.join().unwrap().unwrap();
++    store
++        .put_runtime("one", "joined-followup", b"full")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "after-worker-join").unwrap().unwrap(),
++        b"2"
++    );
++    drop(ticket);
++    let root = tmp.path().join("data");
++    drop(store);
++    let reopened = Store::open_existing(&root).unwrap();
++    assert_eq!(
++        reopened
++            .runtime("one", "before-worker-join")
++            .unwrap()
++            .unwrap(),
++        b"1"
++    );
++    assert_eq!(
++        reopened
++            .runtime("one", "after-worker-join")
++            .unwrap()
++            .unwrap(),
++        b"2"
++    );
++    assert_eq!(
++        reopened.runtime("one", "joined-followup").unwrap().unwrap(),
++        b"full"
++    );
++}
++
++#[test]
++fn control_burst_defers_checkpoint_without_hiding_pending_age_or_health_observation() {
++    let (_tmp, store, ticket) = enabled();
++    store.create_account("two").unwrap();
++    let before_sql = arm(&ticket.gates.before_sql);
++    let completed = ticket.state.lock().unwrap().completed;
++    // Publish due while a real foreground is active so the worker cannot win
++    // the request-to-first-control race before this fixture begins its burst.
++    store
++        .control("one", |_| {
++            request(&ticket);
++            Ok(())
++        })
++        .unwrap();
++    let first_due = ticket.state.lock().unwrap().pending_since.unwrap();
++    for _ in 0..6 {
++        std::thread::sleep(Duration::from_millis(20));
++        store.runtime("one", "idle-burst-read").unwrap();
++        let state = ticket.state.lock().unwrap();
++        assert_eq!(state.pending_since, Some(first_due));
++        assert_eq!(state.completed, completed);
++        assert!(!before_sql.state.lock().unwrap().0);
++    }
++    let last_activity = ticket.state.lock().unwrap().last_foreground_activity;
++    let health = store.checkpoint_health("one").unwrap();
++    assert!(health["pendingAgeMs"].as_u64().unwrap() >= 100);
++    assert_eq!(
++        ticket.state.lock().unwrap().last_foreground_activity,
++        last_activity
++    );
++    // Another account's control activity is outside this ticket's quiet clock.
++    store
++        .put_runtime("two", "other-account", b"independent")
++        .unwrap();
++    assert_eq!(
++        ticket.state.lock().unwrap().last_foreground_activity,
++        last_activity
++    );
++    before_sql.entered();
++    assert!(last_activity.elapsed() >= IDLE_DELAY);
++    assert_eq!(ticket.state.lock().unwrap().pending_since, Some(first_due));
++    before_sql.release();
++    until(|| ticket.state.lock().unwrap().completed > completed);
++}
++
++#[test]
++fn original_pressure_caps_bypass_idle_delay_but_keep_real_passive_sql() {
++    for pressure in 0..3 {
++        let (_tmp, store, ticket) = enabled();
++        // Join only the asynchronous runner to call the same admission/SQLite
++        // path deterministically. The admitted maintenance handle stays open.
++        store.join_checkpoint_worker();
++        store
++            .control("one", |_| {
++                request(&ticket);
++                Ok(())
++            })
++            .unwrap();
++        let completed = {
++            let mut state = ticket.state.lock().unwrap();
++            match pressure {
++                0 => {
++                    state.checkpointed_frames = 0;
++                    ticket.frames.store(MAX_FRAMES, Ordering::Release);
++                }
++                1 => state.free_bytes = Some(MIN_FREE - 1),
++                _ => state.pending_since = Some(Instant::now() - MAX_AGE),
++            }
++            assert!(state.last_foreground_activity.elapsed() < IDLE_DELAY);
++            state.completed
++        };
++        ticket.run_due();
++        let state = ticket.state.lock().unwrap();
++        assert_eq!(state.completed, completed + 1);
++        assert_eq!(state.last_rc, rusqlite::ffi::SQLITE_OK);
++        assert_eq!(state.phase as u8, Phase::Idle as u8);
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/background_checkpoints.rs b/packages/native-client-rust/crates/wechat-store/src/background_checkpoints.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f1eecb91255422cc9c559f8b37de70824a4db50
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/background_checkpoints.rs
+@@ -0,0 +1,1134 @@
++//! Same-owner WAL maintenance. Successful FULL commits never depend on this job.
++use crate::*;
++use std::sync::{
++    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
++    Condvar, Weak,
++};
++use std::time::{Duration, Instant};
++
++pub(crate) const FRAME_THRESHOLD: i64 = 1000;
++const MAX_FRAMES: i64 = 32768;
++const MIN_FREE: u64 = 64 * 1024 * 1024;
++const MAX_AGE: Duration = Duration::from_secs(60);
++const RETRY: Duration = Duration::from_millis(250);
++const IDLE_DELAY: Duration = Duration::from_millis(100);
++
++fn checkpoint_pressure(backlog: i64, free: Option<u64>, age: Option<Duration>) -> bool {
++    backlog >= MAX_FRAMES
++        || free.is_some_and(|bytes| bytes < MIN_FREE)
++        || age.is_some_and(|age| age >= MAX_AGE)
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Phase {
++    Idle,
++    Running,
++    Finishing,
++    Poisoned,
++    Retired,
++}
++
++struct State {
++    phase: Phase,
++    foreground: usize,
++    approved: admission::Family,
++    latest_foreground: admission::Family,
++    transfer: bool,
++    epoch: u64,
++    retiring: bool,
++    closing: bool,
++    closed: bool,
++    retry_at: Instant,
++    last_foreground_activity: Instant,
++    pending_since: Option<Instant>,
++    error: Option<&'static str>,
++    log_frames: i64,
++    checkpointed_frames: i64,
++    completed: u64,
++    free_bytes: Option<u64>,
++    checkpoint_generation: u64,
++    wal_salt: Option<[u8; 8]>,
++    space_error: bool,
++    last_rc: i32,
++    last_outcome: &'static str,
++}
++
++pub(crate) struct Ticket {
++    path: PathBuf,
++    generation: u64,
++    lease: Arc<Lease>,
++    shared: Weak<Shared>,
++    state: Mutex<State>,
++    connection: Mutex<Option<Connection>>,
++    requested: AtomicBool,
++    frames: AtomicI64,
++    signals: AtomicU64,
++    wal_generation: AtomicU64,
++    #[cfg(test)]
++    gates: TestGates,
++}
++
++#[cfg(test)]
++#[derive(Default)]
++struct TestGates {
++    before_admission: Mutex<Option<Arc<TestGate>>>,
++    before_sql: Mutex<Option<Arc<TestGate>>>,
++    after_sql: Mutex<Option<Arc<TestGate>>>,
++    before_retirement: Mutex<Option<Arc<TestGate>>>,
++    before_close: Mutex<Option<Arc<TestGate>>>,
++    before_revalidation_close: Mutex<Option<Arc<TestGate>>>,
++    forced_rc: std::sync::atomic::AtomicI32,
++}
++
++#[cfg(test)]
++#[derive(Default)]
++struct TestGate {
++    state: Mutex<(bool, bool)>,
++    wake: Condvar,
++}
++
++#[cfg(test)]
++impl TestGate {
++    fn pause(&self) {
++        let mut state = self.state.lock().unwrap();
++        state.0 = true;
++        self.wake.notify_all();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !state.1 && Instant::now() < deadline {
++            state = self
++                .wake
++                .wait_timeout(state, Duration::from_millis(20))
++                .unwrap()
++                .0;
++        }
++    }
++    fn entered(&self) {
++        let mut state = self.state.lock().unwrap();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !state.0 && Instant::now() < deadline {
++            state = self
++                .wake
++                .wait_timeout(state, Duration::from_millis(20))
++                .unwrap()
++                .0;
++        }
++        assert!(state.0, "checkpoint test gate was not reached");
++    }
++    fn release(&self) {
++        self.state.lock().unwrap().1 = true;
++        self.wake.notify_all();
++    }
++}
++
++#[cfg(test)]
++fn test_pause(slot: &Mutex<Option<Arc<TestGate>>>) {
++    let gate = slot.lock().unwrap().clone();
++    if let Some(gate) = gate {
++        gate.pause();
++    }
++}
++
++pub(crate) struct Hook(pub(crate) Arc<Ticket>);
++
++#[derive(Debug)]
++pub(crate) struct MaintenanceBusy;
++impl std::fmt::Display for MaintenanceBusy {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("operation_in_progress")
++    }
++}
++impl std::error::Error for MaintenanceBusy {}
++
++// SQLite calls this after the FULL commit has completed. It cannot acquire a
++// Rust mutex, inspect a path, allocate a task, report failure or run checkpoint.
++pub(crate) unsafe extern "C" fn notify(
++    data: *mut std::ffi::c_void,
++    _db: *mut rusqlite::ffi::sqlite3,
++    name: *const std::ffi::c_char,
++    frames: std::ffi::c_int,
++) -> std::ffi::c_int {
++    if data.is_null() || name.is_null() || frames < 0 {
++        return rusqlite::ffi::SQLITE_OK;
++    }
++    // SAFETY: SQLite owns the static database-name argument for this callback;
++    // the writer retains Hook until unregister, including quarantine.
++    let main = unsafe { std::ffi::CStr::from_ptr(name).to_bytes() == b"main" };
++    if main {
++        // SAFETY: register_hook supplies a live stable Box<Hook> pointer.
++        let hook = unsafe { &*(data.cast::<Hook>()) };
++        hook.0.frames.store(i64::from(frames), Ordering::Release);
++        if i64::from(frames) >= FRAME_THRESHOLD {
++            hook.0.signals.fetch_add(1, Ordering::AcqRel);
++            hook.0.requested.store(true, Ordering::Release);
++            hook.0.wake();
++        }
++    }
++    rusqlite::ffi::SQLITE_OK
++}
++
++pub(crate) fn register_hook(db: &Connection, ticket: Arc<Ticket>) -> Box<Hook> {
++    let mut hook = Box::new(Hook(ticket));
++    // SAFETY: db is the exclusively checked-out foreground connection. Hook's
++    // Box is retained alongside it and removed only before a proven safe close.
++    unsafe {
++        rusqlite::ffi::sqlite3_wal_hook(
++            db.handle(),
++            Some(notify),
++            (&mut *hook as *mut Hook).cast(),
++        );
++    }
++    hook
++}
++
++pub(crate) fn unregister_hook(db: &Connection) {
++    // SAFETY: the writer is exclusively owned here and has no active callback.
++    unsafe {
++        rusqlite::ffi::sqlite3_wal_hook(db.handle(), None, std::ptr::null_mut());
++    }
++}
++
++pub(crate) fn verify_hook(db: &Connection, hook: &Hook) -> Result<()> {
++    let pointer = (hook as *const Hook).cast_mut().cast::<std::ffi::c_void>();
++    // SAFETY: only this checked-out writer uses the handle. Reinstalling its
++    // exact hook returns the previous userdata without invoking a callback.
++    let previous = unsafe { rusqlite::ffi::sqlite3_wal_hook(db.handle(), Some(notify), pointer) };
++    anyhow::ensure!(previous == pointer, "account checkpoint hook changed");
++    Ok(())
++}
++
++fn preserve_connection(db: Connection, lease: &Arc<Lease>) {
++    std::mem::forget(db);
++    std::mem::forget(lease.clone());
++}
++
++fn close_connection(db: Connection, lease: &Arc<Lease>) -> Result<()> {
++    let protected = db.set_db_config(
++        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
++        true,
++    );
++    if !matches!(protected, Ok(true)) || !db.is_autocommit() {
++        preserve_connection(db, lease);
++        bail!("checkpoint connection unavailable; process restart required");
++    }
++    match db.close() {
++        Ok(()) => Ok(()),
++        Err((db, error)) => {
++            preserve_connection(db, lease);
++            Err(error.into())
++        }
++    }
++}
++
++impl Ticket {
++    fn frames_and_backlog(&self, state: &State) -> (i64, i64) {
++        let observed = self.frames.load(Ordering::Acquire);
++        let frames = if observed > 0 {
++            observed
++        } else {
++            state.log_frames.max(0)
++        };
++        let backlog = if self.wal_generation.load(Ordering::Acquire) == state.checkpoint_generation
++        {
++            (frames - state.checkpointed_frames.max(0)).max(0)
++        } else {
++            frames
++        };
++        (frames, backlog)
++    }
++
++    fn record_foreground_finish(&self, state: &mut State) {
++        let now = Instant::now();
++        state.last_foreground_activity = now;
++        if self.requested.load(Ordering::Acquire) {
++            // Start at the first due commit, not when idle later permits SQL.
++            // Continued control traffic must not hide the existing age cap.
++            state.pending_since.get_or_insert(now);
++        }
++    }
++
++    fn wake(&self) {
++        if let Some(shared) = self.shared.upgrade() {
++            shared.wake.notify_one();
++        }
++    }
++
++    pub(crate) fn generation(&self) -> u64 {
++        self.generation
++    }
++
++    pub(crate) fn active(&self) -> bool {
++        self.state
++            .lock()
++            .map(|s| s.foreground > 0 || matches!(s.phase, Phase::Running | Phase::Finishing))
++            .unwrap_or(true)
++    }
++
++    pub(crate) fn poisoned(&self) -> bool {
++        self.state
++            .lock()
++            .map(|s| s.phase == Phase::Poisoned)
++            .unwrap_or(true)
++    }
++
++    pub(crate) fn poison(&self, code: &'static str) {
++        if let Ok(mut state) = self.state.lock() {
++            state.phase = Phase::Poisoned;
++            state.error = Some(code);
++        }
++        self.requested.store(false, Ordering::Release);
++        self.wake();
++    }
++
++    pub(crate) fn begin(
++        self: &Arc<Self>,
++        cache: &mut admission::AdmissionCache,
++    ) -> Result<Option<Foreground>> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint state unavailable"))?;
++        anyhow::ensure!(
++            state.phase != Phase::Poisoned,
++            "account connection unavailable; process restart required"
++        );
++        if state.closing {
++            return Err(MaintenanceBusy.into());
++        }
++        if state.phase == Phase::Retired {
++            return Ok(None);
++        }
++        if state.retiring {
++            if state.foreground > 0 || matches!(state.phase, Phase::Running | Phase::Finishing) {
++                return Err(MaintenanceBusy.into());
++            }
++            state.phase = Phase::Retired;
++            return Ok(None);
++        }
++        let valid = match state.phase {
++            Phase::Idle => state.approved.exact(&self.path),
++            Phase::Running => state.latest_foreground.checkpoint_overlap(&self.path),
++            Phase::Finishing => bail!("checkpoint finishing without its foreground owner"),
++            Phase::Poisoned => bail!("account connection unavailable; process restart required"),
++            Phase::Retired => bail!("account maintenance retired"),
++        };
++        if !matches!(valid, Ok(true)) {
++            if state.phase == Phase::Idle {
++                state.phase = Phase::Retired;
++                state.retiring = true;
++                self.requested.store(false, Ordering::Release);
++                return Ok(None);
++            }
++            state.phase = Phase::Poisoned;
++            state.error = Some("checkpoint_family_changed");
++            valid?;
++            bail!("account database family changed; existing files preserved");
++        }
++        if state.transfer && state.phase == Phase::Idle {
++            // The full seal must still exactly match now. It is not a permanent
++            // exemption for metadata changes after the controlled CP epoch.
++            cache.insert(self.path.clone(), state.approved.try_clone()?);
++            state.transfer = false;
++        }
++        state.last_foreground_activity = Instant::now();
++        state.foreground += 1;
++        Ok(Some(Foreground {
++            ticket: self.clone(),
++            epoch: state.epoch,
++            finished: false,
++        }))
++    }
++
++    pub(crate) fn finish_install(&self, cache: &mut admission::AdmissionCache) -> Result<()> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint state unavailable"))?;
++        anyhow::ensure!(
++            state.foreground == 1
++                && state.phase == Phase::Idle
++                && state.approved.exact(&self.path)?,
++            "checkpoint install family changed"
++        );
++        cache.insert(self.path.clone(), state.approved.try_clone()?);
++        state.foreground = 0;
++        self.record_foreground_finish(&mut state);
++        self.wake();
++        Ok(())
++    }
++
++    pub(crate) fn retire(&self) -> Result<()> {
++        {
++            let mut state = self
++                .state
++                .lock()
++                .map_err(|_| anyhow::anyhow!("checkpoint state unavailable"))?;
++            anyhow::ensure!(
++                state.phase != Phase::Poisoned,
++                "account connection unavailable; process restart required"
++            );
++            if state.closed {
++                return Ok(());
++            }
++            if state.closing
++                || state.foreground != 0
++                || matches!(state.phase, Phase::Running | Phase::Finishing)
++            {
++                return Err(MaintenanceBusy.into());
++            }
++            state.retiring = true;
++            state.closing = true;
++            state.phase = Phase::Retired;
++        }
++        self.requested.store(false, Ordering::Release);
++        #[cfg(test)]
++        test_pause(&self.gates.before_close);
++        let db = self
++            .connection
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint connection unavailable"))?
++            .take();
++        let result = match db {
++            Some(db) => close_connection(db, &self.lease),
++            None => Err(anyhow::anyhow!("checkpoint retirement lost its handle")),
++        };
++        if let Ok(mut state) = self.state.lock() {
++            state.closing = false;
++            if result.is_ok() {
++                state.closed = true;
++            } else {
++                state.phase = Phase::Poisoned;
++                state.error = Some("checkpoint_close_failed");
++            }
++        }
++        if let Some(shared) = self.shared.upgrade() {
++            shared.wake.notify_all();
++        }
++        result
++    }
++
++    fn retirement_ready(&self) -> bool {
++        self.state
++            .lock()
++            .map(|state| {
++                state.retiring
++                    && state.foreground == 0
++                    && state.phase == Phase::Retired
++                    && !state.closing
++            })
++            .unwrap_or(false)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn pause_revalidation_close(&self) {
++        test_pause(&self.gates.before_revalidation_close);
++    }
++
++    pub(crate) fn defer_retirement(&self) {
++        if let Ok(mut state) = self.state.lock() {
++            state.retiring = true;
++            if state.foreground == 0 && state.phase == Phase::Idle {
++                state.phase = Phase::Retired;
++            }
++        }
++        self.requested.store(false, Ordering::Release);
++        self.wake();
++    }
++
++    fn run_due(&self) {
++        if !self.requested.load(Ordering::Acquire) {
++            return;
++        }
++        #[cfg(test)]
++        test_pause(&self.gates.before_admission);
++        let generation;
++        {
++            let Ok(mut state) = self.state.lock() else {
++                return;
++            };
++            if state.phase != Phase::Idle
++                || state.foreground != 0
++                || state.retiring
++                || Instant::now() < state.retry_at
++            {
++                return;
++            }
++            let now = Instant::now();
++            let (_, backlog) = self.frames_and_backlog(&state);
++            let age = state
++                .pending_since
++                .map(|at| now.saturating_duration_since(at));
++            if now.saturating_duration_since(state.last_foreground_activity) < IDLE_DELAY
++                && !checkpoint_pressure(backlog, state.free_bytes, age)
++            {
++                return;
++            }
++            // C1: use the last approved complete Family, never bless a current
++            // snapshot immediately before attributing its changes to checkpoint.
++            if !matches!(state.approved.exact(&self.path), Ok(true)) {
++                // No maintenance SQL has started. Restore the original strong
++                // copy-admission path on the next foreground checkout.
++                state.phase = Phase::Retired;
++                state.retiring = true;
++                state.error = Some("checkpoint_idle_revalidation_required");
++                self.requested.store(false, Ordering::Release);
++                return;
++            }
++            state.phase = Phase::Running;
++            generation = self.wal_generation.load(Ordering::Acquire);
++            state.epoch = state.epoch.saturating_add(1);
++            state.pending_since.get_or_insert_with(Instant::now);
++        }
++        self.requested.store(false, Ordering::Release);
++        let signal = self.signals.load(Ordering::Acquire);
++        let db = self.connection.lock().ok().and_then(|mut slot| slot.take());
++        let Some(db) = db else {
++            self.poison("checkpoint_connection_missing");
++            return;
++        };
++        #[cfg(test)]
++        test_pause(&self.gates.before_sql);
++        // No registry, admission, account or ticket-state mutex spans SQLite IO.
++        let mut log = -1;
++        let mut backfilled = -1;
++        // SAFETY: the worker exclusively owns this admitted maintenance handle;
++        // main names its sole operational database. PASSIVE never resets WAL.
++        let mut actual = || unsafe {
++            rusqlite::ffi::sqlite3_wal_checkpoint_v2(
++                db.handle(),
++                c"main".as_ptr(),
++                rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
++                &mut log,
++                &mut backfilled,
++            )
++        };
++        #[cfg(test)]
++        let rc = match self.gates.forced_rc.load(Ordering::Acquire) {
++            0 => actual(),
++            forced => forced,
++        };
++        #[cfg(not(test))]
++        let rc = actual();
++        #[cfg(test)]
++        test_pause(&self.gates.after_sql);
++        let autocommit = db.is_autocommit();
++        let free = self
++            .path
++            .parent()
++            .and_then(|parent| fs2::available_space(parent).ok());
++        // Return the handle before publishing Finishing/Idle. A foreground may
++        // complete and immediately retire this ticket once that state is visible.
++        let returned = match self.connection.lock() {
++            Ok(mut slot) if slot.is_none() => {
++                *slot = Some(db);
++                true
++            }
++            _ => {
++                preserve_connection(db, &self.lease);
++                false
++            }
++        };
++        if !returned {
++            self.poison("checkpoint_connection_unavailable");
++            return;
++        }
++        let mut poisoned = false;
++        if let Ok(mut state) = self.state.lock() {
++            if state.phase == Phase::Poisoned || !autocommit {
++                state.phase = Phase::Poisoned;
++                state.error = Some("checkpoint_operation_unavailable");
++                poisoned = true;
++            } else {
++                state.phase = Phase::Finishing;
++                let progress = backfilled >= 0
++                    && (generation != state.checkpoint_generation
++                        || i64::from(backfilled) > state.checkpointed_frames);
++                if log >= 0 {
++                    state.log_frames = i64::from(log);
++                }
++                if backfilled >= 0 {
++                    state.checkpointed_frames = i64::from(backfilled);
++                    state.checkpoint_generation = generation;
++                }
++                state.free_bytes = free;
++                state.space_error = free.is_none();
++                state.completed = state.completed.saturating_add(1);
++                let base_rc = rc & 0xff;
++                state.last_rc = rc;
++                state.last_outcome = if base_rc == rusqlite::ffi::SQLITE_BUSY {
++                    "busy"
++                } else if rc != rusqlite::ffi::SQLITE_OK {
++                    if matches!(
++                        base_rc,
++                        rusqlite::ffi::SQLITE_IOERR | rusqlite::ffi::SQLITE_FULL
++                    ) {
++                        "io_error"
++                    } else {
++                        "error"
++                    }
++                } else if log < 0 || backfilled < log {
++                    "partial"
++                } else {
++                    "complete"
++                };
++                state.error =
++                    if rc == rusqlite::ffi::SQLITE_OK || base_rc == rusqlite::ffi::SQLITE_BUSY {
++                        if free.is_none() {
++                            Some("checkpoint_space_probe_failed")
++                        } else {
++                            None
++                        }
++                    } else {
++                        Some("checkpoint_io_error")
++                    };
++                let generation_changed = self.wal_generation.load(Ordering::Acquire) != generation;
++                let incomplete = rc != rusqlite::ffi::SQLITE_OK
++                    || log < 0
++                    || backfilled < log
++                    || generation_changed;
++                let newly_requested = self.signals.load(Ordering::Acquire) != signal
++                    || self.requested.load(Ordering::Acquire);
++                if incomplete || newly_requested {
++                    self.requested.store(true, Ordering::Release);
++                    state.retry_at = Instant::now() + RETRY;
++                    if progress {
++                        state.pending_since = Some(Instant::now());
++                    }
++                } else {
++                    state.pending_since = None;
++                    state.retry_at = Instant::now();
++                }
++                // C2/C3: a legitimate FG may still be writing WAL. Last FG
++                // postflight owns its final observation and seals the epoch.
++                if state.foreground == 0 {
++                    if !matches!(
++                        state.latest_foreground.checkpoint_overlap(&self.path),
++                        Ok(true)
++                    ) {
++                        state.phase = Phase::Poisoned;
++                        state.error = Some("checkpoint_completed_family_changed");
++                        poisoned = true;
++                    } else {
++                        match admission::pin_family(&self.path) {
++                            Ok(seal) => {
++                                state.approved = seal;
++                                state.transfer = true;
++                                state.phase = if state.retiring {
++                                    Phase::Retired
++                                } else {
++                                    Phase::Idle
++                                };
++                            }
++                            Err(_) => {
++                                state.phase = Phase::Poisoned;
++                                state.error = Some("checkpoint_completed_family_changed");
++                                poisoned = true;
++                            }
++                        }
++                    }
++                }
++                if base_rc == rusqlite::ffi::SQLITE_CORRUPT
++                    || base_rc == rusqlite::ffi::SQLITE_NOTADB
++                {
++                    state.phase = Phase::Poisoned;
++                    state.error = Some("checkpoint_database_invalid");
++                    poisoned = true;
++                }
++            }
++        } else {
++            poisoned = true;
++        }
++        if poisoned {
++            self.requested.store(false, Ordering::Release);
++            let db = self.connection.lock().ok().and_then(|mut slot| slot.take());
++            if let Some(db) = db {
++                preserve_connection(db, &self.lease);
++            }
++        }
++    }
++
++    fn stop_connection(&self) {
++        if !self.poisoned() && self.retire().is_ok() {
++            return;
++        }
++        self.poison("checkpoint_shutdown_unavailable");
++        let db = self.connection.lock().ok().and_then(|mut slot| slot.take());
++        if let Some(db) = db {
++            preserve_connection(db, &self.lease);
++        }
++    }
++
++    fn health(&self, enabled: bool, stopping: bool) -> serde_json::Value {
++        let Ok(state) = self.state.lock() else {
++            return serde_json::json!({"enabled":enabled,"stopping":stopping,"state":"unavailable","blocked":true});
++        };
++        let age = state.pending_since.map(|at| at.elapsed());
++        let (frames, backlog) = self.frames_and_backlog(&state);
++        let pressure = checkpoint_pressure(backlog, state.free_bytes, age);
++        let closing = state.retiring && !state.closed;
++        let status = if state.phase == Phase::Poisoned {
++            "unavailable"
++        } else if closing {
++            "closing"
++        } else if pressure {
++            "pressure"
++        } else if state.error.is_some() {
++            "fault"
++        } else if matches!(state.phase, Phase::Running | Phase::Finishing) {
++            "running"
++        } else if self.requested.load(Ordering::Acquire) {
++            "pending"
++        } else {
++            "ready"
++        };
++        serde_json::json!({"enabled":enabled,"stopping":stopping,"state":status,"blocked":stopping || closing || pressure || state.phase == Phase::Poisoned,"generation":self.generation,"epoch":state.epoch,"foreground":state.foreground,"pending":self.requested.load(Ordering::Acquire),"walFrames":frames,"uncheckpointedFrames":backlog,"checkpointedFrames":state.checkpointed_frames,"completed":state.completed,"lastRc":state.last_rc,"lastOutcome":state.last_outcome,"pendingAgeMs":age.map(|age| age.as_millis() as u64),"freeBytes":state.free_bytes,"spaceProbeError":state.space_error,"error":state.error})
++    }
++}
++
++pub(crate) struct Foreground {
++    ticket: Arc<Ticket>,
++    epoch: u64,
++    finished: bool,
++}
++
++impl Foreground {
++    pub(crate) fn finish(
++        mut self,
++        observed: admission::Family,
++        cache: &mut admission::AdmissionCache,
++    ) -> Result<()> {
++        let salt = observed.wal_generation(&self.ticket.path)?;
++        let mut state = self
++            .ticket
++            .state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint state unavailable"))?;
++        anyhow::ensure!(
++            state.phase != Phase::Poisoned && state.foreground == 1 && state.epoch == self.epoch,
++            "account checkpoint epoch unavailable"
++        );
++        anyhow::ensure!(
++            observed.exact_control_members()
++                && state.approved.control_identities(&self.ticket.path)?,
++            "account checkpoint family changed during operation"
++        );
++        state.latest_foreground = observed.try_clone()?;
++        if salt != state.wal_salt {
++            state.wal_salt = salt;
++            self.ticket.wal_generation.fetch_add(1, Ordering::AcqRel);
++            if state.phase == Phase::Finishing {
++                self.ticket.requested.store(true, Ordering::Release);
++                state.retry_at = Instant::now() + RETRY;
++                state.pending_since = Some(Instant::now());
++            }
++        }
++        cache.insert(self.ticket.path.clone(), observed.try_clone()?);
++        if matches!(state.phase, Phase::Idle | Phase::Finishing) {
++            state.approved = observed;
++            state.transfer = false;
++            state.phase = if state.retiring {
++                Phase::Retired
++            } else {
++                Phase::Idle
++            };
++        }
++        state.foreground = 0;
++        self.ticket.record_foreground_finish(&mut state);
++        self.finished = true;
++        self.ticket.wake();
++        Ok(())
++    }
++}
++
++impl Drop for Foreground {
++    fn drop(&mut self) {
++        if !self.finished {
++            if let Ok(mut state) = self.ticket.state.lock() {
++                state.foreground = state.foreground.saturating_sub(1);
++                state.phase = Phase::Poisoned;
++                state.error = Some("checkpoint_foreground_unfinished");
++            }
++            self.ticket.wake();
++        }
++    }
++}
++
++struct Shared {
++    tickets: Mutex<std::collections::BTreeMap<PathBuf, Arc<Ticket>>>,
++    wake_lock: Mutex<()>,
++    wake: Condvar,
++    stopping: AtomicBool,
++    generation: AtomicU64,
++    setup_failed: AtomicBool,
++}
++
++pub(crate) struct Manager {
++    shared: Arc<Shared>,
++    enabled: AtomicBool,
++    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
++    lease: Arc<Lease>,
++}
++
++impl Manager {
++    pub(crate) fn new(lease: Arc<Lease>) -> Self {
++        Self {
++            shared: Arc::new(Shared {
++                tickets: Mutex::new(Default::default()),
++                wake_lock: Mutex::new(()),
++                wake: Condvar::new(),
++                stopping: AtomicBool::new(false),
++                generation: AtomicU64::new(1),
++                setup_failed: AtomicBool::new(false),
++            }),
++            enabled: AtomicBool::new(false),
++            worker: Mutex::new(None),
++            lease,
++        }
++    }
++
++    pub(crate) fn enabled(&self) -> bool {
++        self.enabled.load(Ordering::Acquire)
++    }
++
++    pub(crate) fn enable(&self) -> Result<()> {
++        anyhow::ensure!(
++            !self.shared.stopping.load(Ordering::Acquire),
++            "checkpoint maintenance stopped"
++        );
++        let mut worker = self
++            .worker
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint worker unavailable"))?;
++        if worker.is_some() {
++            return Ok(());
++        }
++        let shared = self.shared.clone();
++        *worker = Some(
++            std::thread::Builder::new()
++                .name("control-checkpoint".into())
++                .spawn(move || {
++                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                        while !shared.stopping.load(Ordering::Acquire) {
++                            let tickets = match shared.tickets.lock() {
++                                Ok(tickets) => tickets.values().cloned().collect::<Vec<_>>(),
++                                Err(_) => break,
++                            };
++                            for ticket in tickets {
++                                if shared.stopping.load(Ordering::Acquire) {
++                                    break;
++                                }
++                                ticket.run_due();
++                                if ticket.retirement_ready() {
++                                    #[cfg(test)]
++                                    test_pause(&ticket.gates.before_retirement);
++                                    match ticket.retire() {
++                                        Ok(()) => {
++                                            if let Ok(mut tickets) = shared.tickets.lock() {
++                                                if tickets.get(&ticket.path).is_some_and(
++                                                    |current| Arc::ptr_eq(current, &ticket),
++                                                ) {
++                                                    tickets.remove(&ticket.path);
++                                                }
++                                            }
++                                        }
++                                        Err(error) if error.is::<MaintenanceBusy>() => {}
++                                        Err(_) => ticket.poison("checkpoint_retirement_failed"),
++                                    }
++                                }
++                            }
++                            let Ok(guard) = shared.wake_lock.lock() else {
++                                break;
++                            };
++                            if shared.stopping.load(Ordering::Acquire) {
++                                break;
++                            }
++                            drop(shared.wake.wait_timeout(guard, Duration::from_millis(50)));
++                        }
++                    }));
++                    if result.is_err() || !shared.stopping.load(Ordering::Acquire) {
++                        shared.setup_failed.store(true, Ordering::Release);
++                    }
++                    // request_stop leaves idle handles untouched: in-flight FULL
++                    // result persistence may still use their approved family.
++                })?,
++        );
++        self.enabled.store(true, Ordering::Release);
++        Ok(())
++    }
++
++    pub(crate) fn create(&self, path: &Path) -> Result<Arc<Ticket>> {
++        anyhow::ensure!(
++            self.enabled() && !self.shared.stopping.load(Ordering::Acquire),
++            "checkpoint maintenance not running"
++        );
++        let approved = admission::pin_family(path)?;
++        anyhow::ensure!(
++            approved.exact_control_members(),
++            "checkpoint requires exact WAL family"
++        );
++        let db = admission::open_checkpoint(path, &approved, &self.lease)?;
++        let approved = admission::pin_family(path)?;
++        let frames = i64::from(approved.published_frames(path)?);
++        let salt = approved.wal_generation(path)?;
++        let ticket = Arc::new(Ticket {
++            path: path.into(),
++            generation: self.shared.generation.fetch_add(1, Ordering::AcqRel),
++            lease: self.lease.clone(),
++            shared: Arc::downgrade(&self.shared),
++            state: Mutex::new(State {
++                phase: Phase::Idle,
++                foreground: 1,
++                latest_foreground: approved.try_clone()?,
++                approved,
++                transfer: false,
++                epoch: 0,
++                retiring: false,
++                closing: false,
++                closed: false,
++                retry_at: Instant::now(),
++                last_foreground_activity: Instant::now(),
++                pending_since: None,
++                error: None,
++                log_frames: frames,
++                checkpointed_frames: 0,
++                completed: 0,
++                free_bytes: None,
++                checkpoint_generation: 0,
++                wal_salt: salt,
++                space_error: false,
++                last_rc: 0,
++                last_outcome: "not_run",
++            }),
++            connection: Mutex::new(Some(db)),
++            requested: AtomicBool::new(true),
++            frames: AtomicI64::new(frames),
++            signals: AtomicU64::new(0),
++            wal_generation: AtomicU64::new(0),
++            #[cfg(test)]
++            gates: TestGates::default(),
++        });
++        let mut tickets = self
++            .shared
++            .tickets
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint tickets unavailable"))?;
++        anyhow::ensure!(
++            !tickets.contains_key(path),
++            "checkpoint ticket already exists"
++        );
++        tickets.insert(path.into(), ticket.clone());
++        Ok(ticket)
++    }
++
++    pub(crate) fn unavailable_ticket(&self, path: &Path) -> bool {
++        self.shared
++            .tickets
++            .lock()
++            .map(|tickets| tickets.contains_key(path))
++            .unwrap_or(true)
++    }
++
++    pub(crate) fn retire(&self, ticket: &Arc<Ticket>) -> Result<()> {
++        ticket.retire()?;
++        let mut tickets = self
++            .shared
++            .tickets
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint tickets unavailable"))?;
++        if tickets
++            .get(&ticket.path)
++            .is_some_and(|current| Arc::ptr_eq(current, ticket))
++        {
++            tickets.remove(&ticket.path);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn wait_retirement(&self, path: &Path, deadline: Instant) -> Result<bool> {
++        let ticket = self
++            .shared
++            .tickets
++            .lock()
++            .map_err(|_| anyhow::anyhow!("checkpoint tickets unavailable"))?
++            .get(path)
++            .cloned();
++        let Some(ticket) = ticket else {
++            return Ok(false);
++        };
++        self.wait_ticket_retirement(&ticket, deadline)
++    }
++
++    pub(crate) fn wait_ticket_retirement(
++        &self,
++        ticket: &Arc<Ticket>,
++        deadline: Instant,
++    ) -> Result<bool> {
++        loop {
++            {
++                let state = ticket
++                    .state
++                    .lock()
++                    .map_err(|_| anyhow::anyhow!("checkpoint state unavailable"))?;
++                anyhow::ensure!(
++                    state.phase != Phase::Poisoned,
++                    "account connection unavailable; process restart required"
++                );
++                if state.closed {
++                    return Ok(true);
++                }
++                if !state.retiring && !state.closing {
++                    return Ok(false);
++                }
++            }
++            let remaining = deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                return Err(MaintenanceBusy.into());
++            }
++            let guard = self
++                .shared
++                .wake_lock
++                .lock()
++                .map_err(|_| anyhow::anyhow!("checkpoint wait unavailable"))?;
++            // No Ticket, registry, admission or SQLite lock spans this wait.
++            // The short timeout also covers notification races and stopped workers.
++            drop(
++                self.shared
++                    .wake
++                    .wait_timeout(guard, remaining.min(Duration::from_millis(20)))
++                    .map_err(|_| anyhow::anyhow!("checkpoint wait unavailable"))?,
++            );
++        }
++    }
++
++    pub(crate) fn setup_fault(&self) {
++        self.shared.setup_failed.store(true, Ordering::Release);
++    }
++    pub(crate) fn setup_ok(&self) -> bool {
++        !self.shared.setup_failed.load(Ordering::Acquire)
++    }
++
++    pub(crate) fn request_stop(&self) {
++        self.shared.stopping.store(true, Ordering::Release);
++        self.shared.wake.notify_all();
++    }
++
++    pub(crate) fn stop_join(&self) {
++        self.request_stop();
++        // Hold only this handle-ownership lock until exit, so every concurrent
++        // caller returns after the worker has ended, not merely after take().
++        let mut worker = self.worker.lock().unwrap_or_else(|poison| {
++            self.setup_fault();
++            poison.into_inner()
++        });
++        if let Some(handle) = worker.take() {
++            if handle.join().is_err() {
++                self.setup_fault();
++            }
++        }
++    }
++
++    pub(crate) fn close_after_join(&self) {
++        let tickets = self
++            .shared
++            .tickets
++            .lock()
++            .map(|tickets| tickets.values().cloned().collect::<Vec<_>>())
++            .unwrap_or_default();
++        for ticket in tickets {
++            ticket.stop_connection();
++        }
++    }
++
++    pub(crate) fn health(&self, path: &Path) -> serde_json::Value {
++        let enabled = self.enabled();
++        let stopping = self.shared.stopping.load(Ordering::Acquire);
++        if !self.setup_ok() {
++            return serde_json::json!({"enabled":enabled,"stopping":stopping,"state":"setup_failed","blocked":true});
++        }
++        let ticket = self
++            .shared
++            .tickets
++            .lock()
++            .ok()
++            .and_then(|tickets| tickets.get(path).cloned());
++        match ticket {
++            Some(ticket) => ticket.health(enabled, stopping),
++            None => {
++                serde_json::json!({"enabled":enabled,"stopping":stopping,"state":if enabled { "waiting_for_wal" } else { "disabled" },"blocked":stopping})
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "background_checkpoint_tests.rs"]
++mod tests;
++
++impl Store {
++    /// Native Core enables this once; ordinary Stores preserve SQLite defaults.
++    pub fn enable_background_checkpoints(&self) -> Result<()> {
++        anyhow::ensure!(
++            self.snapshot.is_none(),
++            "read snapshot cannot enable maintenance"
++        );
++        let manager = self
++            .checkpoints
++            .as_ref()
++            .context("read snapshot cannot enable maintenance")?;
++        manager.enable()?;
++        self.admitted
++            .lock()
++            .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?
++            .manager = Some(manager.clone());
++        for account in self.accounts()? {
++            self.control(&account.id, |_| Ok(()))?;
++        }
++        anyhow::ensure!(manager.setup_ok(), "checkpoint maintenance setup failed");
++        Ok(())
++    }
++
++    pub fn checkpoint_health(&self, account: &str) -> Result<serde_json::Value> {
++        self.account(account)?;
++        if self.snapshot.is_some() {
++            return Ok(
++                serde_json::json!({"enabled":false,"stopping":false,"state":"disabled","blocked":false}),
++            );
++        }
++        Ok(self
++            .checkpoints
++            .as_ref()
++            .context("checkpoint manager unavailable")?
++            .health(&self.account_dir(account)?.join("agent/control.sqlite")))
++    }
++
++    /// Wait only for local handle retirement; no callback or remote send is replayed.
++    pub fn wait_checkpoint_retirement(&self, account: &str) -> Result<()> {
++        self.account(account)?;
++        if self.snapshot.is_none() {
++            if let Some(manager) = &self.checkpoints {
++                manager.wait_retirement(
++                    &self.account_dir(account)?.join("agent/control.sqlite"),
++                    Instant::now() + Duration::from_secs(2),
++                )?;
++            }
++        }
++        Ok(())
++    }
++
++    pub fn request_checkpoint_stop(&self) {
++        if let Some(manager) = &self.checkpoints {
++            if manager.enabled() {
++                manager.request_stop();
++            }
++        }
++    }
++
++    /// Finish only the maintenance worker. In-flight FULL writes keep their
++    /// SQLite handles; the owner Drop closes those after foreground users end.
++    pub fn join_checkpoint_worker(&self) {
++        if let Some(manager) = &self.checkpoints {
++            if manager.enabled() {
++                manager.stop_join();
++            }
++        }
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-store/src/control_connections.rs b/packages/native-client-rust/crates/wechat-store/src/control_connections.rs
+index ad69a267f7feb72cd0aef61f12a9b9ab727822be..0d5c7ef2312e2a2b9a0df7d265b193b098c7f3a6 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/control_connections.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/control_connections.rs
+@@ -1,4 +1,5 @@
+ //! Owned operational connections, never official-profile connections.
++use crate::background_checkpoints::{self, Foreground, Hook, Manager, Ticket};
+ use crate::*;
+ use rusqlite::config::DbConfig;
+ use std::{collections::BTreeMap, mem::ManuallyDrop};
+@@ -8,20 +9,25 @@ const CAPACITY: usize = 8;
+ #[derive(Default)]
+ pub(crate) struct ControlConnections {
+     pub(crate) admitted: admission::AdmissionCache,
++    pub(crate) manager: Option<Arc<Manager>>,
+     writers: BTreeMap<PathBuf, Writer>,
+     sequence: u64,
+ }
+ 
++struct Owned {
++    db: Connection,
++    hook: Option<Box<Hook>>,
++    ticket: Option<Arc<Ticket>>,
++}
++
+ enum Writer {
+-    Idle { db: Connection, used: u64 },
++    Idle { owned: Owned, used: u64 },
+     Unavailable { _held: Quarantined },
+ }
+ 
+-// An unknown family must never be rolled back/checkpointed by a destructor.
+-// A failed close also must not release ownership while its handle is live.
+-// Such an account requires process restart; OS cleanup then releases both.
++// Keep callback userdata and ownership alive as long as an unsafe handle.
+ struct Quarantined {
+-    _db: ManuallyDrop<Connection>,
++    _owned: ManuallyDrop<Owned>,
+     _lease: ManuallyDrop<Arc<Lease>>,
+ }
+ 
+@@ -33,49 +39,135 @@ fn no_close_checkpoint(db: &Connection) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn full_defaults(db: &Connection) -> Result<()> {
+-    let synchronous: i64 = db.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+-    let checkpoint: i64 = db.pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))?;
++fn full_defaults(owned: &Owned) -> Result<()> {
++    let synchronous: i64 = owned
++        .db
++        .pragma_query_value(None, "synchronous", |row| row.get(0))?;
++    let checkpoint: i64 = owned
++        .db
++        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))?;
++    let expected = if owned.ticket.is_some() { 0 } else { 1000 };
+     anyhow::ensure!(
+-        synchronous == 2 && checkpoint == 1000,
++        synchronous == 2 && checkpoint == expected,
+         "account connection durability settings changed"
+     );
++    if let Some(hook) = &owned.hook {
++        anyhow::ensure!(
++            owned
++                .ticket
++                .as_ref()
++                .is_some_and(|ticket| Arc::ptr_eq(ticket, &hook.0)
++                    && ticket.generation() == hook.0.generation()),
++            "account checkpoint ticket changed"
++        );
++        background_checkpoints::verify_hook(&owned.db, hook)?;
++    }
+     Ok(())
+ }
+ 
+ impl ControlConnections {
+-    fn quarantine(&mut self, path: &Path, db: Connection, lease: &Arc<Lease>) {
++    fn quarantine(&mut self, path: &Path, owned: Owned, lease: &Arc<Lease>) {
++        if let Some(ticket) = &owned.ticket {
++            ticket.poison("checkpoint_writer_unavailable");
++        }
+         self.admitted.remove(path);
+         self.writers.insert(
+             path.into(),
+             Writer::Unavailable {
+                 _held: Quarantined {
+-                    _db: ManuallyDrop::new(db),
++                    _owned: ManuallyDrop::new(owned),
+                     _lease: ManuallyDrop::new(lease.clone()),
+                 },
+             },
+         );
+     }
+ 
+-    fn close_idle(&mut self, path: &Path, db: Connection, lease: &Arc<Lease>) -> Result<()> {
+-        // This function can run after an external path change. Only connection
+-        // configuration and autocommit inspection are allowed before close.
+-        if no_close_checkpoint(&db).is_err() || !db.is_autocommit() {
+-            self.quarantine(path, db, lease);
++    fn close_idle(&mut self, path: &Path, mut owned: Owned, lease: &Arc<Lease>) -> Result<()> {
++        if let Some(ticket) = &owned.ticket {
++            if ticket.poisoned() || ticket.active() {
++                self.quarantine(path, owned, lease);
++                bail!("account connection unavailable; process restart required");
++            }
++            if let Some(manager) = &self.manager {
++                if let Err(error) = manager.retire(ticket) {
++                    self.quarantine(path, owned, lease);
++                    return Err(error);
++                }
++            }
++        }
++        if no_close_checkpoint(&owned.db).is_err() || !owned.db.is_autocommit() {
++            self.quarantine(path, owned, lease);
+             bail!("account connection unavailable; process restart required");
+         }
+-        match db.close() {
++        if owned.hook.is_some() {
++            background_checkpoints::unregister_hook(&owned.db);
++            owned.hook = None;
++        }
++        match owned.db.close() {
+             Ok(()) => Ok(()),
+             Err((db, error)) => {
+-                self.quarantine(path, db, lease);
++                owned.db = db;
++                self.quarantine(path, owned, lease);
+                 Err(error).context("account connection close failed; process restart required")
+             }
+         }
+     }
+ 
++    fn discard_after_guard_error(
++        &mut self,
++        path: &Path,
++        owned: Owned,
++        lease: &Arc<Lease>,
++    ) -> Result<()> {
++        if owned.ticket.is_some() {
++            self.quarantine(path, owned, lease);
++            Ok(())
++        } else {
++            self.admitted.remove(path);
++            self.close_idle(path, owned, lease)
++        }
++    }
++
++    pub(crate) fn busy(&self, path: &Path) -> bool {
++        match self.writers.get(path) {
++            Some(Writer::Idle { owned, .. }) => {
++                owned.ticket.as_ref().is_some_and(|ticket| ticket.active())
++            }
++            Some(Writer::Unavailable { .. }) => true,
++            None => self
++                .manager
++                .as_ref()
++                .is_some_and(|manager| manager.unavailable_ticket(path)),
++        }
++    }
++
++    pub(crate) fn resident_ticket(&self, path: &Path) -> Option<Arc<Ticket>> {
++        match self.writers.get(path) {
++            Some(Writer::Idle { owned, .. }) => owned.ticket.clone(),
++            _ => None,
++        }
++    }
++
++    pub(crate) fn close_all(&mut self, lease: &Arc<Lease>) {
++        let paths = self.writers.keys().cloned().collect::<Vec<_>>();
++        for path in paths {
++            if let Some(entry) = self.writers.remove(&path) {
++                match entry {
++                    Writer::Idle { owned, .. } => {
++                        let _ = self.close_idle(&path, owned, lease);
++                    }
++                    unavailable @ Writer::Unavailable { .. } => {
++                        self.writers.insert(path, unavailable);
++                    }
++                }
++            }
++        }
++    }
++
+     pub(crate) fn evict(&mut self, path: &Path, lease: &Arc<Lease>) -> Result<()> {
++        self.reserve_retirement(path)?;
+         match self.writers.remove(path) {
+-            Some(Writer::Idle { db, .. }) => self.close_idle(path, db, lease)?,
++            Some(Writer::Idle { owned, .. }) => self.close_idle(path, owned, lease)?,
+             Some(entry @ Writer::Unavailable { .. }) => {
+                 self.writers.insert(path.into(), entry);
+                 bail!("account connection unavailable; process restart required");
+@@ -86,55 +178,202 @@ impl ControlConnections {
+         Ok(())
+     }
+ 
++    pub(crate) fn reserve_retirement(&self, path: &Path) -> Result<()> {
++        if matches!(self.writers.get(path), Some(Writer::Unavailable { .. })) {
++            bail!("account connection unavailable; process restart required");
++        }
++        if self.busy(path) {
++            return Err(background_checkpoints::MaintenanceBusy.into());
++        }
++        if let Some(Writer::Idle { owned, .. }) = self.writers.get(path) {
++            if let (Some(manager), Some(ticket)) = (&self.manager, &owned.ticket) {
++                manager.retire(ticket)?;
++            }
++        }
++        Ok(())
++    }
++
++    pub(crate) fn run_for_removal<T>(
++        &mut self,
++        path: &Path,
++        lease: &Arc<Lease>,
++        f: impl FnOnce(&mut Connection) -> Result<T>,
++    ) -> Result<T> {
++        self.reserve_retirement(path)?;
++        let manager = self.manager.take();
++        let result = self.run(path, lease, f);
++        self.manager = manager;
++        result
++    }
++
+     fn make_room(&mut self, lease: &Arc<Lease>) -> Result<()> {
+         if self.writers.len() < CAPACITY {
+             return Ok(());
+         }
+-        let path = self
++        let paths = self
+             .writers
+             .iter()
+             .filter_map(|(path, entry)| match entry {
+-                Writer::Idle { used, .. } => Some(((*used, path), path.clone())),
+-                Writer::Unavailable { .. } => None,
++                Writer::Idle { owned, used }
++                    if owned
++                        .ticket
++                        .as_ref()
++                        .is_none_or(|ticket| !ticket.active() && !ticket.poisoned()) =>
++                {
++                    Some((*used, path.clone()))
++                }
++                _ => None,
+             })
+-            .min_by_key(|(key, _)| *key)
+-            .map(|(_, path)| path)
+-            .context("account connection capacity unavailable; process restart required")?;
+-        self.evict(&path, lease)
++            .collect::<Vec<_>>();
++        let mut paths = paths;
++        paths.sort();
++        for (_, path) in paths {
++            match self.evict(&path, lease) {
++                Ok(()) => return Ok(()),
++                Err(error) if error.is::<background_checkpoints::MaintenanceBusy>() => continue,
++                Err(error) => return Err(error),
++            }
++        }
++        bail!("account connection capacity unavailable; process restart required")
+     }
+ 
+-    fn checkout(&mut self, path: &Path, lease: &Arc<Lease>) -> Result<Connection> {
++    fn checkout(&mut self, path: &Path, lease: &Arc<Lease>) -> Result<(Owned, Option<Foreground>)> {
+         if matches!(self.writers.get(path), Some(Writer::Unavailable { .. })) {
+             bail!("account connection unavailable; process restart required");
+         }
+-        // Use exactly the original RW probe and family predicate before any
+-        // SQLite work, including on a long-lived handle.
+-        let unchanged = admission::permission_probe(path)
+-            .and_then(|()| admission::known_unchanged(&self.admitted, path));
+         match self.writers.remove(path) {
+-            Some(Writer::Idle { db, .. }) if matches!(unchanged, Ok(true)) => {
+-                if !db.is_autocommit() {
+-                    self.quarantine(path, db, lease);
+-                    bail!("account connection unavailable; process restart required");
++            Some(Writer::Idle { owned, used }) if owned.ticket.is_some() => {
++                let admission = admission::permission_probe(path).and_then(|()| {
++                    owned
++                        .ticket
++                        .as_ref()
++                        .expect("ticket checked")
++                        .begin(&mut self.admitted)
++                });
++                match admission {
++                    Ok(Some(foreground)) => {
++                        if !owned.db.is_autocommit() {
++                            drop(foreground);
++                            self.quarantine(path, owned, lease);
++                            bail!("account connection unavailable; process restart required");
++                        }
++                        return Ok((owned, Some(foreground)));
++                    }
++                    Ok(None) => {
++                        // Idle metadata changes regain the original complete
++                        // admission path; they are never attributed to a CP.
++                        #[cfg(test)]
++                        if let Some(ticket) = &owned.ticket {
++                            ticket.pause_revalidation_close();
++                        }
++                        // A worker may reserve the close after begin observed
++                        // Retired. Reserve atomically before removing this known
++                        // resident handle; expected Busy must preserve it.
++                        if let (Some(manager), Some(ticket)) = (&self.manager, &owned.ticket) {
++                            if let Err(error) = manager.retire(ticket) {
++                                if error.is::<background_checkpoints::MaintenanceBusy>() {
++                                    self.writers
++                                        .insert(path.into(), Writer::Idle { owned, used });
++                                } else {
++                                    self.quarantine(path, owned, lease);
++                                }
++                                return Err(error);
++                            }
++                        }
++                        self.close_idle(path, owned, lease)?;
++                        self.admitted.remove(path);
++                    }
++                    Err(error) if error.is::<background_checkpoints::MaintenanceBusy>() => {
++                        self.writers
++                            .insert(path.into(), Writer::Idle { owned, used });
++                        return Err(error);
++                    }
++                    Err(error) => {
++                        self.quarantine(path, owned, lease);
++                        return Err(error);
++                    }
+                 }
+-                return Ok(db);
+             }
+-            Some(Writer::Idle { db, .. }) => {
+-                self.close_idle(path, db, lease)?;
++            Some(Writer::Idle { owned, .. }) => {
++                let unchanged = admission::permission_probe(path)
++                    .and_then(|()| admission::known_unchanged(&self.admitted, path));
++                if matches!(unchanged, Ok(true)) {
++                    if !owned.db.is_autocommit() {
++                        self.quarantine(path, owned, lease);
++                        bail!("account connection unavailable; process restart required");
++                    }
++                    return Ok((owned, None));
++                }
++                self.close_idle(path, owned, lease)?;
+                 self.admitted.remove(path);
++                unchanged?;
+             }
+             Some(Writer::Unavailable { .. }) => unreachable!("checked above"),
+             None => {}
+         }
+-        unchanged?;
++        anyhow::ensure!(
++            !self
++                .manager
++                .as_ref()
++                .is_some_and(|manager| manager.unavailable_ticket(path)),
++            "account maintenance retirement in progress"
++        );
++        admission::permission_probe(path)?;
+         self.make_room(lease)?;
+         let (db, ()) =
+             admission::open_prepared(path, Some(&self.admitted), Store::prepare_account)?;
+-        if let Err(error) = no_close_checkpoint(&db) {
+-            self.close_idle(path, db, lease)?;
++        let owned = Owned {
++            db,
++            hook: None,
++            ticket: None,
++        };
++        if let Err(error) = no_close_checkpoint(&owned.db) {
++            self.close_idle(path, owned, lease)?;
+             return Err(error);
+         }
+-        Ok(db)
++        Ok((owned, None))
++    }
++
++    fn finish_foreground(&mut self, path: &Path, foreground: Option<Foreground>) -> Result<()> {
++        if let Some(foreground) = foreground {
++            foreground.finish(admission::pin_family(path)?, &mut self.admitted)
++        } else {
++            admission::remember(&mut self.admitted, path)
++        }
++    }
++
++    fn install(&mut self, path: &Path, owned: &mut Owned) -> Result<Option<Arc<Ticket>>> {
++        let Some(manager) = &self.manager else {
++            return Ok(None);
++        };
++        if !manager.enabled() || owned.ticket.is_some() {
++            return Ok(None);
++        }
++        if !admission::pin_family(path)?.exact_control_members() {
++            return Ok(None);
++        }
++        let mut installed = None;
++        let setup = (|| -> Result<()> {
++            owned.db.pragma_update(None, "wal_autocheckpoint", 0)?;
++            let ticket = manager.create(path)?;
++            owned.hook = Some(background_checkpoints::register_hook(
++                &owned.db,
++                ticket.clone(),
++            ));
++            owned.ticket = Some(ticket.clone());
++            installed = Some(ticket);
++            Ok(())
++        })();
++        if setup.is_err() {
++            manager.setup_fault();
++            if owned.ticket.is_some() {
++                return setup.map(|()| installed);
++            }
++            // Preserve a callback that already completed FULL. Native enable
++            // reports this separate setup fault before admitting remote work.
++            owned.db.pragma_update(None, "wal_autocheckpoint", 1000)?;
++        }
++        Ok(installed)
+     }
+ 
+     pub(crate) fn run<T>(
+@@ -143,99 +382,177 @@ impl ControlConnections {
+         lease: &Arc<Lease>,
+         f: impl FnOnce(&mut Connection) -> Result<T>,
+     ) -> Result<T> {
+-        let mut db = self.checkout(path, lease)?;
++        self.run_option(path, lease, &mut Some(f))
++    }
++
++    pub(crate) fn run_option<T, F>(
++        &mut self,
++        path: &Path,
++        lease: &Arc<Lease>,
++        f: &mut Option<F>,
++    ) -> Result<T>
++    where
++        F: FnOnce(&mut Connection) -> Result<T>,
++    {
++        let (mut owned, foreground) = self.checkout(path, lease)?;
+         let pin = match admission::pin_family(path) {
+             Ok(pin) => pin,
+             Err(error) => {
+-                self.admitted.remove(path);
+-                self.close_idle(path, db, lease)?;
++                drop(foreground);
++                self.discard_after_guard_error(path, owned, lease)?;
+                 return Err(error);
+             }
+         };
+-        let initial_wal =
+-            match db.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0)) {
+-                Ok(mode) => mode == "wal",
+-                Err(error) => {
+-                    self.admitted.remove(path);
+-                    self.close_idle(path, db, lease)?;
+-                    return Err(error.into());
+-                }
+-            };
+-        // Preserve preparation on cache hits as well as fresh connections.
+-        let result = Store::prepare_account(&mut db)
+-            .and_then(|()| full_defaults(&db))
+-            .and_then(|()| f(&mut db));
+-        let same_files = pin.identities_unchanged(path, initial_wal && !db.is_autocommit());
+-        if !matches!(same_files, Ok(true)) {
+-            self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
+-            same_files?;
++        let initial_wal = match owned
++            .db
++            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
++        {
++            Ok(mode) => mode == "wal",
++            Err(error) => {
++                drop(foreground);
++                self.discard_after_guard_error(path, owned, lease)?;
++                return Err(error.into());
++            }
++        };
++        let result = Store::prepare_account(&mut owned.db)
++            .and_then(|()| full_defaults(&owned))
++            .and_then(|()| f.take().context("account callback already executed")?(&mut owned.db));
++        let same = pin.identities_unchanged(path, initial_wal && !owned.db.is_autocommit());
++        let managed_same = owned
++            .ticket
++            .as_ref()
++            .is_none_or(|ticket| !ticket.poisoned())
++            && (owned.ticket.is_none() || matches!(pin.control_identities(path), Ok(true)));
++        if !matches!(same, Ok(true)) || !managed_same {
++            drop(foreground);
++            self.discard_after_guard_error(path, owned, lease)?;
++            same?;
+             bail!("account database family changed during operation; existing files preserved");
+         }
+-        if !db.is_autocommit() {
+-            if db.execute_batch("ROLLBACK").is_err() || !db.is_autocommit() {
+-                self.quarantine(path, db, lease);
++        if !owned.db.is_autocommit() {
++            if owned.db.execute_batch("ROLLBACK").is_err() || !owned.db.is_autocommit() {
++                drop(foreground);
++                self.quarantine(path, owned, lease);
+                 bail!("account transaction cleanup failed; process restart required");
+             }
++            let safe_deferred = owned.ticket.is_some()
++                && full_defaults(&owned).is_ok()
++                && no_close_checkpoint(&owned.db).is_ok();
++            if let Err(error) = self.finish_foreground(path, foreground) {
++                self.discard_after_guard_error(path, owned, lease)?;
++                return Err(error);
++            }
+             self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
+-            return Err(result.err().unwrap_or_else(|| {
++            let error = result.err().unwrap_or_else(|| {
+                 anyhow::anyhow!("account callback left an unfinished transaction")
+-            }));
++            });
++            if let Some(ticket) = &owned.ticket {
++                if ticket.active() && safe_deferred {
++                    ticket.defer_retirement();
++                    self.sequence = self.sequence.saturating_add(1);
++                    self.writers.insert(
++                        path.into(),
++                        Writer::Idle {
++                            owned,
++                            used: self.sequence,
++                        },
++                    );
++                    return Err(error);
++                }
++            }
++            self.close_idle(path, owned, lease)?;
++            return Err(error);
+         }
+         let value = match result {
+             Ok(value) => value,
+             Err(error) => {
++                let safe_deferred = owned.ticket.is_some()
++                    && full_defaults(&owned).is_ok()
++                    && no_close_checkpoint(&owned.db).is_ok();
++                if let Err(cleanup) = self.finish_foreground(path, foreground) {
++                    self.discard_after_guard_error(path, owned, lease)?;
++                    return Err(cleanup);
++                }
+                 self.admitted.remove(path);
+-                self.close_idle(path, db, lease)?;
++                if let Some(ticket) = &owned.ticket {
++                    if ticket.active() && safe_deferred {
++                        ticket.defer_retirement();
++                        self.sequence = self.sequence.saturating_add(1);
++                        self.writers.insert(
++                            path.into(),
++                            Writer::Idle {
++                                owned,
++                                used: self.sequence,
++                            },
++                        );
++                        return Err(error);
++                    }
++                }
++                self.close_idle(path, owned, lease)?;
+                 return Err(error);
+             }
+         };
+-        let settings = full_defaults(&db);
++        let settings = full_defaults(&owned).and_then(|()| no_close_checkpoint(&owned.db));
+         if let Err(error) = settings {
+-            self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
++            drop(foreground);
++            self.discard_after_guard_error(path, owned, lease)?;
+             return Err(error);
+         }
+-        if let Err(error) = no_close_checkpoint(&db) {
+-            self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
+-            return Err(error);
+-        }
+-        let mode: String = match db.pragma_query_value(None, "journal_mode", |row| row.get(0)) {
++        let mode: String = match owned
++            .db
++            .pragma_query_value(None, "journal_mode", |row| row.get(0))
++        {
+             Ok(mode) => mode,
+             Err(error) => {
+-                self.admitted.remove(path);
+-                self.close_idle(path, db, lease)?;
++                drop(foreground);
++                self.discard_after_guard_error(path, owned, lease)?;
+                 return Err(error.into());
+             }
+         };
+-        let same_files = pin.identities_unchanged(path, initial_wal && mode == "wal");
+-        if !matches!(same_files, Ok(true)) {
+-            self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
+-            same_files?;
++        let same = pin.identities_unchanged(path, initial_wal && mode == "wal");
++        if !matches!(same, Ok(true))
++            || owned
++                .ticket
++                .as_ref()
++                .is_some_and(|ticket| ticket.poisoned())
++            || owned.ticket.is_some() && mode != "wal"
++        {
++            drop(foreground);
++            self.discard_after_guard_error(path, owned, lease)?;
++            same?;
+             bail!("account database family changed during operation; existing files preserved");
+         }
++        if let Err(error) = self.finish_foreground(path, foreground) {
++            self.discard_after_guard_error(path, owned, lease)?;
++            return Err(error);
++        }
+         if mode != "wal" {
+-            // DELETE and other existing modes retain their previous lifetime.
+-            self.close_idle(path, db, lease)?;
+-            admission::remember(&mut self.admitted, path)?;
++            self.close_idle(path, owned, lease)?;
+             return Ok(value);
+         }
+-        if let Err(error) = admission::remember(&mut self.admitted, path) {
+-            self.admitted.remove(path);
+-            self.close_idle(path, db, lease)?;
+-            return Err(error);
+-        }
++        let installed = match self.install(path, &mut owned) {
++            Ok(ticket) => ticket,
++            Err(error) => {
++                self.discard_after_guard_error(path, owned, lease)?;
++                return Err(error);
++            }
++        };
+         self.sequence = self.sequence.saturating_add(1);
+         self.writers.insert(
+             path.into(),
+             Writer::Idle {
+-                db,
++                owned,
+                 used: self.sequence,
+             },
+         );
++        if let Some(ticket) = installed {
++            if let Err(error) = ticket.finish_install(&mut self.admitted) {
++                if let Some(Writer::Idle { owned, .. }) = self.writers.remove(path) {
++                    self.discard_after_guard_error(path, owned, lease)?;
++                }
++                return Err(error);
++            }
++        }
+         Ok(value)
+     }
+ 
+diff --git a/packages/native-client-rust/crates/wechat-store/src/lib.rs b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+index 69b618fd98ba50e78701ea7e6bf16862e5a8a310..687cfa0976d976e8bf7b361d3809b33fa0ef79d6 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -2,6 +2,7 @@
+ mod account_removal;
+ mod admission;
+ mod authorization;
++mod background_checkpoints;
+ mod checkpoint;
+ mod client_ids;
+ mod control_connections;
+@@ -157,6 +158,7 @@ pub struct Account {
+ pub struct Store {
+     pub root: PathBuf,
+     pub server_id: String,
++    checkpoints: Option<Arc<background_checkpoints::Manager>>,
+     db: Mutex<Connection>,
+     admitted: Mutex<control_connections::ControlConnections>,
+     snapshot: Option<(String, Mutex<Connection>)>,
+@@ -164,6 +166,23 @@ pub struct Store {
+     _lease: Arc<Lease>,
+ }
+ 
++impl Drop for Store {
++    fn drop(&mut self) {
++        // The worker owns only separate shared state, never an Arc<Store>.
++        // Join before closing foreground handles or releasing ownership. No
++        // registry, admission or account lock is held while waiting for IO.
++        if let Some(manager) = &self.checkpoints {
++            manager.stop_join();
++            manager.close_after_join();
++        }
++        let connections = self
++            .admitted
++            .get_mut()
++            .unwrap_or_else(|poison| poison.into_inner());
++        connections.close_all(&self._lease);
++    }
++}
++
+ impl Store {
+     pub fn open(root: &Path) -> Result<Self> {
+         Self::open_inner(root, true)
+@@ -193,12 +212,16 @@ impl Store {
+         }
+         let (db, server_id) =
+             admission::open_prepared(&db_path, None, |db| Self::prepare_registry(db, initialize))?;
++        let lease = Arc::new(lease);
+         Ok(Self {
+             root,
+             server_id,
++            checkpoints: Some(Arc::new(background_checkpoints::Manager::new(
++                lease.clone(),
++            ))),
+             db: Mutex::new(db),
+             admitted: Mutex::new(Default::default()),
+-            _lease: Arc::new(lease),
++            _lease: lease,
+             snapshot: None,
+         })
+     }
+diff --git a/packages/native-client-rust/crates/wechat-store/src/operations.rs b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+index 6275c378bf734f647f00ec3d8e504135104338d5..4cc910d0cfbdccfaeadabbf22a8c8e7f4788fea0 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/operations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+@@ -220,24 +220,57 @@ impl Store {
+                 .map_err(|_| anyhow::anyhow!("read snapshot unavailable"))?;
+             return f(&mut db);
+         }
+-        self.account(id)?;
+-        // Serialize sidecar operations through the store lock as well as SQLite.
+-        let guard = self
+-            .db
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+-        // Recheck after taking the registry lock: a removal may have raced admission.
+-        Self::require_registered(&guard, id)?;
+-        let path = self.account_dir(id)?.join("agent/control.sqlite");
+-        let m = fs::symlink_metadata(&path)?;
+-        if !m.is_file() || !wechat_platform::private_path(&path)? {
+-            bail!("invalid account sidecar permissions");
++        let mut callback = Some(f);
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
++        loop {
++            self.account(id)?;
++            let (result, retiring_ticket) = {
++                // Serialize sidecar operations through the store lock as well as SQLite.
++                let guard = self
++                    .db
++                    .lock()
++                    .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
++                // Removal may have raced admission, including a retirement wait.
++                Self::require_registered(&guard, id)?;
++                let path = self.account_dir(id)?.join("agent/control.sqlite");
++                let m = fs::symlink_metadata(&path)?;
++                if !m.is_file() || !wechat_platform::private_path(&path)? {
++                    bail!("invalid account sidecar permissions");
++                }
++                let mut connections = self
++                    .admitted
++                    .lock()
++                    .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
++                let result = connections.run_option(&path, &self._lease, &mut callback);
++                let retiring_ticket = if callback.is_some()
++                    && result
++                        .as_ref()
++                        .is_err_and(|error| error.is::<background_checkpoints::MaintenanceBusy>())
++                {
++                    connections.resident_ticket(&path)
++                } else {
++                    None
++                };
++                (result, retiring_ticket)
++            };
++            match result {
++                Err(error)
++                    if callback.is_some()
++                        && error.is::<background_checkpoints::MaintenanceBusy>() =>
++                {
++                    // The user's callback has never run. Release both global
++                    // locks before waiting for this known resident to close,
++                    // then repeat the complete registration/family admission.
++                    if let (Some(manager), Some(ticket)) = (&self.checkpoints, retiring_ticket) {
++                        if manager.wait_ticket_retirement(&ticket, deadline)? {
++                            continue;
++                        }
++                    }
++                    return Err(error);
++                }
++                result => return result,
++            }
+         }
+-        let mut connections = self
+-            .admitted
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
+-        connections.run(&path, &self._lease, f)
+     }
+     pub(crate) fn prepare_account(db: &mut Connection) -> Result<()> {
+         db.busy_timeout(std::time::Duration::from_secs(2))?;
+diff --git a/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs b/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
+index 9225981c8d0d882c49d4bdbac3849c35d3b56e8c..96002cf698823aae1393ac474e658c4607cce71f 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/read_snapshot.rs
+@@ -49,6 +49,7 @@ impl Store {
+         Ok(Self {
+             root: self.root.clone(),
+             server_id: self.server_id.clone(),
++            checkpoints: None,
+             db: Mutex::new(db),
+             admitted: Mutex::new(Default::default()),
+             _lease: self._lease.clone(),
+diff --git a/packages/native-client-rust/crates/wx/src/main.rs b/packages/native-client-rust/crates/wx/src/main.rs
+index 7057ba7d88aa2ea0c0e400370c26456b77c39a79..f63b4487f57c243fc7a348ec1b2c947ebacefaa0 100644
+--- a/packages/native-client-rust/crates/wx/src/main.rs
++++ b/packages/native-client-rust/crates/wx/src/main.rs
+@@ -17,6 +17,8 @@ mod login;
+ mod outcome;
+ mod profile_cli;
+ mod profile_export;
++#[cfg(all(test, target_os = "linux"))]
++mod serve_maintenance_tests;
+ mod settings;
+ use outcome::{failure, set_exit};
+ 
+@@ -1864,6 +1866,26 @@ async fn serve(config: wechat_config::ServerConfig, token_stdin: bool) -> Result
+         None => wechat_api::provision_token(&config.token_file, !config.token_explicit)?,
+     };
+     let core = Core::new(store.clone(), config.storage_key_file.as_deref())?;
++    serve_owned(core, config, token).await
++}
++
++struct ServeMaintenanceGuard(Arc<Core>);
++impl Drop for ServeMaintenanceGuard {
++    fn drop(&mut self) {
++        self.0.shutdown();
++        self.0.join_checkpoint_worker();
++    }
++}
++
++async fn serve_owned(
++    core: Arc<Core>,
++    config: wechat_config::ServerConfig,
++    token: String,
++) -> Result<()> {
++    // The CLI exits the process after run returns. Other workers can retain
++    // Core, so neither success nor early setup/server errors may rely on Drop.
++    let _maintenance = ServeMaintenanceGuard(core.clone());
++    let store = core.store.clone();
+     if let Some(path) = &config.profile_format_key_file {
+         core.configure_profile_format_key(&private_input(path, 16)?)?;
+     }
+diff --git a/packages/native-client-rust/crates/wx/src/serve_maintenance_tests.rs b/packages/native-client-rust/crates/wx/src/serve_maintenance_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a892b3ef3b0bada406e68943542c05f5e10823e
+--- /dev/null
++++ b/packages/native-client-rust/crates/wx/src/serve_maintenance_tests.rs
+@@ -0,0 +1,116 @@
++//! Exercise the actual serve body while another owner retains Core and Store.
++use super::*;
++use std::{collections::BTreeSet, sync::atomic::Ordering, time::Instant};
++static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
++
++struct NoTransport;
++impl wechat_core::upstream::Upstream for NoTransport {
++    fn kind(&self) -> wechat_core::upstream::UpstreamKind {
++        wechat_core::upstream::UpstreamKind::Native
++    }
++}
++
++fn checkpoint_threads() -> BTreeSet<u32> {
++    std::fs::read_dir("/proc/self/task")
++        .unwrap()
++        .filter_map(|entry| {
++            let path = entry.ok()?.path();
++            let name = std::fs::read_to_string(path.join("comm")).ok()?;
++            name.starts_with("control-check")
++                .then(|| path.file_name()?.to_str()?.parse().ok())
++                .flatten()
++        })
++        .collect()
++}
++
++fn fixture() -> (
++    tempfile::TempDir,
++    Arc<Core>,
++    wechat_config::ServerConfig,
++    BTreeSet<u32>,
++) {
++    let before = checkpoint_threads();
++    let temporary = tempfile::tempdir().unwrap();
++    let root = temporary.path().join("data");
++    let store = Arc::new(wechat_store::Store::open(&root).unwrap());
++    store.create_account("one").unwrap();
++    let core = Core::with_upstream(store, None, Arc::new(NoTransport)).unwrap();
++    let deadline = Instant::now() + Duration::from_secs(2);
++    let created = loop {
++        let added = checkpoint_threads()
++            .difference(&before)
++            .copied()
++            .collect::<BTreeSet<_>>();
++        if !added.is_empty() {
++            break added;
++        }
++        assert!(Instant::now() < deadline, "checkpoint worker did not start");
++        std::thread::sleep(Duration::from_millis(1));
++    };
++    let config = wechat_config::ServerConfig {
++        schema_version: 1,
++        config_file: temporary.path().join("server.toml"),
++        config_present: false,
++        data_dir: root,
++        token_file: temporary.path().join("api-token"),
++        token_explicit: false,
++        storage_key_file: None,
++        profile_format_key_file: None,
++        listen: "127.0.0.1:0".parse().unwrap(),
++        network_listen: None,
++        tls_cert_file: None,
++        tls_key_file: None,
++    };
++    (temporary, core, config, created)
++}
++
++fn joined_while_owned(core: &Core, store: &Arc<wechat_store::Store>, workers: &BTreeSet<u32>) {
++    assert!(core.stopping.load(Ordering::SeqCst));
++    assert!(
++        Arc::strong_count(store) >= 2,
++        "Store was dropped instead of explicitly joined"
++    );
++    assert!(workers
++        .iter()
++        .all(|id| !Path::new("/proc/self/task").join(id.to_string()).exists()));
++    assert_eq!(
++        core.storage_maintenance_health("one").unwrap()["stopping"],
++        true
++    );
++    store
++        .put_runtime("one", "after-cli-join", b"still-owned")
++        .unwrap();
++    assert_eq!(
++        store.runtime("one", "after-cli-join").unwrap().unwrap(),
++        b"still-owned"
++    );
++}
++
++#[tokio::test]
++async fn serve_setup_error_joins_checkpoint_before_return_with_other_core_owners() {
++    let _serial = SERIAL.lock().await;
++    let (_temporary, core, mut config, workers) = fixture();
++    let store = core.store.clone();
++    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++    config.listen = occupied.local_addr().unwrap();
++    let error = serve_owned(core.clone(), config, "synthetic-owner-token".into())
++        .await
++        .unwrap_err();
++    assert_eq!(
++        error.downcast_ref::<std::io::Error>().unwrap().kind(),
++        std::io::ErrorKind::AddrInUse
++    );
++    joined_while_owned(&core, &store, &workers);
++}
++
++#[tokio::test]
++async fn serve_graceful_shutdown_joins_checkpoint_before_cli_process_exit() {
++    let _serial = SERIAL.lock().await;
++    let (_temporary, core, config, workers) = fixture();
++    let store = core.store.clone();
++    core.shutdown();
++    serve_owned(core.clone(), config, "synthetic-owner-token".into())
++        .await
++        .unwrap();
++    joined_while_owned(&core, &store, &workers);
++}

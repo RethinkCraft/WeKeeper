@@ -1,0 +1,262 @@
+diff --git a/.changeset/admission-change-diagnostics.md b/.changeset/admission-change-diagnostics.md
+new file mode 100644
+index 0000000..b6e3094
+--- /dev/null
++++ b/.changeset/admission-change-diagnostics.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Identify the database category, validation phase and changed companion suffixes when SQLite store admission refuses a concurrent file-family change. Preserve the fail-closed admission checks, and cover read-only WAL readers creating companions with synthetic regression tests. Diagnostic context does not include account paths or message contents.
+diff --git a/packages/native-client-rust/crates/wechat-store/src/admission.rs b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+index 8b9ef99..2bf714e 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/admission.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/admission.rs
+@@ -23,6 +23,25 @@ struct Member {
+     changed: (i64, i64),
+ }
+ pub(crate) struct Family(BTreeMap<&'static str, Member>);
++fn database_class(path: &Path) -> &'static str {
++    match path.file_name().and_then(|name| name.to_str()) {
++        Some("registry.sqlite") => "registry",
++        Some("control.sqlite") => "account_control",
++        Some("database.sqlite") => "validation_copy",
++        _ => "other",
++    }
++}
++fn change_context(path: &Path, phase: &str, members: &[&str]) -> String {
++    let members = members
++        .iter()
++        .map(|suffix| if suffix.is_empty() { "main" } else { suffix })
++        .collect::<Vec<_>>()
++        .join(",");
++    format!(
++        "database={}, phase={phase}, members={members}",
++        database_class(path)
++    )
++}
+ fn member_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+     let mut name = path
+         .file_name()
+@@ -70,24 +89,38 @@ impl Family {
+         Ok(Self(members))
+     }
+     fn unchanged(&self, path: &Path) -> Result<bool> {
++        Ok(self.changed_members(path)?.is_empty())
++    }
++    fn changed_members(&self, path: &Path) -> Result<Vec<&'static str>> {
+         let current = Self::read(path)?;
+-        if self.0.keys().ne(current.0.keys()) {
+-            return Ok(false);
+-        }
+-        for (suffix, before) in &self.0 {
+-            let after = &current.0[suffix];
+-            if !wechat_platform::same_path_file(&member_path(path, suffix)?, &before.file)?
+-                || before.length != after.length
+-                || before.modified != after.modified
+-            {
+-                return Ok(false);
+-            }
++        let mut changed = Vec::new();
++        for suffix in SUFFIXES {
++            let (Some(before), Some(after)) = (self.0.get(suffix), current.0.get(suffix)) else {
++                if self.0.contains_key(suffix) != current.0.contains_key(suffix) {
++                    changed.push(suffix);
++                }
++                continue;
++            };
++            let differs =
++                !wechat_platform::same_path_file(&member_path(path, suffix)?, &before.file)?
++                    || before.length != after.length
++                    || before.modified != after.modified;
+             #[cfg(unix)]
+-            if before.changed != after.changed {
+-                return Ok(false);
++            let differs = differs || before.changed != after.changed;
++            if differs {
++                changed.push(suffix);
+             }
+         }
+-        Ok(true)
++        Ok(changed)
++    }
++    fn require_unchanged(&self, path: &Path, phase: &str, message: &str) -> Result<()> {
++        let changed = self.changed_members(path)?;
++        ensure!(
++            changed.is_empty(),
++            "{message} [{}]",
++            change_context(path, phase, &changed)
++        );
++        Ok(())
+     }
+     fn copy_to(&self, source: &Path, destination: &Path) -> Result<()> {
+         for (suffix, member) in &self.0 {
+@@ -104,14 +137,16 @@ impl Family {
+             )?;
+             ensure!(
+                 copied == member.length,
+-                "database family changed during validation"
++                "database family changed during validation [{}]",
++                change_context(source, "copy_length", &[suffix])
+             );
+             output.sync_all()?;
+         }
+-        ensure!(
+-            self.unchanged(source)?,
+-            "database family changed during validation"
+-        );
++        self.require_unchanged(
++            source,
++            "copy_complete",
++            "database family changed during validation",
++        )?;
+         wechat_platform::sync_dir(destination.parent().context("database needs a parent")?)?;
+         Ok(())
+     }
+@@ -132,7 +167,7 @@ impl Family {
+                 remaining -= wanted as u64;
+             }
+         }
+-        ensure!(self.unchanged(path)?, "database recovery family changed");
++        self.require_unchanged(path, "recovery_digest", "database recovery family changed")?;
+         Ok(format!("{:x}", hash.finalize()))
+     }
+ }
+@@ -240,10 +275,11 @@ pub(crate) fn open_prepared<T>(
+             path.display()
+         )
+     })?;
+-    ensure!(
+-        family.unchanged(path)?,
+-        "database family changed during validation; existing files preserved"
+-    );
++    family.require_unchanged(
++        path,
++        "post_validation",
++        "database family changed during validation; existing files preserved",
++    )?;
+     // Rollback recovery can legitimately change the main file or consume its
+     // journal. Keep the pre-open family before permitting that operation; the
+     // content-addressed name deduplicates unchanged retries and cold restarts.
+@@ -252,10 +288,11 @@ pub(crate) fn open_prepared<T>(
+     } else {
+         None
+     };
+-    ensure!(
+-        family.unchanged(path)?,
+-        "database family changed before admission; existing files preserved"
+-    );
++    family.require_unchanged(
++        path,
++        "pre_admission",
++        "database family changed before admission; existing files preserved",
++    )?;
+     let opened = (|| -> Result<(Connection, T)> {
+         let mut db = connect(path)?;
+         let value = prepare(&mut db)?;
+@@ -293,3 +330,104 @@ pub(crate) fn remember(cache: &mut AdmissionCache, path: &Path) -> Result<()> {
+     cache.insert(path.to_owned(), Family::read(path)?);
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn clean_wal_database(path: &Path) -> Result<()> {
++        wechat_platform::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(path)?;
++        let db = Connection::open(path)?;
++        db.execute_batch(
++            "PRAGMA journal_mode=WAL; CREATE TABLE fixture(value TEXT NOT NULL); \
++             INSERT INTO fixture VALUES('synthetic preserved value');",
++        )?;
++        db.close().map_err(|(_, error)| error)?;
++        for suffix in ["-wal", "-shm", "-journal"] {
++            assert!(!member_path(path, suffix)?.exists());
++        }
++        Ok(())
++    }
++
++    fn family_bytes(path: &Path) -> Result<BTreeMap<&'static str, Vec<u8>>> {
++        SUFFIXES
++            .into_iter()
++            .filter_map(|suffix| {
++                let member = member_path(path, suffix).unwrap();
++                member.exists().then(|| {
++                    fs::read(member)
++                        .map(|bytes| (suffix, bytes))
++                        .map_err(Into::into)
++                })
++            })
++            .collect()
++    }
++
++    #[test]
++    fn readonly_wal_reader_creating_companions_is_refused_without_source_changes() -> Result<()> {
++        let temp = tempfile::tempdir()?;
++        let path = temp.path().join("control.sqlite");
++        clean_wal_database(&path)?;
++        let main_before = fs::read(&path)?;
++        let family = Family::read(&path)?;
++
++        // This is intentionally after admission captured the family. SQLite's
++        // READ_ONLY flag still permits creating its WAL/index companions.
++        let reader = Connection::open_with_flags(
++            &path,
++            OpenFlags::SQLITE_OPEN_READ_ONLY
++                | OpenFlags::SQLITE_OPEN_NO_MUTEX
++                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
++        )?;
++        assert_eq!(
++            reader.query_row("SELECT value FROM fixture", [], |row| row
++                .get::<_, String>(0))?,
++            "synthetic preserved value"
++        );
++        let before_copy = family_bytes(&path)?;
++        assert!(before_copy.contains_key("-wal"));
++        assert!(before_copy.contains_key("-shm"));
++        assert_eq!(before_copy[""], main_before);
++
++        let error = family
++            .copy_to(&path, &temp.path().join("copy.sqlite"))
++            .unwrap_err()
++            .to_string();
++        assert_eq!(
++            error,
++            "database family changed during validation \
++             [database=account_control, phase=copy_complete, members=-wal,-shm]"
++        );
++        assert!(!error.contains(temp.path().to_str().unwrap()));
++        assert!(!error.contains("synthetic preserved value"));
++        assert_eq!(family_bytes(&path)?, before_copy);
++        assert_eq!(
++            reader.query_row("SELECT value FROM fixture", [], |row| row
++                .get::<_, String>(0))?,
++            "synthetic preserved value"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn uncontended_clean_wal_family_is_admitted_without_changing_data() -> Result<()> {
++        let temp = tempfile::tempdir()?;
++        let path = temp.path().join("control.sqlite");
++        clean_wal_database(&path)?;
++        let before = family_bytes(&path)?;
++        let (db, value) = open_prepared(&path, None, |db| {
++            Ok(db.query_row("SELECT value FROM fixture", [], |row| {
++                row.get::<_, String>(0)
++            })?)
++        })?;
++        assert_eq!(value, "synthetic preserved value");
++        db.close().map_err(|(_, error)| error)?;
++        assert_eq!(family_bytes(&path)?, before);
++        Ok(())
++    }
++}

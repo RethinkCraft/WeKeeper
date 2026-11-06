@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/thisnick/agent-wechat.git",
+  "release": "v1.3.0-beta.0",
+  "commit": "db60e29370c2cf47e4593c1717900d3c547207e0",
+  "rust_toolchain": "1.93.1",
+  "cargo_lock_sha256": "cfe60753fa10f8346e46b77b343a8360d846a12322beb955a9f4a030cc9c674e",
+  "patches": [
+    {
+      "file": "patches/0001-required-consumers-client-ids.patch",
+      "sha256": "88793392be3bb6ff60f46d1e3893e58003fde0cd1505c32ccd8353fdbe3a68b6"
+    },
+    {
+      "file": "patches/0002-native-quote-receipts.patch",
+      "sha256": "9119dba9a1c2337993981a6a68f5db98889e6c1f2b9d18f3a6686e7a599f79f0"
+    },
+    {
+      "file": "patches/0003-owned-sync-duplicate-reader.patch",
+      "sha256": "9910a64815ea61b02f1bf67bff65b680e2a05562b5ed943df356e02d4c2a093a"
+    },
+    {
+      "file": "patches/0004-correlate-native-quote-receipts.patch",
+      "sha256": "b34bb715bd375f31cdeb46d0255e4b19abf0012fd43004a7564a1064cb936da5"
+    },
+    {
+      "file": "patches/0005-quote-echo-equivalence.patch",
+      "sha256": "d88b82b8143464dbf02355b6ad0fef5b05b94aff2b46c8212a6e0853c34aefe6"
+    },
+    {
+      "file": "patches/0006-direct-native-ingress.patch",
+      "sha256": "1c86a4a6d13bfd9db679db79bfafac98ee67fcbf2a6fc8b139dc914380e47b60"
+    },
+    {
+      "file": "patches/0007-admission-change-diagnostics.patch",
+      "sha256": "5bd5b6c8ca49a6e88b8e36ae1fa55d2533453a62892ea46169ec8ed660937cf5"
+    },
+    {
+      "file": "patches/0008-native-quote-phase-timings.patch",
+      "sha256": "853057c846a905804bed0f8520297a9652c5316d91732bf77085c24b2bf5f23d"
+    },
+    {
+      "file": "patches/0009-control-writer-lifetime.patch",
+      "sha256": "03f833a7ab702423090c23135e1d8dc8a48d2416e8782e07921588667839abc6"
+    },
+    {
+      "file": "patches/0010-expected-send-lookup-misses.patch",
+      "sha256": "d45ecee25337600ed49b804da5633b31d4352d2121f2b7566aa87f2aa1654edb"
+    },
+    {
+      "file": "patches/0011-quote-rpc-phase-observations.patch",
+      "sha256": "f5c578aab99d318eca7830b6f467af1818e98ae539fcb91fdea5a8fab53c7f84"
+    },
+    {
+      "file": "patches/0012-quote-http-phase-observations.patch",
+      "sha256": "23fc7f952b09d094fcfe21e5331319a3f25b280accb550dd5757194f7ec24507"
+    },
+    {
+      "file": "patches/0013-quote-short-connect-observations.patch",
+      "sha256": "d74fb32976eda43cfdce732fc906de278d201cc87c1b3ce8872348ea2eaa4591"
+    },
+    {
+      "file": "patches/0014-native-received-quote-admission.patch",
+      "sha256": "d03e7b3b75c0221c395e81b6f7487a71af32fbb8b0660fc6b92421b687cb5817"
+    },
+    {
+      "file": "patches/0015-native-unchanged-finalization.patch",
+      "sha256": "4549d6d3b3b2a8537b952cab79fcd32771ae497e578c3715db9fc73e3b234807"
+    },
+    {
+      "file": "patches/0016-native-equal-auth-finalization.patch",
+      "sha256": "0a90da6b55dfaced91c32fe4f5de3ca54ab4ca722a8962fe560fd87b1704a4f6"
+    },
+    {
+      "file": "patches/0017-native-idle-background-checkpoints.patch",
+      "sha256": "c949840f0bdf1df7c526925d7f8533c105d6349501517813d7f76cb5fc75c1e1"
+    },
+    {
+      "file": "patches/0018-session-renew-on-reject.patch",
+      "sha256": "1626483f2175cc6068e6c53f623b0bced61b202f9a324e8297f9f8989c516a97"
+    },
+    {
+      "file": "patches/0019-archive-projection-yield.patch",
+      "sha256": "2f88dca07bd9c4b7081a1cbb59faea4e602a3ac182e6124c6670204e4be6e7b3"
+    },
+    {
+      "file": "patches/0020-equal-send-credential-authority.patch",
+      "sha256": "a12a7cfccc63840db8e1bcb0fb95b3402562d8e50771fe591dd255c434af1eba"
+    }
+  ],
+  "acceptance": {
+    "native_quote_live_validated": false,
+    "independent_peer_receipt_verified": false,
+    "phone_receipt_verified": false,
+    "business_connected": false
+  }
+}

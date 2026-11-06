@@ -1,0 +1,152 @@
+diff --git a/.changeset/archive-projection-yield.md b/.changeset/archive-projection-yield.md
+new file mode 100644
+--- /dev/null
++++ b/.changeset/archive-projection-yield.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Defer archive profile projection while foreground send/receive work holds the account path, forcing progress after sixty seconds so catch-up cannot starve.
+diff --git a/packages/native-client-rust/FEATURES.md b/packages/native-client-rust/FEATURES.md
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -277,3 +277,10 @@
+ and push reconnects with `session_renewed`. Unchanged credentials, renew
+ transport failures, local logout, and desired!=connected keep the original
+ logout path. Explicit logout never renews.
++### Archive projection yields to foreground
++
++Native ingress defers new archive-profile projection commands while queued or
++in-flight sends exist, required consumers still have unacked events, or event
++activity is newer than two seconds. The oldest pending projection batch still
++advances after sixty seconds so archive work cannot starve. Bot receive does
++not wait for `message.committed`.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs b/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/native_ingress.rs
+@@ -275,6 +275,30 @@
+         Ok(())
+     }
+ 
++    fn defer_archive_projection(&self, account: &str) -> Result<bool> {
++        // Bot receive path does not wait for message.committed. Yield the
++        // account lock while foreground send/receive work is active, but never
++        // starve archive projection longer than sixty seconds.
++        let oldest = self.store.oldest_pending_projection_age_secs(account)?;
++        if oldest.is_some_and(|age| age >= 60) {
++            return Ok(false);
++        }
++        if !self.store.queued_sends(account)?.is_empty()
++            || !self.store.submitting_sends(account)?.is_empty()
++            || self.store.required_consumers_unacked(account)?
++        {
++            return Ok(true);
++        }
++        if self
++            .store
++            .recent_event_activity_secs(account)?
++            .is_some_and(|age| age <= 2)
++        {
++            return Ok(true);
++        }
++        Ok(false)
++    }
++
+     pub(super) fn start_native_ingress_worker(self: &Arc<Self>, account: &str) -> Result<()> {
+         let core = self.clone();
+         let account = account.to_owned();
+@@ -302,6 +326,14 @@
+                     tokio::time::sleep(Duration::from_millis(250)).await;
+                     continue;
+                 }
++                let defer_archive = send_projection.is_none()
++                    && core
++                        .defer_archive_projection(&account)
++                        .unwrap_or(false);
++                if defer_archive {
++                    tokio::time::sleep(Duration::from_millis(50)).await;
++                    continue;
++                }
+                 let Ok(guard) = core.lock_account(&account).await else {
+                     break;
+                 };
+@@ -311,7 +343,9 @@
+                     let _guard = guard;
+                     let own = worker.account_state(&owned)?.own_username.clone();
+                     worker.catalogue_native_history(&owned, &own)?;
+-                    if worker.store.queued_sends(&owned)?.is_empty() {
++                    if worker.store.queued_sends(&owned)?.is_empty()
++                        && worker.store.submitting_sends(&owned)?.is_empty()
++                    {
+                         if let Some(id) = send_projection {
+                             // Local repair only: accepted sends never re-enter
+                             // the network submission path, even after failure.
+diff --git a/packages/native-client-rust/crates/wechat-store/src/operations.rs b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+--- a/packages/native-client-rust/crates/wechat-store/src/operations.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/operations.rs
+@@ -561,6 +561,64 @@
+             Ok(rows.collect::<rusqlite::Result<_>>()?)
+         })
+     }
++    pub fn submitting_sends(&self, account: &str) -> Result<Vec<String>> {
++        self.control(account, |db| {
++            let mut q = db.prepare(
++                "SELECT id FROM outbox WHERE state='submitting' ORDER BY created_at,id LIMIT 100",
++            )?;
++            let rows = q.query_map([], |r| r.get(0))?;
++            Ok(rows.collect::<rusqlite::Result<_>>()?)
++        })
++    }
++    /// True when any required consumer still has delivered-but-unacked events.
++    pub fn required_consumers_unacked(&self, account: &str) -> Result<bool> {
++        self.control(account, |db| {
++            Ok(db.query_row(
++                "SELECT EXISTS(SELECT 1 FROM required_event_consumers WHERE delivered_sequence>acknowledged_sequence)",
++                [],
++                |r| r.get(0),
++            )?)
++        })
++    }
++    /// Age in seconds of the oldest non-projected message apply intent, if any.
++    pub fn oldest_pending_projection_age_secs(&self, account: &str) -> Result<Option<i64>> {
++        self.control(account, |db| {
++            let created: Option<String> = db.query_row(
++                "SELECT created_at FROM apply_intents WHERE stream='message' AND state!='projected' ORDER BY rowid LIMIT 1",
++                [],
++                |r| r.get(0),
++            ).optional()?;
++            let Some(created) = created else {
++                return Ok(None);
++            };
++            let Some(when) = chrono::DateTime::parse_from_rfc3339(&created)
++                .ok()
++                .map(|value| value.with_timezone(&chrono::Utc))
++            else {
++                return Ok(Some(0));
++            };
++            Ok(Some((chrono::Utc::now() - when).num_seconds().max(0)))
++        })
++    }
++    pub fn recent_event_activity_secs(&self, account: &str) -> Result<Option<i64>> {
++        self.control(account, |db| {
++            let created: Option<String> = db.query_row(
++                "SELECT created_at FROM events ORDER BY sequence DESC LIMIT 1",
++                [],
++                |r| r.get(0),
++            ).optional()?;
++            let Some(created) = created else {
++                return Ok(None);
++            };
++            let Some(when) = chrono::DateTime::parse_from_rfc3339(&created)
++                .ok()
++                .map(|value| value.with_timezone(&chrono::Utc))
++            else {
++                return Ok(None);
++            };
++            Ok(Some((chrono::Utc::now() - when).num_seconds().max(0)))
++        })
++    }
+     pub fn send_payload(&self, account: &str, id: &str) -> Result<Vec<u8>> {
+         self.control(account, |db| {
+             Ok(db.query_row("SELECT payload FROM outbox WHERE id=?1", [id], |r| r.get(0))?)

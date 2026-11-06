@@ -1,132 +1,43 @@
 # Architecture
 
-WeKeeper keeps one collector, one private SQLite archive and one local stdio MCP
-layer. There is no HTTP server, separate AI analysis service, vector database or
-distributed job system. Codex performs analysis after requesting scoped evidence.
+WeKeeper has two application layers over a shared local archive: dashboard/sync/private AI conversations, and the protocol group bot.
 
-```mermaid
-flowchart LR
-    W[Local WeChat databases and cache] --> C[Collector]
-    C --> A[(SQLite archive)]
-    C --> B[Content-addressed media]
-    A --> M[stdio MCP]
-    B --> M
-    M --> X[Codex]
-    X -. explicit accepted voice request .-> J[Queued native task]
-    J --> N[Isolated cache proof and native UI worker]
-    N --> A
-```
+## Local archive and intake
 
-## Source and collection boundary
+`archive.py` owns transactional messages, source provenance, search, coverage and cached media metadata. Existing schema 4 and 5 stores retain their version on read or write; a new store uses schema 5. Read-only access never initializes or migrates a database. The retired UI bot's event production is removed; existing historical event tables are left intact.
 
-Discovery and key initialization are separate from ordinary collection. Explicit
-setup commands save only account-bound, HMAC-verified material. The collector
-and MCP never automatically acquire keys, start WeChat or log in.
+The official-client collector and protocol snapshot bridge are alternative intake paths. The bridge stages a page durably, writes the retained snapshots through the public archive store, and then advances its own cursor. Its stable source identity, message row assignments and cursor survive restarts. It does not become a required gateway consumer, acknowledge bot events, or send messages. The gateway's control database remains owned by the gateway.
 
-For each changed message shard, the collector creates one stable decrypted
-snapshot and reads its group tables in batches. Source row identity, not message
-time, advances the collection checkpoint. New rows are prioritized; independent
-backfill and daily reconciliation resume after interruption. New groups and
-shards are discovered automatically. Source reset/reuse starts a new generation
-without erasing old archived data.
+`core/` contains local database snapshots, decryption and process helpers. Cached media and document extraction remain local. Optional native voice conversion has its own explicit request and acceptance gate; removal of UI bot sending does not remove voice support.
 
-Message insertion and checkpoint updates commit in the same transaction.
-SQLite WAL permits archive queries during collection. A collector lock rejects
-another collection instance for the same state. Temporary plaintext snapshots
-are private, bounded and cleaned after use; unparsed and unknown payloads remain
-available in the private archive for later reparsing.
+## Dashboard and private questions
 
-Cached `VoiceInfo` audio and `head_image.db` images enrich existing identities.
-Their snapshots, progress and errors remain separate from message checkpoints.
-An auxiliary failure cannot prevent text archival or become false evidence of
-new message reception.
+`dashboard/` contains outgoing sync, the local AI worker, independent SIWC authorization, cloud read models, security and usage. The browser is in `frontend/`; deployment assets are in `deploy/dashboard/`.
 
-## Archive and media model
+Sync sends only allowlisted groups' text projections and protected avatar thumbnails. Partition revisions, hashes, queued retries and idempotent server ingestion handle reconnects and lost acknowledgements. Collector health, sync health, authorization and quota retain separate meanings.
 
-Stable message references bind account, group, server identity and source
-provenance. Raw origins, structured content, reply relations, media state and
-parser version are retained. Same-second or late messages are not skipped by
-timestamp watermarks. Missing server IDs are preserved conservatively when
-cross-generation deduplication cannot be proved.
+Private questions use leased cloud jobs and local scoped search, message context and statistics tools. Each turn freezes its selected groups and time range. The worker stores completed events before upload; restart recovery does not repeat uncertain inference. Conversations remain private to their creator.
 
-The archive includes local member/profile snapshots, avatar versions, forwarded
-items, ordered card components, original voice assets, native transcript versions
-and task records. Quotes, forwarded entries, note components and transcripts do
-not count as additional top-level group messages or actual group participants.
+Independent SIWC authorization, shared inference pause state and process locks are separate from all application task queues. Removing scheduled summaries does not remove login, refresh, `auth resume`, request concurrency limits, actual usage or the private question worker. There is no background summary scheduler or precomputed-summary tool.
 
-Media uses content-addressed copies of already cached bytes and any verified
-decoded image. Precise identity/content evidence is required for association;
-filenames or visual similarity are insufficient. Full cache, thumbnail,
-unresolved, missing, corrupt and unsupported states remain distinct. Existing
-decoding material is retained when new settings arrive. Source cache cleanup
-does not invalidate a good archive copy.
+## Protocol group bot
 
-All business storage remains in the selected private state:
+`bot/` contains:
 
-```text
-STATE_DIR/
-├── archive/
-│   ├── archive.sqlite
-│   ├── media/
-│   └── backups/
-└── secrets/
-```
+- `protocol_gateway`, `protocol_inbox` and `protocol_native_inbox`: account-bound receipt, persisted intake, native source snapshots and ACK handling.
+- `protocol_business`, `store`, `service` and `request_policy`: admission, business authorization, idempotent writes and recovery.
+- `reply_generator`, `memory_host`, `persona` and `providers`: generation with request-scoped business tools and the selected local model credentials.
+- `protocol_outbox`, `protocol_history` and `deferred_usage`: frozen reply delivery, confirmation, existing conversation history and durable usage completion.
+- `protocol_runtime` and `control`: independent processing lanes plus opt-in outgoing cloud management.
 
-Operational lock/metadata files and optional accessibility preparation records
-also live in private state. These paths are implementation storage, not MCP
-reference inputs. The repository contains no account state or client binaries.
+One activated consumer retains its initial account, generation and receive boundary. An ordinary restart must not activate again. A request can produce at most one final reply. An uncertain send is reconciled using its existing identifier; recovery does not submit another send to obtain certainty.
 
-## Queries and short-lived workers
+Cloud management starts only after explicit alignment of the active local configuration. The control loop is independent of reception, generation, projection, sending and reconciliation. It retains group allowlists, pseudonymous member resolution, provider verification and monotonic configuration revisions. Protocol outbox acceptance is reported as gateway acceptance; it is not a phone-delivery assertion.
 
-Ordinary MCP tools open the archive read-only. Reads, searches and statistics
-require explicit groups and times. FTS5 trigram search handles suitable terms;
-short Chinese terms use bounded substring matching. Optional transcript/card/
-forwarded indexes return the parent message and match provenance. Derived index
-changes do not invalidate ordinary message identity or inflate counts.
+## Package and deployment boundaries
 
-Paging is bounded by item count and output size. Cursors bind query scope and
-the relevant snapshot/revision. Source/coverage gaps remain visible instead of
-being represented as an empty, supposedly complete history.
+The import name remains `chatlog_keeper`. Three installed entrypoints are `chatlog-keeper`, `wekeeper-dashboard`, and `wekeeper-bot`. The archive MCP retains fifteen tools and no bot send permission; the separate business MCP retains its scoped permission model.
 
-Document extraction is an isolated worker consuming verified archive bytes. It
-has input, expansion, text/output, CPU, memory and wall-clock limits. HTML is
-parsed as inert text, formulas are not evaluated, and no renderer or external
-fetch path exists. These resource limits are not an operating-system network
-sandbox.
+Wheels contain the Python runtime and required native-source helpers. Source distributions additionally contain frontend source/lockfiles, offline tests, documentation, portable unit templates and the complete pinned gateway patch chain. Rust build trees, account state, model keys, gateway tokens and generated reports are private deployment resources, not release contents.
 
-The optional native conversion queue is independent of the 30-second collector
-poll. A single task runs in an isolated child with a 90-second deadline, bounded
-pipes, parent-exit protection and a UI lock. Before any conversion, a companion
-read-only process authenticates the current cached audio and verifies its identity
-and hash. The reviewed UI path checks account, group, sender, time and duration;
-ambiguous or changed targets stop. Results come from WeChat's native accessibility
-text and are saved separately. Querying does not trigger a task.
-
-## Module map
-
-| Area | Main modules |
-|---|---|
-| CLI and MCP | `cli.py`, `mcp_server.py` |
-| Collection | `collector.py`, `p2_sources.py` |
-| Archive and structured semantics | `archive.py`, `archive_semantics.py`, `archive_p2.py`, `message_model.py` |
-| Cached media and documents | `archive_media.py`, `documents.py`, `document_extractors.py`, `document_worker.py` |
-| Native voice tasks | `native_transcription.py`, `native_accessibility.py`, `native_cache_probe.py` |
-| Session health and alerts | `client_health.py`, `health_alerts.py` |
-| Linux/source adapters | `wechat_db.py`, `wechat_contacts.py`, `wechat_image.py`, key modules and `core/` |
-
-The existing `chatlog_keeper/` and flat `tests/` layouts are retained for the
-0.5.0 publication. This packaging pass does not introduce a second runtime or
-rename stable package, CLI or MCP interfaces.
-
-## Trust and compatibility
-
-The archive stores plaintext private content; protect the whole state directory
-and its backups. MCP filters key material, raw payload fields and private URLs
-from ordinary output. Selected content still enters the requesting model's
-context, so chat text and document instructions remain untrusted data.
-
-Client UI presence and network availability do not prove WeChat server
-connectivity. Health combines those observations with actual recent ordinary
-message ingestion; a transcription/index update never counts as reception.
-The tested client and outstanding media/type gaps are described in
-[validation](validation.md), with future work in [the roadmap](../ROADMAP.md).
+Production services should use immutable, checksummed release directories. A source checkout can then be maintained without changing code underneath active processes. State paths and persisted queues stay independent of release paths.

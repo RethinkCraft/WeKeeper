@@ -1,0 +1,12 @@
+[Unit]
+Description=Check WeKeeper protocol session renewal periodically
+
+[Timer]
+OnBootSec=72h
+OnUnitActiveSec=72h
+AccuracySec=1h
+Persistent=true
+Unit=wekeeper-protocol-session-renew-verify.service
+
+[Install]
+WantedBy=timers.target

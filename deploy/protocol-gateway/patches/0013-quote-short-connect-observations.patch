@@ -1,0 +1,665 @@
+diff --git a/.changeset/native-quote-connect-observations.md b/.changeset/native-quote-connect-observations.md
+new file mode 100644
+index 0000000..ac91895
+--- /dev/null
++++ b/.changeset/native-quote-connect-observations.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Add an opt-in private timing phase around the short HTTP client's actual connector. Owned trace context follows the request without global state; legacy observers keep the original connector path. Connection results, errors, timeouts and cancellation are retained, and diagnostics omit request and endpoint values. The direct Tower dependency uses the already locked package and features.
+diff --git a/deploy/native/README.md b/deploy/native/README.md
+index c36e215..14ec802 100644
+--- a/deploy/native/README.md
++++ b/deploy/native/README.md
+@@ -107,6 +107,8 @@ The writer is bounded and never makes send workers wait for stdout. Check sequen
+ 
+ Within a native quote `raw_rpc`, `rpc_session_connect` includes DNS/TCP setup and the complete pinned MMTLS handshake through its verified NOOP reply. Their child phases are `rpc_dns_tcp_connect` and `rpc_mmtls_handshake`. Separate phases cover quote protobuf preparation, the authenticated packet, shortlink framing, HTTP-client construction, `rpc_short_http` (request construction, response status and bounded body read), MMTLS reply decoding and authenticated reply decoding/cookie installation. Within `rpc_short_http`, `rpc_short_http_headers` ends after the request returns response headers and its status is checked; `rpc_short_http_body` covers the unchanged bounded read of the complete response body. A send or status failure has no body phase. These records use the same command, intent and attempt as their parent; nested durations are not additive. Only quote sends attach this observer. Heartbeat, synchronization, login, simulator operations and other existing callers do not emit these RPC phases.
+ 
++An enabled native quote trace also observes the short HTTP client's actual connector as `rpc_short_http_connect`. With the current direct HTTP route, this covers its own DNS lookup and TCP connection, separately from the longlink connection. It ends before HTTP dispatch, request upload and response-header waiting finish; the remaining header interval is not a measurement of server processing alone. Each connector call has its own observation, and cancellation is incomplete rather than successful. The default path and legacy borrowed observers add no connector layer. No endpoint, address, header, body or raw-error value is recorded.
++
+ `server.user.toml` follows the Linux default `~/.config/agent-wechat/server/config.toml`. `server.toml` selects the explicit container locations:
+ 
+ | Path | Purpose |
+diff --git a/packages/native-client-rust/Cargo.lock b/packages/native-client-rust/Cargo.lock
+index b7d13ca..8241139 100644
+--- a/packages/native-client-rust/Cargo.lock
++++ b/packages/native-client-rust/Cargo.lock
+@@ -2490,6 +2490,7 @@ dependencies = [
+  "reqwest",
+  "serde",
+  "serde_json",
++ "tower",
+  "wechat-media",
+  "wechat-platform",
+  "zeroize",
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+index 59a9a67..2610f6b 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+@@ -50,6 +50,7 @@ pub(super) enum Stage {
+     RpcHttpClientPrepare,
+     RpcShortHttp,
+     RpcShortHttpHeaders,
++    RpcShortHttpConnect,
+     RpcShortHttpBody,
+     RpcMmtlsReplyDecode,
+     RpcAuthenticatedReplyDecode,
+@@ -371,6 +372,7 @@ fn rpc_stage(phase: wechat_protocol::rpc_observation::Phase) -> Stage {
+         Phase::HttpClientPrepare => Stage::RpcHttpClientPrepare,
+         Phase::ShortHttp => Stage::RpcShortHttp,
+         Phase::ShortHttpHeaders => Stage::RpcShortHttpHeaders,
++        Phase::ShortHttpConnect => Stage::RpcShortHttpConnect,
+         Phase::ShortHttpBody => Stage::RpcShortHttpBody,
+         Phase::MmtlsReplyDecode => Stage::RpcMmtlsReplyDecode,
+         Phase::AuthenticatedReplyDecode => Stage::RpcAuthenticatedReplyDecode,
+@@ -378,6 +380,11 @@ fn rpc_stage(phase: wechat_protocol::rpc_observation::Phase) -> Stage {
+ }
+ 
+ impl wechat_protocol::rpc_observation::Observer for Trace {
++    fn owned(&self) -> Option<Arc<dyn wechat_protocol::rpc_observation::Observer>> {
++        self.sink.as_ref()?;
++        Some(Arc::new(self.clone()))
++    }
++
+     fn begin(&self, phase: wechat_protocol::rpc_observation::Phase) {
+         self.emit(rpc_stage(phase), Edge::Begin, None, None);
+     }
+@@ -481,6 +488,7 @@ mod tests {
+         assert!(trace.command_id.is_none());
+         assert!(trace.command_key_hash.is_none());
+         assert!(trace.protocol_observer().is_none());
++        assert!(wechat_protocol::rpc_observation::Observer::owned(&trace).is_none());
+         assert_eq!(trace.measure(Stage::RawRpc, || Ok::<_, ()>(7)), Ok(7));
+     }
+ 
+@@ -493,7 +501,7 @@ mod tests {
+             .command("private-account", "private-key", Runtime::Native)
+             .bind(&id, Outcome::Created)
+             .worker();
+-        let observer = trace.protocol_observer().unwrap();
++        let observer = trace.protocol_observer().unwrap().owned().unwrap();
+         for phase in [
+             Phase::QuoteRequestPrepare,
+             Phase::SessionConnect,
+@@ -504,6 +512,7 @@ mod tests {
+             Phase::HttpClientPrepare,
+             Phase::ShortHttp,
+             Phase::ShortHttpHeaders,
++            Phase::ShortHttpConnect,
+             Phase::ShortHttpBody,
+             Phase::MmtlsReplyDecode,
+             Phase::AuthenticatedReplyDecode,
+@@ -515,7 +524,7 @@ mod tests {
+             .try_iter()
+             .map(|r| serde_json::to_value(r).unwrap())
+             .collect::<Vec<_>>();
+-        assert_eq!(rows.len(), 25);
++        assert_eq!(rows.len(), 27);
+         assert!(rows.iter().all(
+             |r| r["intent_id"] == id && r["command_id"].as_str() == trace.command_id.as_deref()
+         ));
+@@ -529,7 +538,11 @@ mod tests {
+         assert!(rows
+             .iter()
+             .any(|r| r["stage"] == "rpc_short_http" && r["edge"] == "end"));
+-        for stage in ["rpc_short_http_headers", "rpc_short_http_body"] {
++        for stage in [
++            "rpc_short_http_headers",
++            "rpc_short_http_connect",
++            "rpc_short_http_body",
++        ] {
+             assert!(rows
+                 .iter()
+                 .any(|r| r["stage"] == stage && r["edge"] == "begin"));
+diff --git a/packages/native-client-rust/crates/wechat-protocol/Cargo.toml b/packages/native-client-rust/crates/wechat-protocol/Cargo.toml
+index 0718552..5cf1d31 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/Cargo.toml
++++ b/packages/native-client-rust/crates/wechat-protocol/Cargo.toml
+@@ -16,6 +16,7 @@ flate2 = "1"
+ base64 = "0.22"
+ hex = "0.4"
+ reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
++tower = { version = "=0.5.3", default-features = false }
+ zeroize = { version = "1", features = ["derive"] }
+ image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+ 
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs b/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs
+index 226d779..4179fb7 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs
+@@ -6,6 +6,7 @@ use std::{
+     sync::{
+         atomic::{AtomicUsize, Ordering},
+         mpsc::{self, Receiver, Sender},
++        Arc,
+     },
+     thread,
+ };
+@@ -196,3 +197,192 @@ fn short_http_observation_disabled_keeps_the_complete_response() {
+         b"synthetic"
+     );
+ }
++
++#[derive(Clone)]
++struct OwnedRecorder(Sender<Event>);
++impl Observer for OwnedRecorder {
++    fn begin(&self, phase: Phase) {
++        self.0.send(Event::Begin(phase)).unwrap();
++    }
++    fn end(&self, phase: Phase, _: Duration, outcome: Outcome) {
++        self.0.send(Event::End(phase, outcome)).unwrap();
++    }
++    fn owned(&self) -> Option<Arc<dyn Observer>> {
++        Some(Arc::new(self.clone()))
++    }
++}
++
++#[test]
++fn short_http_connect_observation_ends_before_the_server_releases_headers() {
++    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++    let url = format!("http://{}/synthetic", listener.local_addr().unwrap());
++    let (seen, request_seen) = mpsc::channel();
++    let (headers, allow_headers) = mpsc::channel();
++    let server = thread::spawn(move || {
++        let (mut socket, _) = listener.accept().unwrap();
++        request(&mut socket);
++        seen.send(()).unwrap();
++        allow_headers.recv_timeout(Duration::from_secs(3)).unwrap();
++        socket
++            .write_all(
++                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsynthetic",
++            )
++            .unwrap();
++    });
++    let (sender, events) = mpsc::channel();
++    let worker = thread::spawn(move || {
++        let observer = OwnedRecorder(sender);
++        let builder = reqwest::blocking::Client::builder()
++            .timeout(Duration::from_secs(3))
++            .no_proxy()
++            .redirect(reqwest::redirect::Policy::none());
++        let client = crate::short_http_connect::observed(builder, Some(&observer))
++            .build()
++            .unwrap();
++        short_http_observed(Some(&observer), || {
++            Ok(client.post(url).body(Vec::new()).send()?)
++        })
++    });
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttp));
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttpHeaders));
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttpConnect));
++    assert_eq!(
++        next(&events),
++        Event::End(Phase::ShortHttpConnect, Outcome::Ok)
++    );
++    request_seen.recv_timeout(Duration::from_secs(3)).unwrap();
++    // The actual reqwest connector is ready, but the response headers have not
++    // been sent. No timer or sleep is used to guess this boundary.
++    assert!(matches!(events.try_recv(), Err(mpsc::TryRecvError::Empty)));
++    headers.send(()).unwrap();
++    assert_eq!(
++        next(&events),
++        Event::End(Phase::ShortHttpHeaders, Outcome::Ok)
++    );
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttpBody));
++    assert_eq!(next(&events), Event::End(Phase::ShortHttpBody, Outcome::Ok));
++    assert_eq!(next(&events), Event::End(Phase::ShortHttp, Outcome::Ok));
++    assert_eq!(worker.join().unwrap().unwrap(), b"synthetic");
++    server.join().unwrap();
++}
++
++struct ControlledResolver(bool);
++impl reqwest::dns::Resolve for ControlledResolver {
++    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
++        if self.0 {
++            Box::pin(async { Err(std::io::Error::other("synthetic resolver error").into()) })
++        } else {
++            Box::pin(std::future::pending())
++        }
++    }
++}
++
++#[test]
++fn short_http_connect_observation_preserves_resolver_failure() {
++    let (sender, events) = mpsc::channel();
++    let observer = OwnedRecorder(sender);
++    let builder = reqwest::blocking::Client::builder()
++        .timeout(Duration::from_secs(1))
++        .no_proxy()
++        .dns_resolver(Arc::new(ControlledResolver(true)));
++    let client = crate::short_http_connect::observed(builder, Some(&observer))
++        .build()
++        .unwrap();
++    let result = short_http_observed(Some(&observer), || {
++        Ok(client
++            .post("http://synthetic.invalid/synthetic")
++            .body(Vec::new())
++            .send()?)
++    });
++    assert!(result
++        .unwrap_err()
++        .downcast_ref::<reqwest::Error>()
++        .unwrap()
++        .is_connect());
++    assert_eq!(
++        events.try_iter().collect::<Vec<_>>(),
++        [
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++            Event::Begin(Phase::ShortHttpConnect),
++            Event::End(Phase::ShortHttpConnect, Outcome::Error),
++            Event::End(Phase::ShortHttpHeaders, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error)
++        ]
++    );
++}
++
++#[test]
++fn short_http_connect_observation_keeps_connect_timeout_and_cancellation() {
++    for enabled in [false, true] {
++        let (sender, events) = mpsc::channel();
++        let observer = OwnedRecorder(sender);
++        let builder = reqwest::blocking::Client::builder()
++            .timeout(Duration::from_secs(1))
++            .connect_timeout(Duration::from_millis(50))
++            .no_proxy()
++            .dns_resolver(Arc::new(ControlledResolver(false)));
++        let client = crate::short_http_connect::observed(
++            builder,
++            enabled.then_some(&observer as &dyn Observer),
++        )
++        .build()
++        .unwrap();
++        let result = short_http_observed(Some(&observer), || {
++            Ok(client
++                .post("http://synthetic.invalid/synthetic")
++                .body(Vec::new())
++                .send()?)
++        });
++        let error = result.unwrap_err();
++        let error = error.downcast_ref::<reqwest::Error>().unwrap();
++        assert!(error.is_timeout() && error.is_connect());
++        let rows = events.try_iter().collect::<Vec<_>>();
++        let mut expected = vec![
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++        ];
++        if enabled {
++            expected.extend([
++                Event::Begin(Phase::ShortHttpConnect),
++                Event::End(Phase::ShortHttpConnect, Outcome::Incomplete),
++            ]);
++        }
++        expected.extend([
++            Event::End(Phase::ShortHttpHeaders, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error),
++        ]);
++        assert_eq!(rows, expected);
++    }
++}
++
++#[test]
++fn short_http_connect_observation_legacy_borrowed_sink_has_no_owned_context() {
++    let (sender, events) = mpsc::channel();
++    let observer = Recorder(sender);
++    assert!(observer.owned().is_none());
++    let builder = reqwest::blocking::Client::builder()
++        .timeout(Duration::from_secs(1))
++        .connect_timeout(Duration::from_millis(50))
++        .no_proxy()
++        .dns_resolver(Arc::new(ControlledResolver(true)));
++    let client = crate::short_http_connect::observed(builder, Some(&observer))
++        .build()
++        .unwrap();
++    let result = short_http_observed(Some(&observer), || {
++        Ok(client
++            .post("http://synthetic.invalid/synthetic")
++            .body(Vec::new())
++            .send()?)
++    });
++    assert!(result.is_err());
++    assert_eq!(
++        events.try_iter().collect::<Vec<_>>(),
++        [
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++            Event::End(Phase::ShortHttpHeaders, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error)
++        ]
++    );
++}
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/lib.rs b/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
+index 4b838ca..19faac0 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
+@@ -18,6 +18,7 @@ pub mod protobuf;
+ pub mod push;
+ pub mod quote_send;
+ pub mod rpc_observation;
++mod short_http_connect;
+ pub mod silk;
+ pub mod wire;
+ pub use client::*;
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+index e9cfbe3..aafabdd 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+@@ -745,12 +745,12 @@ pub(crate) fn short_exchange_observed(
+         Ok((hello, extensions, wire))
+     })?;
+     let client = observe_rpc(observer, RpcPhase::HttpClientPrepare, || {
+-        Ok(reqwest::blocking::Client::builder()
++        let builder = reqwest::blocking::Client::builder()
+             .timeout(timeout)
+             .connect_timeout(timeout.min(Duration::from_secs(10)))
+             .redirect(reqwest::redirect::Policy::none())
+-            .no_proxy()
+-            .build()?)
++            .no_proxy();
++        Ok(crate::short_http_connect::observed(builder, observer).build()?)
+     })?;
+     let bytes = short_http_observed(observer, || {
+         Ok(client
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+index 9986d06..94962f3 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+@@ -1,6 +1,9 @@
+ //! Optional typed observations. No request, identity, endpoint or error values.
+ use anyhow::Result;
+-use std::time::{Duration, Instant};
++use std::{
++    sync::Arc,
++    time::{Duration, Instant},
++};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Phase {
+@@ -13,6 +16,7 @@ pub enum Phase {
+     HttpClientPrepare,
+     ShortHttp,
+     ShortHttpHeaders,
++    ShortHttpConnect,
+     ShortHttpBody,
+     MmtlsReplyDecode,
+     AuthenticatedReplyDecode,
+@@ -30,6 +34,12 @@ pub enum Outcome {
+ pub trait Observer: Send + Sync {
+     fn begin(&self, phase: Phase);
+     fn end(&self, phase: Phase, duration: Duration, outcome: Outcome);
++
++    /// Opt in to observations performed by the HTTP client's owned futures.
++    /// Existing borrowed observers keep the unchanged connector by default.
++    fn owned(&self) -> Option<Arc<dyn Observer>> {
++        None
++    }
+ }
+ 
+ struct Span<'a> {
+@@ -105,6 +115,7 @@ mod tests {
+ 
+     #[test]
+     fn disabled_runs_the_original_action_once_and_preserves_error() {
++        assert!(Recorder::default().owned().is_none());
+         let count = AtomicUsize::new(0);
+         let result: Result<()> = measure(None, Phase::SessionConnect, || {
+             count.fetch_add(1, Ordering::SeqCst);
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/short_http_connect.rs b/packages/native-client-rust/crates/wechat-protocol/src/short_http_connect.rs
+new file mode 100644
+index 0000000..2545e93
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-protocol/src/short_http_connect.rs
+@@ -0,0 +1,251 @@
++//! Optional observations around reqwest's actual short HTTP connector.
++use crate::rpc_observation::{Observer, Outcome, Phase};
++use std::{
++    future::Future,
++    pin::Pin,
++    sync::Arc,
++    task::{Context, Poll},
++    time::Instant,
++};
++use tower::{Layer, Service};
++
++pub(crate) fn observed(
++    builder: reqwest::blocking::ClientBuilder,
++    observer: Option<&dyn Observer>,
++) -> reqwest::blocking::ClientBuilder {
++    match observer.and_then(|observer| observer.owned()) {
++        Some(observer) => builder.connector_layer(ConnectLayer(observer)),
++        None => builder,
++    }
++}
++
++#[derive(Clone)]
++struct ConnectLayer(Arc<dyn Observer>);
++
++impl<S> Layer<S> for ConnectLayer {
++    type Service = ConnectService<S>;
++
++    fn layer(&self, inner: S) -> Self::Service {
++        ConnectService {
++            inner,
++            observer: self.0.clone(),
++        }
++    }
++}
++
++#[derive(Clone)]
++struct ConnectService<S> {
++    inner: S,
++    observer: Arc<dyn Observer>,
++}
++
++impl<S, Request> Service<Request> for ConnectService<S>
++where
++    S: Service<Request>,
++{
++    type Response = S::Response;
++    type Error = S::Error;
++    type Future = ConnectFuture<S::Future>;
++
++    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(context)
++    }
++
++    fn call(&mut self, request: Request) -> Self::Future {
++        let span = ConnectSpan::new(self.observer.clone());
++        let future = self.inner.call(request);
++        ConnectFuture {
++            future: Box::pin(future),
++            span,
++        }
++    }
++}
++
++struct ConnectFuture<F> {
++    future: Pin<Box<F>>,
++    span: ConnectSpan,
++}
++
++impl<F, T, E> Future for ConnectFuture<F>
++where
++    F: Future<Output = Result<T, E>>,
++{
++    type Output = Result<T, E>;
++
++    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.get_mut();
++        match this.future.as_mut().poll(context) {
++            Poll::Pending => Poll::Pending,
++            Poll::Ready(result) => {
++                this.span.finish(if result.is_ok() {
++                    Outcome::Ok
++                } else {
++                    Outcome::Error
++                });
++                Poll::Ready(result)
++            }
++        }
++    }
++}
++
++struct ConnectSpan {
++    observer: Arc<dyn Observer>,
++    started: Option<Instant>,
++}
++
++impl ConnectSpan {
++    fn new(observer: Arc<dyn Observer>) -> Self {
++        observer.begin(Phase::ShortHttpConnect);
++        Self {
++            observer,
++            started: Some(Instant::now()),
++        }
++    }
++
++    fn finish(&mut self, outcome: Outcome) {
++        if let Some(started) = self.started.take() {
++            self.observer
++                .end(Phase::ShortHttpConnect, started.elapsed(), outcome);
++        }
++    }
++}
++
++impl Drop for ConnectSpan {
++    fn drop(&mut self) {
++        self.finish(Outcome::Incomplete);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        future::{pending, ready, Pending, Ready},
++        sync::{
++            atomic::{AtomicUsize, Ordering},
++            Mutex,
++        },
++        task::{Wake, Waker},
++        time::Duration,
++    };
++
++    #[derive(Debug, PartialEq, Eq)]
++    enum Event {
++        Begin,
++        End(Outcome),
++    }
++    #[derive(Default)]
++    struct Recorder(Mutex<Vec<Event>>);
++    impl Observer for Recorder {
++        fn begin(&self, phase: Phase) {
++            assert_eq!(phase, Phase::ShortHttpConnect);
++            self.0.lock().unwrap().push(Event::Begin);
++        }
++        fn end(&self, phase: Phase, _: Duration, outcome: Outcome) {
++            assert_eq!(phase, Phase::ShortHttpConnect);
++            self.0.lock().unwrap().push(Event::End(outcome));
++        }
++    }
++    struct Noop;
++    impl Wake for Noop {
++        fn wake(self: Arc<Self>) {}
++    }
++
++    struct Immediate {
++        result: Result<u8, &'static str>,
++        ready: Result<(), &'static str>,
++        called: Arc<AtomicUsize>,
++    }
++    impl Service<u8> for Immediate {
++        type Response = u8;
++        type Error = &'static str;
++        type Future = Ready<Result<u8, &'static str>>;
++        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++            Poll::Ready(self.ready)
++        }
++        fn call(&mut self, request: u8) -> Self::Future {
++            assert_eq!(request, 7);
++            self.called.fetch_add(1, Ordering::SeqCst);
++            ready(self.result)
++        }
++    }
++
++    #[test]
++    fn connector_layer_forwards_request_result_and_error_without_extra_calls() {
++        for result in [Ok(9), Err("synthetic connection error")] {
++            let recorder = Arc::new(Recorder::default());
++            let called = Arc::new(AtomicUsize::new(0));
++            let mut service = ConnectLayer(recorder.clone()).layer(Immediate {
++                result,
++                ready: Ok(()),
++                called: called.clone(),
++            });
++            let waker = Waker::from(Arc::new(Noop));
++            let mut context = Context::from_waker(&waker);
++            assert_eq!(service.poll_ready(&mut context), Poll::Ready(Ok(())));
++            let mut future = Box::pin(service.call(7));
++            assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(result));
++            drop(future);
++            assert_eq!(called.load(Ordering::SeqCst), 1);
++            assert_eq!(
++                *recorder.0.lock().unwrap(),
++                [
++                    Event::Begin,
++                    Event::End(if result.is_ok() {
++                        Outcome::Ok
++                    } else {
++                        Outcome::Error
++                    })
++                ]
++            );
++        }
++    }
++
++    #[test]
++    fn connector_layer_preserves_readiness_failure_without_a_connection_span() {
++        let recorder = Arc::new(Recorder::default());
++        let called = Arc::new(AtomicUsize::new(0));
++        let mut service = ConnectLayer(recorder.clone()).layer(Immediate {
++            result: Ok(9),
++            ready: Err("synthetic readiness error"),
++            called: called.clone(),
++        });
++        let waker = Waker::from(Arc::new(Noop));
++        let mut context = Context::from_waker(&waker);
++        assert_eq!(
++            service.poll_ready(&mut context),
++            Poll::Ready(Err("synthetic readiness error"))
++        );
++        assert_eq!(called.load(Ordering::SeqCst), 0);
++        assert!(recorder.0.lock().unwrap().is_empty());
++    }
++
++    struct Never;
++    impl Service<()> for Never {
++        type Response = ();
++        type Error = ();
++        type Future = Pending<Result<(), ()>>;
++        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++            Poll::Ready(Ok(()))
++        }
++        fn call(&mut self, _: ()) -> Self::Future {
++            pending()
++        }
++    }
++
++    #[test]
++    fn connector_layer_dropped_pending_future_is_incomplete() {
++        let recorder = Arc::new(Recorder::default());
++        let mut service = ConnectLayer(recorder.clone()).layer(Never);
++        let mut future = Box::pin(service.call(()));
++        let waker = Waker::from(Arc::new(Noop));
++        let mut context = Context::from_waker(&waker);
++        assert_eq!(future.as_mut().poll(&mut context), Poll::Pending);
++        assert_eq!(*recorder.0.lock().unwrap(), [Event::Begin]);
++        drop(future);
++        assert_eq!(
++            *recorder.0.lock().unwrap(),
++            [Event::Begin, Event::End(Outcome::Incomplete)]
++        );
++    }
++}

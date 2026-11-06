@@ -1,0 +1,469 @@
+diff --git a/.changeset/native-quote-echo-equivalence.md b/.changeset/native-quote-echo-equivalence.md
+new file mode 100644
+index 0000000..6f9df63
+--- /dev/null
++++ b/.changeset/native-quote-echo-equivalence.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Recover existing outgoing quoted messages when the native echo adds the observed client and display metadata to the official profile's XML. Retain exact message and quote identity, timestamps, body, source fields and all other XML values; conflicting echoes remain pending without rewriting the existing message.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+index 9c2effd..7216038 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs
+@@ -8,6 +8,9 @@ use wechat_profile::{
+ };
+ use wechat_protocol::wire::{AddMessage, SyncCommand};
+ 
++#[path = "sync_quote_echo.rs"]
++mod quote_echo;
++
+ /// A safe, typed obligation. The sealed batch retains the original command;
+ /// reporting this value never constitutes applying its native side effects.
+ #[derive(Debug, Serialize)]
+@@ -758,7 +761,12 @@ impl Core {
+             let stored = stored?;
+             let expected = std::str::from_utf8(&message.content)?;
+             if stored.create_time != message.created_at as i64
+-                || stored.content.text.as_deref() != Some(expected)
++                || !quote_echo::content_matches(
++                    stored.content.text.as_deref(),
++                    expected,
++                    message.outgoing,
++                    message.message_type,
++                )
+                 || stored.local_type
+                     != match stored_fields.get("local_type") {
+                         Some(SqlValue::Integer(n)) => n.clone(),
+@@ -1228,6 +1236,82 @@ impl Core {
+ mod encrypted_roundtrip {
+     use super::*;
+     use wechat_protocol::protobuf as p;
++    #[test]
++    fn existing_outgoing_quote_echo_preserves_identity_and_canonical_content() {
++        let temporary = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&temporary.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        let core = Core::new(store.clone(), None).unwrap();
++        core.configure_profile_format_key(&[9; 16]).unwrap();
++        core.install_login_state("one", &state(), None).unwrap();
++        core.ensure_managed_profile("one", &state()).unwrap();
++        let original = "<msg><appmsg><title>synthetic reply</title><type>57</type><refermsg><type>1</type><svrid>42</svrid><fromusr>peer</fromusr><chatusr>peer</chatusr><displayname></displayname><content>synthetic source</content></refermsg></appmsg><appinfo><version>0</version><isforceupdate>0</isforceupdate></appinfo></msg>";
++        let echoed = original
++            .replace("<version>0</version>", "<version>1</version>")
++            .replace("<isforceupdate>0</isforceupdate>", "")
++            .replace(
++                "<displayname></displayname>",
++                "<displayname>synthetic name</displayname>",
++            )
++            .replace("</msg>", "<scene>0</scene><commenturl/></msg>")
++            .replace("</title><type>", "</title>\n  <type>");
++        core.apply_sync_command(
++            "one",
++            &add(49, "synthetic_self", "peer", original.as_bytes(), 77, 100),
++            "original",
++            "catchup",
++        )
++        .unwrap();
++        core.apply_sync_command(
++            "one",
++            &add(49, "synthetic_self", "peer", echoed.as_bytes(), 77, 100),
++            "echo",
++            "catchup",
++        )
++        .unwrap();
++        let reader = core.profile_reader_owned("one").unwrap();
++        let rows = reader
++            .messages_by_server_id("peer", "77", Some("synthetic_self"))
++            .unwrap();
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0].content.text.as_deref(), Some(original));
++        assert_eq!(rows[0].sender.as_deref(), Some("synthetic_self"));
++        assert_eq!(rows[0].create_time, 100);
++        drop(reader);
++        assert_eq!(
++            store
++                .events("one", 0, 100)
++                .unwrap()
++                .iter()
++                .filter(|event| event.kind == "message.committed")
++                .count(),
++            1
++        );
++        for (from, to, time, receipt) in [
++            ("synthetic_self", "peer", 101, "changed-time"),
++            ("peer", "synthetic_self", 100, "incoming-echo"),
++        ] {
++            let error = core
++                .apply_sync_command(
++                    "one",
++                    &add(49, from, to, echoed.as_bytes(), 77, time),
++                    receipt,
++                    "catchup",
++                )
++                .unwrap_err();
++            if time != 100 {
++                // The official row's sort-slot selector rejects a changed
++                // create_time before the later echo/content comparison.
++                assert!(matches!(
++                    error.downcast_ref::<wechat_profile::ProfileError>(),
++                    Some(wechat_profile::ProfileError::InvalidMetadata)
++                ));
++            } else {
++                assert_eq!(error.to_string(), "message_identity_conflict");
++            }
++            assert!(store.runtime("one", receipt).unwrap().is_none());
++        }
++    }
+     pub(super) fn state() -> AccountState {
+         AccountState {
+             schema: 1,
+diff --git a/packages/native-client-rust/crates/wechat-core/src/sync_quote_echo.rs b/packages/native-client-rust/crates/wechat-core/src/sync_quote_echo.rs
+new file mode 100644
+index 0000000..74d3970
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/sync_quote_echo.rs
+@@ -0,0 +1,341 @@
++//! Existing outgoing quote echoes may add display/client metadata to the
++//! official row's XML. Keep every message/quote value and attribute exact;
++//! accept only the five directional differences observed in saved quote echoes.
++use roxmltree::{Document, Node, NodeId};
++use serde_json::{json, Value};
++use std::collections::{BTreeMap, BTreeSet};
++
++pub(super) fn content_matches(
++    stored: Option<&str>,
++    incoming: &str,
++    outgoing: bool,
++    message_type: i32,
++) -> bool {
++    if stored == Some(incoming) {
++        return true;
++    }
++    let Some(stored) = stored else {
++        return false;
++    };
++    outgoing && message_type == 49 && equivalent_quote_echo(stored, incoming).is_some()
++}
++
++fn parse(text: &str) -> Option<Document<'_>> {
++    if text.len() > 256 * 1024
++        || text.to_ascii_uppercase().contains("<!DOCTYPE")
++        || text.to_ascii_uppercase().contains("<!ENTITY")
++    {
++        return None;
++    }
++    let doc = Document::parse_with_options(
++        text,
++        roxmltree::ParsingOptions {
++            allow_dtd: false,
++            nodes_limit: 4096,
++            ..Default::default()
++        },
++    )
++    .ok()?;
++    if doc.descendants().any(|node| {
++        node.ancestors().take(34).count() > 32
++            || (node.is_element()
++                && (node.tag_name().namespace().is_some()
++                    || node
++                        .attributes()
++                        .any(|attribute| attribute.namespace().is_some())))
++    }) {
++        return None;
++    }
++    Some(doc)
++}
++
++fn unique_child<'a, 'input>(
++    node: Node<'a, 'input>,
++    name: &str,
++) -> Option<Option<Node<'a, 'input>>> {
++    let mut children = node.children().filter(|child| child.has_tag_name(name));
++    let first = children.next();
++    children.next().is_none().then_some(first)
++}
++
++fn leaf(node: Node<'_, '_>) -> Option<String> {
++    if node.attributes().len() != 0 || node.children().any(|child| !child.is_text()) {
++        return None;
++    }
++    Some(node.children().filter_map(|child| child.text()).collect())
++}
++
++fn view(doc: &Document<'_>, incoming: bool) -> Option<Vec<NodeId>> {
++    let root = doc.root_element();
++    if !root.has_tag_name("msg") {
++        return None;
++    }
++    let app = unique_child(root, "appmsg")??;
++    if leaf(unique_child(app, "type")??)? != "57" {
++        return None;
++    }
++    let reference = unique_child(app, "refermsg")??;
++    let display = unique_child(reference, "displayname")??;
++    let display_text = leaf(display)?;
++    if (!incoming && !display_text.is_empty())
++        || display_text.len() > 512
++        || display_text.contains('\0')
++    {
++        return None;
++    }
++    let info = unique_child(root, "appinfo")??;
++    let version = unique_child(info, "version")??;
++    let version_text = leaf(version)?;
++    if version_text != "0" && !(incoming && version_text == "1") {
++        return None;
++    }
++    let force = unique_child(info, "isforceupdate")?;
++    match force {
++        Some(node) if leaf(node).as_deref() != Some("0") => return None,
++        None if !incoming => return None,
++        _ => {}
++    }
++    let scene = unique_child(root, "scene")?;
++    let comment = unique_child(root, "commenturl")?;
++    if !incoming && (scene.is_some() || comment.is_some()) {
++        return None;
++    }
++    if scene.is_some_and(|node| leaf(node).as_deref() != Some("0"))
++        || comment.is_some_and(|node| leaf(node).as_deref() != Some(""))
++    {
++        return None;
++    }
++    Some(
++        [Some(display), Some(version), force, scene, comment]
++            .into_iter()
++            .flatten()
++            .map(|node| node.id())
++            .collect(),
++    )
++}
++
++// Preserve leaf text, element order, all attributes and every unrecognized field.
++// Namespaces, duplicate sibling elements, comments and processing instructions
++// are not part of this narrowly evidenced fallback.
++fn tree(node: Node<'_, '_>, ignored: &[NodeId], path: &str) -> Option<Value> {
++    if node.tag_name().namespace().is_some() {
++        return None;
++    }
++    let mut attributes = BTreeMap::new();
++    for attribute in node.attributes() {
++        if attribute.namespace().is_some() {
++            return None;
++        }
++        attributes.insert(attribute.name(), attribute.value());
++    }
++    let mut names = BTreeSet::new();
++    let mut children = Vec::new();
++    for child in node.children() {
++        if child.is_element() {
++            if !names.insert(child.tag_name().name()) {
++                return None;
++            }
++            if !ignored.contains(&child.id()) {
++                children.push(tree(
++                    child,
++                    ignored,
++                    &format!("{path}/{}", child.tag_name().name()),
++                )?);
++            }
++        } else if child.is_text() {
++            let text = child.text()?;
++            // Wire quotes indent these five containers, while the official
++            // row uses compact XML. Never trim a title, reference body or any
++            // other leaf value, including whitespace-only message content.
++            let layout = matches!(
++                path,
++                "/msg"
++                    | "/msg/appmsg"
++                    | "/msg/appmsg/appattach"
++                    | "/msg/appmsg/refermsg"
++                    | "/msg/appinfo"
++            ) && node.children().any(|child| child.is_element())
++                && text.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
++            if !text.is_empty() && !layout {
++                children.push(json!(["text", text]));
++            }
++        } else {
++            return None;
++        }
++    }
++    Some(json!([node.tag_name().name(), attributes, children]))
++}
++
++fn equivalent_quote_echo(stored: &str, incoming: &str) -> Option<()> {
++    let stored = parse(stored)?;
++    let incoming = parse(incoming)?;
++    let before = view(&stored, false)?;
++    let after = view(&incoming, true)?;
++    (tree(stored.root_element(), &before, "/msg")?
++        == tree(incoming.root_element(), &after, "/msg")?)
++    .then_some(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn profile() -> String {
++        "<msg><appmsg appid='' sdkver='0'><title>synthetic reply</title><type>57</type><refermsg><type>1</type><svrid>9007199254740993</svrid><fromusr>group@chatroom</fromusr><chatusr>sender</chatusr><displayname></displayname><content>synthetic original</content></refermsg><source>preserved</source></appmsg><appinfo><version>0</version><isforceupdate>0</isforceupdate></appinfo></msg>".into()
++    }
++
++    fn change(base: &str, field: usize) -> String {
++        match field {
++            0 => base.replace("<version>0</version>", "<version>1</version>"),
++            1 => base.replace("<isforceupdate>0</isforceupdate>", ""),
++            2 => base.replace("</msg>", "<scene>0</scene></msg>"),
++            3 => base.replace("</msg>", "<commenturl></commenturl></msg>"),
++            4 => base.replace(
++                "<displayname></displayname>",
++                "<displayname>synthetic name</displayname>",
++            ),
++            _ => unreachable!(),
++        }
++    }
++
++    #[test]
++    fn accepts_each_observed_metadata_change_and_all_combinations() {
++        let stored = profile();
++        for mask in 1..32 {
++            let mut incoming = stored.clone();
++            for field in 0..5 {
++                if mask & (1 << field) != 0 {
++                    incoming = change(&incoming, field);
++                }
++            }
++            assert!(
++                content_matches(Some(&stored), &incoming, true, 49),
++                "mask {mask}"
++            );
++            assert!(!content_matches(Some(&stored), &incoming, false, 49));
++            assert!(!content_matches(Some(&stored), &incoming, true, 1));
++        }
++    }
++
++    #[test]
++    fn rejects_changed_message_quote_identity_content_and_other_fields() {
++        let stored = profile();
++        let echoed = change(&stored, 4);
++        for (from, to) in [
++            ("synthetic reply", "changed reply"),
++            ("9007199254740993", "9007199254740994"),
++            ("group@chatroom", "other@chatroom"),
++            ("<chatusr>sender", "<chatusr>other"),
++            ("synthetic original", "changed original"),
++            ("<refermsg><type>1", "<refermsg><type>49"),
++            ("<type>57", "<type>1"),
++            ("<source>preserved", "<source>changed"),
++            ("appid=''", "appid='changed'"),
++            ("<version>0", "<version>2"),
++            ("<isforceupdate>0", "<isforceupdate>1"),
++        ] {
++            assert!(
++                !content_matches(Some(&stored), &echoed.replace(from, to), true, 49),
++                "{from}"
++            );
++        }
++        for extra in [
++            "<scene>1</scene>",
++            "<commenturl>https://example.invalid</commenturl>",
++            "<unknown>value</unknown>",
++        ] {
++            assert!(!content_matches(
++                Some(&stored),
++                &echoed.replace("</msg>", &format!("{extra}</msg>")),
++                true,
++                49
++            ));
++        }
++    }
++
++    #[test]
++    fn rejects_duplicate_nodes_namespaces_reverse_changes_and_nonempty_name_replacement() {
++        let stored = profile();
++        let echoed = change(&stored, 4);
++        for extra in [
++            "<type>57</type>",
++            "<title>synthetic reply</title>",
++            "<refermsg/>",
++        ] {
++            assert!(!content_matches(
++                Some(&stored),
++                &echoed.replace("</appmsg>", &format!("{extra}</appmsg>")),
++                true,
++                49
++            ));
++        }
++        assert!(!content_matches(
++            Some(&stored),
++            &echoed.replace("<msg>", "<msg xmlns='synthetic'>"),
++            true,
++            49
++        ));
++        assert!(!content_matches(Some(&echoed), &stored, true, 49));
++        assert!(!content_matches(
++            Some(&echoed),
++            &echoed.replace("synthetic name", "other name"),
++            true,
++            49
++        ));
++        assert!(!content_matches(
++            Some(&stored),
++            &echoed.replace("synthetic name", "<nested/>"),
++            true,
++            49
++        ));
++        assert!(!content_matches(
++            Some(&stored),
++            &format!("<!DOCTYPE msg>{echoed}"),
++            true,
++            49
++        ));
++    }
++
++    #[test]
++    fn exact_content_keeps_existing_behavior_without_fallback() {
++        assert!(content_matches(Some("plain"), "plain", false, 1));
++        assert!(!content_matches(None, "plain", true, 49));
++        assert!(!content_matches(Some("plain"), "different", true, 49));
++        assert!(!content_matches(
++            Some(&profile()),
++            &profile().replace("<type>57", "<type>1"),
++            true,
++            49
++        ));
++    }
++
++    #[test]
++    fn permits_only_container_layout_whitespace_and_preserves_leaf_whitespace() {
++        let stored = profile();
++        let echoed = change(&stored, 4)
++            .replace("<msg>", "<msg>\n\t")
++            .replace("</title><type>", "</title>\n\t<type>")
++            .replace("</svrid><fromusr>", "</svrid>\n  <fromusr>")
++            .replace("<appinfo>", "<appinfo>\n");
++        assert!(content_matches(Some(&stored), &echoed, true, 49));
++        for from in [
++            "synthetic reply",
++            "synthetic original",
++            "preserved",
++            "sender",
++        ] {
++            assert!(!content_matches(
++                Some(&stored),
++                &echoed.replace(from, &format!(" {from} ")),
++                true,
++                49
++            ));
++        }
++        assert!(!content_matches(
++            Some(&stored),
++            &echoed.replace("<msg>", "<msg>\u{a0}"),
++            true,
++            49
++        ));
++    }
++}

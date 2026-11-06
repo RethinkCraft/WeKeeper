@@ -1,0 +1,203 @@
+diff --git a/.changeset/native-control-writer-lifetime.md b/.changeset/native-control-writer-lifetime.md
+index 896701fc69614b46cd452c10fb425a9e255e7bff..567e79c3e78b43c1105a3abeb5f3926959ed309c 100644
+--- a/.changeset/native-control-writer-lifetime.md
++++ b/.changeset/native-control-writer-lifetime.md
+@@ -3,3 +3,5 @@
+ ---
+ 
+ Reuse up to eight idle account-sidecar WAL connections while preserving file-family admission, FULL synchronization and SQLite's default automatic checkpoint. Keep read snapshots separate, invalidate changed or failed connections, and hold ownership until every connection is closed. Unrecoverable connection cleanup requires a daemon restart instead of admitting another writer.
++
++Expected missing send and media idempotency keys keep the healthy connection alive while preserving their existing public not-found errors. SQL and receipt-decoding failures still invalidate the connection.
+diff --git a/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs b/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs
+index c4fe6625f68ae18f4cbdaa5d0d9c33aba6bc55a5..56d24def3a774f0110cd03e557d4f8f73fe348cb 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/control_writer_tests.rs
+@@ -67,6 +67,131 @@ fn wal_control_operations_reuse_the_owned_connection() {
+     assert_eq!(value, 7);
+ }
+ 
++#[test]
++fn expected_lookup_misses_keep_the_native_send_sequence_on_one_wal_writer() {
++    let (directory, store) = wal_store();
++    let path = control_path(&store, "one");
++    store
++        .put_runtime("one", "account-state", b"synthetic protected state")
++        .unwrap();
++    store.put_runtime("one", "desired", b"connected").unwrap();
++    store.control("one", |db| {
++        db.execute_batch("CREATE TEMP TABLE send_sequence_canary(value); INSERT INTO send_sequence_canary VALUES(11)")?;
++        Ok(())
++    }).unwrap();
++    let mut salts = BTreeSet::new();
++    let mut max_wal = 0;
++    for index in 0..12 {
++        let key = format!("native-send-{index}");
++        let error = store.send_by_key("one", &key).unwrap_err();
++        assert!(matches!(
++            error.downcast_ref::<rusqlite::Error>(),
++            Some(rusqlite::Error::QueryReturnedNoRows)
++        ));
++        assert_eq!(store.admitted.lock().unwrap().cached_writers(), 1);
++        assert_eq!(
++            store.runtime("one", "account-state").unwrap().unwrap(),
++            b"synthetic protected state"
++        );
++        let error = store
++            .media_job_by_key("one", &format!("send:{key}"))
++            .err()
++            .expect("missing media job");
++        assert!(matches!(
++            error.downcast_ref::<rusqlite::Error>(),
++            Some(rusqlite::Error::QueryReturnedNoRows)
++        ));
++        assert_eq!(store.admitted.lock().unwrap().cached_writers(), 1);
++        store
++            .control("one", |db| {
++                assert_eq!(
++                    db.query_row("SELECT value FROM send_sequence_canary", [], |r| r
++                        .get::<_, i64>(0))?,
++                    11
++                );
++                Ok(())
++            })
++            .unwrap();
++        let client_id = store.reserve_client_id("one", &key, index + 7).unwrap();
++        let (intent, created) = store
++            .create_send(
++                "one",
++                &key,
++                "synthetic-peer",
++                "fixed-hash",
++                b"sealed",
++                &client_id.to_string(),
++            )
++            .unwrap();
++        assert!(created && store.claim_send("one", &intent.id).unwrap());
++        store
++            .put_runtime(
++                "one",
++                &format!("quote-receipt:{}", intent.id),
++                b"retained raw receipt",
++            )
++            .unwrap();
++        store
++            .update_send(
++                "one",
++                &intent.id,
++                "accepted",
++                Some(&(700 + index).to_string()),
++                None,
++            )
++            .unwrap();
++        store
++            .put_runtime("one", "cross-checkpoint", &vec![index as u8; 1024 * 1024])
++            .unwrap();
++        let wal = fs::read(member(&path, "-wal")).unwrap();
++        salts.insert(wal[16..24].to_vec());
++        max_wal = max_wal.max(wal.len());
++    }
++    assert!(salts.len() >= 2);
++    assert!(max_wal < 6 * 1024 * 1024);
++    drop(store);
++    let reopened = Store::open_existing(&directory.path().join("data")).unwrap();
++    assert_eq!(
++        reopened
++            .send_by_key("one", "native-send-11")
++            .unwrap()
++            .server_id
++            .as_deref(),
++        Some("711")
++    );
++}
++
++#[test]
++fn failed_lookup_sql_or_receipt_decode_still_discards_the_writer() {
++    let (_directory, store) = wal_store();
++    let (intent, _) = store
++        .create_send("one", "known", "peer", "hash", b"sealed", "7")
++        .unwrap();
++    store
++        .put_runtime("one", &format!("send-projected:{}", intent.id), &[0xff])
++        .unwrap();
++    let error = store.send_by_key("one", "known").unwrap_err();
++    assert!(error
++        .to_string()
++        .contains("invalid text projection receipt"));
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++    store
++        .control("one", |db| {
++            db.execute_batch("DROP TABLE media_jobs")?;
++            Ok(())
++        })
++        .unwrap();
++    let error = store
++        .media_job_by_key("one", "unknown")
++        .err()
++        .expect("bad table is not missing key");
++    assert!(!matches!(
++        error.downcast_ref::<rusqlite::Error>(),
++        Some(rusqlite::Error::QueryReturnedNoRows)
++    ));
++    assert_eq!(store.admitted.lock().unwrap().cached_writers(), 0);
++}
++
+ #[test]
+ fn unfinished_control_transaction_is_not_reported_successful() {
+     let (_directory, store) = wal_store();
+diff --git a/packages/native-client-rust/crates/wechat-store/src/media.rs b/packages/native-client-rust/crates/wechat-store/src/media.rs
+index 166c54fdf3eb867af68234fb92940fac14236470..16360bce4d5458e64ec7d245e25de8e1349b7317 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/media.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/media.rs
+@@ -262,13 +262,16 @@ impl Store {
+     }
+     pub fn media_job_by_key(&self, account: &str, key: &str) -> Result<MediaJobRecord> {
+         self.control(account, |db| {
+-            let id: String = db.query_row(
+-                "SELECT id FROM media_jobs WHERE idempotency_key=?1",
+-                [key],
+-                |r| r.get(0),
+-            )?;
+-            read_job(db, &id)
+-        })
++            let id: Option<String> = db
++                .query_row(
++                    "SELECT id FROM media_jobs WHERE idempotency_key=?1",
++                    [key],
++                    |r| r.get(0),
++                )
++                .optional()?;
++            id.map(|id| read_job(db, &id)).transpose()
++        })?
++        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows.into())
+     }
+     pub fn pending_media_projections(&self, account: &str) -> Result<Vec<String>> {
+         self.control(account,|db|{
+diff --git a/packages/native-client-rust/crates/wechat-store/src/outbox.rs b/packages/native-client-rust/crates/wechat-store/src/outbox.rs
+index 482b8f3968ba64fdb0433e143793fde4e8efc3cb..7446dadb1861e5817d6119c60c2a561c8c24e97c 100644
+--- a/packages/native-client-rust/crates/wechat-store/src/outbox.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/outbox.rs
+@@ -127,13 +127,17 @@ impl Store {
+     }
+     pub fn send_by_key(&self, account: &str, key: &str) -> Result<SendIntent> {
+         self.control(account, |db| {
+-            let id: String = db.query_row(
+-                "SELECT id FROM outbox WHERE idempotency_key=?1",
+-                [key],
+-                |r| r.get(0),
+-            )?;
+-            super::operations::read_send(db, account, &id)
+-        })
++            let id: Option<String> = db
++                .query_row(
++                    "SELECT id FROM outbox WHERE idempotency_key=?1",
++                    [key],
++                    |r| r.get(0),
++                )
++                .optional()?;
++            id.map(|id| super::operations::read_send(db, account, &id))
++                .transpose()
++        })?
++        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows.into())
+     }
+     pub fn claim_send(&self, account: &str, id: &str) -> Result<bool> {
+         self.control(account,|db|{

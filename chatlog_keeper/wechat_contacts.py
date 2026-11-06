@@ -21,7 +21,7 @@ Usage:
     resolver = WeChatContactResolver(reader)
     resolver.load()
     name = resolver.resolve_display_name("wxid_xxxx")
-    is_grp = resolver.is_group("18461014732@chatroom")
+    is_grp = resolver.is_group("example@chatroom")
 """
 from __future__ import annotations
 

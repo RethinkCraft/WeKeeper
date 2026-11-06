@@ -1,0 +1,1132 @@
+diff --git a/.changeset/native-quote-rpc-observations.md b/.changeset/native-quote-rpc-observations.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d394a46cf78615461cbf8b68be907011acf9dd2
+--- /dev/null
++++ b/.changeset/native-quote-rpc-observations.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Extend opt-in private quote-send diagnostics with typed RPC phases for DNS/TCP setup, a fresh MMTLS handshake, request preparation, shortlink HTTP and response decoding. Records retain the existing intent and attempt correlation and omit endpoints, content, credentials and raw errors. Diagnostics require an effective-user-owned regular stdout file with mode 0600; transport, authentication, send ordering and retries are unchanged.
+diff --git a/deploy/native/README.md b/deploy/native/README.md
+index 2282d6a9ada089029d5566f6e48c3789b34e2c44..b775c315d11f989afe73c26594229eaf235f9ddd 100644
+--- a/deploy/native/README.md
++++ b/deploy/native/README.md
+@@ -99,12 +99,14 @@ Preserve the profile's ownership and backups when preparing permissions. For the
+ 
+ ## Configuration and durable data
+ 
+-For local quote-send diagnostics, set `WX_QUOTE_TIMINGS=1` before starting the daemon and redirect stdout to a private regular file. On Unix, the file must belong to the daemon's effective user and have no group/other permissions; pipes, terminals and unsupported platforms leave this diagnostic disabled. Use a private directory and `umask 077` when preparing the file. The initial `quote_phase_timing` record with stage `sink` confirms that capture started. The flag is off by default and does not change the HTTP API.
++For local quote-send diagnostics, set `WX_QUOTE_TIMINGS=1` before starting the daemon and redirect stdout to a private regular file. On Unix, the file must belong to the daemon's effective user and have mode 0600; pipes, terminals, other permission modes and unsupported platforms leave this diagnostic disabled. Use a private directory and `umask 077` when preparing the file. The initial `quote_phase_timing` record with stage `sink` confirms that capture started. The flag is off by default and does not change the HTTP API.
+ 
+ JSON lines contain diagnostic command/key hashes, intent/attempt IDs, native/simulator markers, UTC microseconds and monotonic phase boundaries. They omit message bodies, account names, destinations, credentials and raw receipts. Capture starts before admission, so an early failure may have no intent ID. Replays bind to the existing intent without another submission. Recovery records explicitly mark missing original command context; general recovered send workers can appear before their payload kind is known. An attempt ID identifies a local worker, not proof of a network send.
+ 
+ The writer is bounded and never makes send workers wait for stdout. Check sequence gaps, `dropped_records`, missing end records and `incomplete` outcomes before using a trace. Logging failure or shutdown can lose records; absence is not zero latency or a successful send. Store spans include admission/open/transaction work through commit return, not just disk flush time. Parent spans overlap their children and command responses can overlap worker execution; do not sum them or add their percentiles. `raw_rpc` means response bytes returned, while `final_state_persist` records the local send-state result after its existing transaction. Neither proves a phone displayed the reply. This diagnostic does not pool sessions, change retries, write a new database or fsync logs.
+ 
++Within a native quote `raw_rpc`, `rpc_session_connect` includes DNS/TCP setup and the complete pinned MMTLS handshake through its verified NOOP reply. Their child phases are `rpc_dns_tcp_connect` and `rpc_mmtls_handshake`. Separate phases cover quote protobuf preparation, the authenticated packet, shortlink framing, HTTP-client construction, `rpc_short_http` (request construction, response status and bounded body read), MMTLS reply decoding and authenticated reply decoding/cookie installation. These records use the same command, intent and attempt as their parent; nested durations are not additive. Only quote sends attach this observer. Heartbeat, synchronization, login, simulator operations and other existing callers do not emit these RPC phases.
++
+ `server.user.toml` follows the Linux default `~/.config/agent-wechat/server/config.toml`. `server.toml` selects the explicit container locations:
+ 
+ | Path | Purpose |
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+index da24966f5d7090efdc3c9c2a8e6778bcb1124621..3bd045269fc09f24a6602c5819909a1c89108b08 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -103,12 +103,13 @@ impl Core {
+         }
+         let sender = state.own_username.clone();
+         let raw = Zeroizing::new(trace.measure(TimingStage::RawRpc, || {
+-            self.upstream.send_quote_raw(
++            self.upstream.send_quote_raw_observed(
+                 state,
+                 &payload.thread_id,
+                 &payload.client_id.to_string(),
+                 payload.created_at,
+                 &quote.xml,
++                trace.protocol_observer(),
+             )
+         })?);
+         trace
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+index 1455897c07935520f4d58cce70d8f21881ed5b91..a94b5a881b21ec94d9f9a8a764d35fd92d43e114 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+@@ -41,6 +41,16 @@ pub(super) enum Stage {
+     SourceRecheck,
+     Claim,
+     RawRpc,
++    QuoteRequestPrepare,
++    RpcSessionConnect,
++    RpcDnsTcpConnect,
++    RpcMmtlsHandshake,
++    RpcAuthenticatedPacketPrepare,
++    RpcShortPacketPrepare,
++    RpcHttpClientPrepare,
++    RpcShortHttp,
++    RpcMmtlsReplyDecode,
++    RpcAuthenticatedReplyDecode,
+     ReceiptRetain,
+     ReceiptLoadDecode,
+     ReceiptRecovery,
+@@ -136,18 +146,25 @@ fn source_tree() -> &'static str {
+     }
+ }
+ 
++#[cfg(unix)]
++fn admit_stdout_file(file: std::fs::File) -> Option<std::fs::File> {
++    use std::os::unix::fs::MetadataExt;
++    let metadata = file.metadata().ok()?;
++    // SAFETY: geteuid has no arguments, pointers, or process side effects.
++    let owner = unsafe { libc::geteuid() };
++    (metadata.is_file() && metadata.mode() & 0o7777 == 0o600 && metadata.uid() == owner)
++        .then_some(file)
++}
++
+ fn private_stdout() -> Option<std::fs::File> {
+     #[cfg(unix)]
+     {
+-        use std::os::{fd::AsFd, unix::fs::MetadataExt};
+-        let file = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned().ok()?);
+-        let metadata = file.metadata().ok()?;
+-        // SAFETY: geteuid has no arguments, pointers, or process side effects.
+-        let owner = unsafe { libc::geteuid() };
+-        if metadata.is_file() && metadata.mode() & 0o077 == 0 && metadata.uid() == owner {
+-            return Some(file);
+-        }
++        use std::os::fd::AsFd;
++        admit_stdout_file(std::fs::File::from(
++            std::io::stdout().as_fd().try_clone_to_owned().ok()?,
++        ))
+     }
++    #[cfg(not(unix))]
+     None
+ }
+ 
+@@ -249,6 +266,13 @@ impl Timings {
+ }
+ 
+ impl Trace {
++    pub(super) fn protocol_observer(
++        &self,
++    ) -> Option<&dyn wechat_protocol::rpc_observation::Observer> {
++        self.sink
++            .as_ref()
++            .map(|_| self as &dyn wechat_protocol::rpc_observation::Observer)
++    }
+     fn emit(&self, stage: Stage, edge: Edge, duration_us: Option<u64>, outcome: Option<Outcome>) {
+         let Some(sink) = &self.sink else {
+             return;
+@@ -333,6 +357,47 @@ impl Trace {
+     }
+ }
+ 
++fn rpc_stage(phase: wechat_protocol::rpc_observation::Phase) -> Stage {
++    use wechat_protocol::rpc_observation::Phase;
++    match phase {
++        Phase::QuoteRequestPrepare => Stage::QuoteRequestPrepare,
++        Phase::SessionConnect => Stage::RpcSessionConnect,
++        Phase::DnsTcpConnect => Stage::RpcDnsTcpConnect,
++        Phase::MmtlsHandshake => Stage::RpcMmtlsHandshake,
++        Phase::AuthenticatedPacketPrepare => Stage::RpcAuthenticatedPacketPrepare,
++        Phase::ShortPacketPrepare => Stage::RpcShortPacketPrepare,
++        Phase::HttpClientPrepare => Stage::RpcHttpClientPrepare,
++        Phase::ShortHttp => Stage::RpcShortHttp,
++        Phase::MmtlsReplyDecode => Stage::RpcMmtlsReplyDecode,
++        Phase::AuthenticatedReplyDecode => Stage::RpcAuthenticatedReplyDecode,
++    }
++}
++
++impl wechat_protocol::rpc_observation::Observer for Trace {
++    fn begin(&self, phase: wechat_protocol::rpc_observation::Phase) {
++        self.emit(rpc_stage(phase), Edge::Begin, None, None);
++    }
++    fn end(
++        &self,
++        phase: wechat_protocol::rpc_observation::Phase,
++        duration: std::time::Duration,
++        outcome: wechat_protocol::rpc_observation::Outcome,
++    ) {
++        use wechat_protocol::rpc_observation::Outcome as RpcOutcome;
++        let outcome = match outcome {
++            RpcOutcome::Ok => Outcome::Ok,
++            RpcOutcome::Error => Outcome::Error,
++            RpcOutcome::Incomplete => Outcome::Incomplete,
++        };
++        self.emit(
++            rpc_stage(phase),
++            Edge::End,
++            Some(micros(duration)),
++            Some(outcome),
++        );
++    }
++}
++
+ pub(super) struct Span {
+     trace: Trace,
+     stage: Stage,
+@@ -388,14 +453,78 @@ impl Drop for Span {
+ mod tests {
+     use super::*;
+     #[test]
++    #[cfg(unix)]
++    fn diagnostic_file_requires_exact_private_mode_without_process_stdout_changes() {
++        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("private.jsonl");
++        let file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(&path)
++            .unwrap();
++        assert!(admit_stdout_file(file.try_clone().unwrap()).is_some());
++        for mode in [0o644, 0o400, 0o200, 0o700, 0o1600] {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
++            assert!(admit_stdout_file(file.try_clone().unwrap()).is_none());
++        }
++    }
++    #[test]
+     fn disabled_has_no_identity_allocation_or_events() {
+         let trace = Timings::default().command("private-account", "private-key", Runtime::Native);
+         assert!(trace.sink.is_none());
+         assert!(trace.command_id.is_none());
+         assert!(trace.command_key_hash.is_none());
++        assert!(trace.protocol_observer().is_none());
+         assert_eq!(trace.measure(Stage::RawRpc, || Ok::<_, ()>(7)), Ok(7));
+     }
+ 
++    #[test]
++    fn protocol_phases_keep_the_same_command_intent_and_attempt_without_values() {
++        use wechat_protocol::rpc_observation::{Outcome as RpcOutcome, Phase};
++        let (sink, receiver) = Timings::channel(64);
++        let id = uuid::Uuid::new_v4().to_string();
++        let trace = sink
++            .command("private-account", "private-key", Runtime::Native)
++            .bind(&id, Outcome::Created)
++            .worker();
++        let observer = trace.protocol_observer().unwrap();
++        for phase in [
++            Phase::QuoteRequestPrepare,
++            Phase::SessionConnect,
++            Phase::DnsTcpConnect,
++            Phase::MmtlsHandshake,
++            Phase::AuthenticatedPacketPrepare,
++            Phase::ShortPacketPrepare,
++            Phase::HttpClientPrepare,
++            Phase::ShortHttp,
++            Phase::MmtlsReplyDecode,
++            Phase::AuthenticatedReplyDecode,
++        ] {
++            observer.begin(phase);
++            observer.end(phase, std::time::Duration::ZERO, RpcOutcome::Ok);
++        }
++        let rows = receiver
++            .try_iter()
++            .map(|r| serde_json::to_value(r).unwrap())
++            .collect::<Vec<_>>();
++        assert_eq!(rows.len(), 21);
++        assert!(rows.iter().all(
++            |r| r["intent_id"] == id && r["command_id"].as_str() == trace.command_id.as_deref()
++        ));
++        assert!(rows
++            .iter()
++            .skip(1)
++            .all(|r| r["attempt_id"].as_str() == trace.attempt_id.as_deref()
++                && r["runtime"] == "native"));
++        let text = serde_json::to_string(&rows).unwrap();
++        assert!(!text.contains("private-account") && !text.contains("private-key"));
++        assert!(rows
++            .iter()
++            .any(|r| r["stage"] == "rpc_short_http" && r["edge"] == "end"));
++    }
++
+     #[test]
+     fn command_hashes_are_length_delimited_and_events_exclude_raw_inputs() {
+         let (sink, receiver) = Timings::channel(32);
+diff --git a/packages/native-client-rust/crates/wechat-core/src/upstream.rs b/packages/native-client-rust/crates/wechat-core/src/upstream.rs
+index 36cb30b2114be8074d4fcd96f4c08bf0e803ed0b..5a2e4b6f11a570f597636ea13b4701d473dc47c3 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/upstream.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/upstream.rs
+@@ -7,6 +7,7 @@ use std::{
+ use wechat_protocol::{
+     media_send::MediaSendResult,
+     push::Notification,
++    rpc_observation::Observer as RpcObserver,
+     wire::{Heartbeat, SyncBatch, TextSendResult},
+     AccountState, DeviceProfile, LoginAttempt, LoginStatus, NativeClient, NativeOptions,
+ };
+@@ -232,6 +233,19 @@ pub trait Upstream: Send + Sync {
+             content,
+         )
+     }
++    /// Custom upstreams keep their existing single submission implementation.
++    /// Only the native implementation attaches value-free protocol timings.
++    fn send_quote_raw_observed(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++        _observer: Option<&dyn RpcObserver>,
++    ) -> Result<Vec<u8>> {
++        self.send_quote_raw(state, destination, client_id, created_at, content)
++    }
+     fn send_share(
+         &self,
+         state: &mut AccountState,
+@@ -358,6 +372,18 @@ impl Upstream for NativeUpstream {
+     fn native(&self, options: NativeOptions) -> Result<NativeClient> {
+         NativeClient::new(options)
+     }
++    fn send_quote_raw_observed(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++        observer: Option<&dyn RpcObserver>,
++    ) -> Result<Vec<u8>> {
++        self.native(NativeOptions::default())?
++            .send_quote_raw_observed(state, destination, client_id, created_at, content, observer)
++    }
+ }
+ 
+ struct NativeChallenge {
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/client.rs b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+index d33293266a3495edc062b5eb35c4b75a9c3894b1..ff2b3d6b03663b0d47358033947be9d96d0e5508 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/client.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+@@ -21,7 +21,9 @@ use crate::{
+     business::{self, AuthenticatedPacket, Prelogin},
+     crypto::Ecdh,
+     mmtls::{self, Session},
+-    protobuf as p, wire,
++    protobuf as p,
++    rpc_observation::{measure as observe_rpc, Observer as RpcObserver, Phase as RpcPhase},
++    wire,
+ };
+ use anyhow::{bail, ensure, Result};
+ pub use logout::*;
+@@ -913,20 +915,40 @@ impl NativeClient {
+         path: &str,
+         request: &[u8],
+     ) -> Result<Vec<u8>> {
+-        let session = self.session(&state.long_host)?;
+-        let packet = AuthenticatedPacket::prepare(state, cgi, request)?;
+-        let reply = mmtls::short_exchange(
++        self.authenticated_rpc_observed(state, cgi, path, request, None)
++    }
++    fn authenticated_rpc_observed(
++        &self,
++        state: &mut AccountState,
++        cgi: u16,
++        path: &str,
++        request: &[u8],
++        observer: Option<&dyn RpcObserver>,
++    ) -> Result<Vec<u8>> {
++        let session = Session::connect_observed(
++            &state.long_host,
++            self.options.timeout,
++            self.options.receive_budget,
++            observer,
++        )?;
++        let packet = observe_rpc(observer, RpcPhase::AuthenticatedPacketPrepare, || {
++            AuthenticatedPacket::prepare(state, cgi, request)
++        })?;
++        let reply = mmtls::short_exchange_observed(
+             &session.short,
+             &state.short_host,
+             path,
+             &packet.packet,
+             self.options.timeout,
++            observer,
+         )?;
+-        let (plain, cookie) = packet.decode_verified_transport_reply(&reply)?;
+-        if !cookie.is_empty() {
+-            state.cookie = cookie;
+-        }
+-        Ok(plain)
++        observe_rpc(observer, RpcPhase::AuthenticatedReplyDecode, || {
++            let (plain, cookie) = packet.decode_verified_transport_reply(&reply)?;
++            if !cookie.is_empty() {
++                state.cookie = cookie;
++            }
++            Ok(plain)
++        })
+     }
+     pub fn sync(&self, state: &mut AccountState, cursor: &[u8]) -> Result<SyncBatch> {
+         self.sync_scene(state, cursor, 6)
+@@ -1138,14 +1160,34 @@ impl NativeClient {
+         created_at: u32,
+         content: &str,
+     ) -> Result<Vec<u8>> {
+-        let request = crate::quote_send::quote_send_request(
++        self.send_quote_raw_observed(state, destination, client_id, created_at, content, None)
++    }
++    /// Same single submission, with optional value-free phase observations.
++    pub fn send_quote_raw_observed(
++        &self,
++        state: &mut AccountState,
++        destination: &str,
++        client_id: &str,
++        created_at: u32,
++        content: &str,
++        observer: Option<&dyn RpcObserver>,
++    ) -> Result<Vec<u8>> {
++        let request = observe_rpc(observer, RpcPhase::QuoteRequestPrepare, || {
++            crate::quote_send::quote_send_request(
++                state,
++                destination,
++                client_id,
++                created_at,
++                content,
++            )
++        })?;
++        self.authenticated_rpc_observed(
+             state,
+-            destination,
+-            client_id,
+-            created_at,
+-            content,
+-        )?;
+-        self.authenticated_rpc(state, 222, "/cgi-bin/micromsg-bin/sendappmsg", &request)
++            222,
++            "/cgi-bin/micromsg-bin/sendappmsg",
++            &request,
++            observer,
++        )
+     }
+     /// Reserve one file-upload message. An uncertain response must not be
+     /// retried automatically; retain the returned receipt with the send intent.
+@@ -1476,6 +1518,41 @@ fn apply_login_notification(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn observed_invalid_quote_stops_before_session_and_never_exposes_values() {
++        use crate::rpc_observation::{Observer, Outcome, Phase};
++        struct Recorder(std::sync::Mutex<Vec<(Phase, Option<Outcome>)>>);
++        impl Observer for Recorder {
++            fn begin(&self, phase: Phase) {
++                self.0.lock().unwrap().push((phase, None));
++            }
++            fn end(&self, phase: Phase, _duration: Duration, outcome: Outcome) {
++                self.0.lock().unwrap().push((phase, Some(outcome)));
++            }
++        }
++        let recorder = Recorder(std::sync::Mutex::new(vec![]));
++        let client = NativeClient::new(NativeOptions::default()).unwrap();
++        let error = client
++            .send_quote_raw_observed(
++                &mut state(),
++                "",
++                "private-id",
++                123,
++                "private-body",
++                Some(&recorder),
++            )
++            .unwrap_err();
++        assert_eq!(error.to_string(), "invalid_quote_request");
++        let rows = recorder.0.lock().unwrap();
++        assert_eq!(
++            *rows,
++            [
++                (Phase::QuoteRequestPrepare, None),
++                (Phase::QuoteRequestPrepare, Some(Outcome::Error))
++            ]
++        );
++        assert!(!format!("{rows:?}").contains("private-"));
++    }
+     fn attempt(status: LoginStatus, qr: bool) -> LoginAttempt {
+         LoginAttempt {
+             schema: 1,
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/lib.rs b/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
+index abed7cc6b344aeed62b500be27bdc72bed761c8d..4b838ca57ea515b501610113858abe379487fc9d 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/lib.rs
+@@ -17,6 +17,7 @@ mod notice;
+ pub mod protobuf;
+ pub mod push;
+ pub mod quote_send;
++pub mod rpc_observation;
+ pub mod silk;
+ pub mod wire;
+ pub use client::*;
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+index 7151b84d43627f288495a88ad865ee8e9591fd69..4fdc5ba5e35153af9ee4342feb5d77a9934e4370 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+@@ -1,5 +1,6 @@
+ //! Fresh pinned MMTLS handshake and authenticated shortlink exchange.
+ use crate::crypto::*;
++use crate::rpc_observation::{measure as observe_rpc, Observer as RpcObserver, Phase as RpcPhase};
+ use anyhow::{ensure, Result};
+ use openssl::{memcmp, nid::Nid};
+ use serde::{Deserialize, Serialize};
+@@ -224,6 +225,24 @@ fn read_record(
+ 
+ impl Session {
+     pub fn connect(host: &str, timeout: Duration, receive_budget: usize) -> Result<Self> {
++        Self::connect_observed(host, timeout, receive_budget, None)
++    }
++    pub(crate) fn connect_observed(
++        host: &str,
++        timeout: Duration,
++        receive_budget: usize,
++        observer: Option<&dyn RpcObserver>,
++    ) -> Result<Self> {
++        observe_rpc(observer, RpcPhase::SessionConnect, || {
++            Self::connect_inner(host, timeout, receive_budget, observer)
++        })
++    }
++    fn connect_inner(
++        host: &str,
++        timeout: Duration,
++        receive_budget: usize,
++        observer: Option<&dyn RpcObserver>,
++    ) -> Result<Self> {
+         validate_host(host)?;
+         ensure!(
+             (1024..=crate::MAX_MESSAGE_BYTES).contains(&receive_budget),
+@@ -236,166 +255,172 @@ impl Session {
+         let deadline = Instant::now() + timeout;
+         // Resolver and connect are constrained by the caller's blocking worker. Socket
+         // read/write deadlines bound every subsequent protocol operation.
+-        use std::net::ToSocketAddrs;
+-        let addresses = (host, 80).to_socket_addrs()?;
+-        let mut socket = None;
+-        for addr in addresses {
+-            let remaining = deadline.saturating_duration_since(Instant::now());
+-            if remaining.is_zero() {
+-                break;
++        let mut socket = observe_rpc(observer, RpcPhase::DnsTcpConnect, || {
++            use std::net::ToSocketAddrs;
++            let addresses = (host, 80).to_socket_addrs()?;
++            let mut socket = None;
++            for addr in addresses {
++                let remaining = deadline.saturating_duration_since(Instant::now());
++                if remaining.is_zero() {
++                    break;
++                }
++                if let Ok(s) = TcpStream::connect_timeout(&addr, remaining) {
++                    socket = Some(s);
++                    break;
++                }
+             }
+-            if let Ok(s) = TcpStream::connect_timeout(&addr, remaining) {
+-                socket = Some(s);
+-                break;
++            let socket = socket.ok_or_else(|| anyhow::anyhow!("Native connection failed"))?;
++            socket.set_write_timeout(Some(timeout))?;
++            Ok(socket)
++        })?;
++        observe_rpc(observer, RpcPhase::MmtlsHandshake, || {
++            let keys = [
++                Ecdh::generate(Nid::X9_62_PRIME256V1)?,
++                Ecdh::generate(Nid::X9_62_PRIME256V1)?,
++            ];
++            let mut shares = vec![];
++            for (i, k) in keys.iter().enumerate() {
++                let point = k.public()?;
++                shares.extend(section(
++                    &[((i + 5) as u32).to_be_bytes().to_vec(), sized(&point)?].concat(),
++                ));
+             }
+-        }
+-        let mut socket = socket.ok_or_else(|| anyhow::anyhow!("Native connection failed"))?;
+-        socket.set_write_timeout(Some(timeout))?;
+-        let keys = [
+-            Ecdh::generate(Nid::X9_62_PRIME256V1)?,
+-            Ecdh::generate(Nid::X9_62_PRIME256V1)?,
+-        ];
+-        let mut shares = vec![];
+-        for (i, k) in keys.iter().enumerate() {
+-            let point = k.public()?;
+-            shares.extend(section(
+-                &[((i + 5) as u32).to_be_bytes().to_vec(), sized(&point)?].concat(),
+-            ));
+-        }
+-        let mut extra = vec![0; 4];
+-        extra.push(2);
+-        extra.extend(5u32.to_be_bytes());
+-        extra.extend(1000u32.to_be_bytes());
+-        let extension = section(&[0x10u16.to_be_bytes().to_vec(), vec![2], shares, extra].concat());
+-        let hello = section(
+-            &[
+-                vec![1],
+-                VERSION.to_le_bytes().to_vec(),
+-                vec![1],
+-                0xc02bu16.to_be_bytes().to_vec(),
+-                random::<32>()?.to_vec(),
+-                crate::wire::unix_time()?.to_be_bytes().to_vec(),
+-                section(&[vec![1], extension].concat()),
+-            ]
+-            .concat(),
+-        );
+-        socket.write_all(&frame(0x16, &hello)?)?;
+-        let mut received = 0;
+-        let server_record = read_record(&mut socket, deadline, &mut received, receive_budget)?;
+-        ensure!(server_record.header[0] == 0x16, "Expected handshake");
+-        let server = parse_server_hello(&server_record.body)?;
+-        let index = server
+-            .key_id
+-            .checked_sub(5)
+-            .ok_or_else(|| anyhow::anyhow!("Unoffered key"))? as usize;
+-        ensure!(index < 2, "Unoffered key");
+-        let mut x = keys[index].derive(&server.point)?;
+-        let first = x.iter().position(|v| *v != 0).unwrap_or(x.len() - 1);
+-        let mut secret = sha256(&x[first..]);
+-        x.zeroize();
+-        let mut transcript = [hello, server_record.body].concat();
+-        let handshake = traffic(&secret, "handshake key expansion", &transcript)?;
+-        let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
+-        ensure!(r.header[0] == 0x16, "Expected signature record");
+-        let signature_body = open(&r, &handshake.server_key, &handshake.server_iv, 1)?;
+-        let signature = signed_payload(&signature_body, 0x0f)?;
+-        let pins: serde_json::Value =
+-            serde_json::from_str(include_str!("../fixtures/mmtls-public-keys.json"))?;
+-        let pin = pins["profiles"]
+-            .as_array()
+-            .unwrap()
+-            .iter()
+-            .find(|p| p["version"].as_u64() == Some(server.version as u64))
+-            .ok_or_else(|| anyhow::anyhow!("Unsupported MMTLS certificate version"))?;
+-        ensure!([5, 1000].contains(&server.version), "Unoffered MMTLS pin");
+-        verify_signature(
+-            pin["ecdsaPEM"].as_str().unwrap(),
+-            &sha256(&transcript),
+-            &signature,
+-        )?;
+-        transcript.extend(signature_body);
+-        let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
+-        ensure!(r.header[0] == 0x16, "Expected ticket record");
+-        let ticket_body = open(&r, &handshake.server_key, &handshake.server_iv, 2)?;
+-        let tickets = parse_tickets(&ticket_body)?;
+-        let access_psk = expand(
+-            &secret,
+-            &[b"PSK_ACCESS".as_slice(), &sha256(&transcript)].concat(),
+-            32,
+-        )?;
+-        transcript.extend(ticket_body);
+-        let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
+-        ensure!(r.header[0] == 0x16, "Expected Finished");
+-        let finish = signed_payload(
+-            &open(&r, &handshake.server_key, &handshake.server_iv, 3)?,
+-            0x14,
+-        )?;
+-        let expected = hmac(
+-            &expand(&secret, b"server finished", 32)?,
+-            &sha256(&transcript),
+-        )?;
+-        ensure!(
+-            finish.len() == expected.len() && memcmp::eq(&finish, &expected),
+-            "Server Finished verification failed"
+-        );
+-        let client_finish = hmac(
+-            &expand(&secret, b"client finished", 32)?,
+-            &sha256(&transcript),
+-        )?;
+-        socket.write_all(&seal(
+-            0x16,
+-            &section(&[vec![0x14], sized(&client_finish)?].concat()),
+-            &handshake.client_key,
+-            &handshake.client_iv,
+-            1,
+-        )?)?;
+-        let mut expanded = expand(
+-            &secret,
+-            &[b"expanded secret".as_slice(), &sha256(&transcript)].concat(),
+-            32,
+-        )?;
+-        let application = traffic(&expanded, "application data key expansion", &transcript)?;
+-        secret.zeroize();
+-        expanded.zeroize();
+-        let noop = pack_longlink(6, u32::MAX, &[])?;
+-        socket.write_all(&seal(
+-            0x17,
+-            &noop,
+-            &application.client_key,
+-            &application.client_iv,
+-            2,
+-        )?)?;
+-        let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
+-        ensure!(r.header[0] == 0x17, "Expected NOOP reply");
+-        let p = unpack_longlink(&open(
+-            &r,
+-            &application.server_key,
+-            &application.server_iv,
+-            4,
+-        )?)?;
+-        ensure!(
+-            p.command == 0x3b9aca06 && p.sequence == u32::MAX && p.payload.is_empty(),
+-            "Unexpected NOOP reply"
+-        );
+-        Ok(Self {
+-            socket,
+-            deadline,
+-            received,
+-            receive_budget,
+-            short: ShortSession {
+-                access_psk,
+-                ticket: tickets[0].clone(),
+-            },
+-            certificate_region: server.region,
+-            certificate_version: server.version,
+-            traffic: application,
+-            outgoing: 3,
+-            incoming: 5,
+-            record_pending: Vec::new(),
+-            application_pending: LonglinkDecoder {
+-                pending: Vec::new(),
+-                max_payload: receive_budget,
+-            },
++            let mut extra = vec![0; 4];
++            extra.push(2);
++            extra.extend(5u32.to_be_bytes());
++            extra.extend(1000u32.to_be_bytes());
++            let extension =
++                section(&[0x10u16.to_be_bytes().to_vec(), vec![2], shares, extra].concat());
++            let hello = section(
++                &[
++                    vec![1],
++                    VERSION.to_le_bytes().to_vec(),
++                    vec![1],
++                    0xc02bu16.to_be_bytes().to_vec(),
++                    random::<32>()?.to_vec(),
++                    crate::wire::unix_time()?.to_be_bytes().to_vec(),
++                    section(&[vec![1], extension].concat()),
++                ]
++                .concat(),
++            );
++            socket.write_all(&frame(0x16, &hello)?)?;
++            let mut received = 0;
++            let server_record = read_record(&mut socket, deadline, &mut received, receive_budget)?;
++            ensure!(server_record.header[0] == 0x16, "Expected handshake");
++            let server = parse_server_hello(&server_record.body)?;
++            let index = server
++                .key_id
++                .checked_sub(5)
++                .ok_or_else(|| anyhow::anyhow!("Unoffered key"))? as usize;
++            ensure!(index < 2, "Unoffered key");
++            let mut x = keys[index].derive(&server.point)?;
++            let first = x.iter().position(|v| *v != 0).unwrap_or(x.len() - 1);
++            let mut secret = sha256(&x[first..]);
++            x.zeroize();
++            let mut transcript = [hello, server_record.body].concat();
++            let handshake = traffic(&secret, "handshake key expansion", &transcript)?;
++            let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
++            ensure!(r.header[0] == 0x16, "Expected signature record");
++            let signature_body = open(&r, &handshake.server_key, &handshake.server_iv, 1)?;
++            let signature = signed_payload(&signature_body, 0x0f)?;
++            let pins: serde_json::Value =
++                serde_json::from_str(include_str!("../fixtures/mmtls-public-keys.json"))?;
++            let pin = pins["profiles"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .find(|p| p["version"].as_u64() == Some(server.version as u64))
++                .ok_or_else(|| anyhow::anyhow!("Unsupported MMTLS certificate version"))?;
++            ensure!([5, 1000].contains(&server.version), "Unoffered MMTLS pin");
++            verify_signature(
++                pin["ecdsaPEM"].as_str().unwrap(),
++                &sha256(&transcript),
++                &signature,
++            )?;
++            transcript.extend(signature_body);
++            let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
++            ensure!(r.header[0] == 0x16, "Expected ticket record");
++            let ticket_body = open(&r, &handshake.server_key, &handshake.server_iv, 2)?;
++            let tickets = parse_tickets(&ticket_body)?;
++            let access_psk = expand(
++                &secret,
++                &[b"PSK_ACCESS".as_slice(), &sha256(&transcript)].concat(),
++                32,
++            )?;
++            transcript.extend(ticket_body);
++            let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
++            ensure!(r.header[0] == 0x16, "Expected Finished");
++            let finish = signed_payload(
++                &open(&r, &handshake.server_key, &handshake.server_iv, 3)?,
++                0x14,
++            )?;
++            let expected = hmac(
++                &expand(&secret, b"server finished", 32)?,
++                &sha256(&transcript),
++            )?;
++            ensure!(
++                finish.len() == expected.len() && memcmp::eq(&finish, &expected),
++                "Server Finished verification failed"
++            );
++            let client_finish = hmac(
++                &expand(&secret, b"client finished", 32)?,
++                &sha256(&transcript),
++            )?;
++            socket.write_all(&seal(
++                0x16,
++                &section(&[vec![0x14], sized(&client_finish)?].concat()),
++                &handshake.client_key,
++                &handshake.client_iv,
++                1,
++            )?)?;
++            let mut expanded = expand(
++                &secret,
++                &[b"expanded secret".as_slice(), &sha256(&transcript)].concat(),
++                32,
++            )?;
++            let application = traffic(&expanded, "application data key expansion", &transcript)?;
++            secret.zeroize();
++            expanded.zeroize();
++            let noop = pack_longlink(6, u32::MAX, &[])?;
++            socket.write_all(&seal(
++                0x17,
++                &noop,
++                &application.client_key,
++                &application.client_iv,
++                2,
++            )?)?;
++            let r = read_record(&mut socket, deadline, &mut received, receive_budget)?;
++            ensure!(r.header[0] == 0x17, "Expected NOOP reply");
++            let p = unpack_longlink(&open(
++                &r,
++                &application.server_key,
++                &application.server_iv,
++                4,
++            )?)?;
++            ensure!(
++                p.command == 0x3b9aca06 && p.sequence == u32::MAX && p.payload.is_empty(),
++                "Unexpected NOOP reply"
++            );
++            Ok(Self {
++                socket,
++                deadline,
++                received,
++                receive_budget,
++                short: ShortSession {
++                    access_psk,
++                    ticket: tickets[0].clone(),
++                },
++                certificate_region: server.region,
++                certificate_version: server.version,
++                traffic: application,
++                outgoing: 3,
++                incoming: 5,
++                record_pending: Vec::new(),
++                application_pending: LonglinkDecoder {
++                    pending: Vec::new(),
++                    max_payload: receive_budget,
++                },
++            })
+         })
+     }
+     pub fn send_application(&mut self, command: u32, sequence: u32, payload: &[u8]) -> Result<()> {
+@@ -672,6 +697,16 @@ pub fn short_exchange(
+     path: &str,
+     payload: &[u8],
+     timeout: Duration,
++) -> Result<Vec<u8>> {
++    short_exchange_observed(session, host, path, payload, timeout, None)
++}
++pub(crate) fn short_exchange_observed(
++    session: &ShortSession,
++    host: &str,
++    path: &str,
++    payload: &[u8],
++    timeout: Duration,
++    observer: Option<&dyn RpcObserver>,
+ ) -> Result<Vec<u8>> {
+     validate_host(host)?;
+     ensure!(
+@@ -685,61 +720,71 @@ pub fn short_exchange(
+         payload.len() <= crate::MAX_MESSAGE_BYTES,
+         "Payload too large"
+     );
+-    let (hello, extensions) = early_hello(&session.ticket)?;
+-    let keys = expand(
+-        &session.access_psk,
+-        &[b"early data key expansion".as_slice(), &sha256(&hello)].concat(),
+-        28,
+-    )?;
+-    let route = section(
+-        &[
+-            sized(path.as_bytes())?,
+-            sized(host.as_bytes())?,
+-            section(payload),
++    let (hello, extensions, wire) = observe_rpc(observer, RpcPhase::ShortPacketPrepare, || {
++        let (hello, extensions) = early_hello(&session.ticket)?;
++        let keys = expand(
++            &session.access_psk,
++            &[b"early data key expansion".as_slice(), &sha256(&hello)].concat(),
++            28,
++        )?;
++        let route = section(
++            &[
++                sized(path.as_bytes())?,
++                sized(host.as_bytes())?,
++                section(payload),
++            ]
++            .concat(),
++        );
++        let wire = [
++            frame(0x19, &hello)?,
++            seal(0x19, &extensions, &keys[..16], &keys[16..], 1)?,
++            seal(0x17, &route, &keys[..16], &keys[16..], 2)?,
++            seal(0x15, &section(&[0, 1, 1]), &keys[..16], &keys[16..], 3)?,
+         ]
+-        .concat(),
+-    );
+-    let wire = [
+-        frame(0x19, &hello)?,
+-        seal(0x19, &extensions, &keys[..16], &keys[16..], 1)?,
+-        seal(0x17, &route, &keys[..16], &keys[16..], 2)?,
+-        seal(0x15, &section(&[0, 1, 1]), &keys[..16], &keys[16..], 3)?,
+-    ]
+-    .concat();
+-    let client = reqwest::blocking::Client::builder()
+-        .timeout(timeout)
+-        .connect_timeout(timeout.min(Duration::from_secs(10)))
+-        .redirect(reqwest::redirect::Policy::none())
+-        .no_proxy()
+-        .build()?;
+-    let mut response = client
+-        .post(format!(
+-            "http://{host}/mmtls/{}",
+-            hex::encode(random::<4>()?)
+-        ))
+-        .header("Content-Type", "application/octet-stream")
+-        .header("User-Agent", "MicroMessenger Client")
+-        .header("Upgrade", "mmtls")
+-        .header("Accept", "*/*")
+-        .header("Cache-Control", "no-cache")
+-        .header("Connection", "close")
+-        .body(wire)
+-        .send()?;
+-    ensure!(
+-        response.status() == 200,
+-        "Native shortlink HTTP status {}",
+-        response.status().as_u16()
+-    );
+-    let mut bytes = Vec::new();
+-    response
+-        .by_ref()
+-        .take((crate::MAX_MESSAGE_BYTES + 1) as u64)
+-        .read_to_end(&mut bytes)?;
+-    ensure!(
+-        bytes.len() <= crate::MAX_MESSAGE_BYTES,
+-        "Shortlink receive budget exceeded"
+-    );
+-    decode_short_reply(&bytes, session, &hello, &extensions)
++        .concat();
++        Ok((hello, extensions, wire))
++    })?;
++    let client = observe_rpc(observer, RpcPhase::HttpClientPrepare, || {
++        Ok(reqwest::blocking::Client::builder()
++            .timeout(timeout)
++            .connect_timeout(timeout.min(Duration::from_secs(10)))
++            .redirect(reqwest::redirect::Policy::none())
++            .no_proxy()
++            .build()?)
++    })?;
++    let bytes = observe_rpc(observer, RpcPhase::ShortHttp, || {
++        let mut response = client
++            .post(format!(
++                "http://{host}/mmtls/{}",
++                hex::encode(random::<4>()?)
++            ))
++            .header("Content-Type", "application/octet-stream")
++            .header("User-Agent", "MicroMessenger Client")
++            .header("Upgrade", "mmtls")
++            .header("Accept", "*/*")
++            .header("Cache-Control", "no-cache")
++            .header("Connection", "close")
++            .body(wire)
++            .send()?;
++        ensure!(
++            response.status() == 200,
++            "Native shortlink HTTP status {}",
++            response.status().as_u16()
++        );
++        let mut bytes = Vec::new();
++        response
++            .by_ref()
++            .take((crate::MAX_MESSAGE_BYTES + 1) as u64)
++            .read_to_end(&mut bytes)?;
++        ensure!(
++            bytes.len() <= crate::MAX_MESSAGE_BYTES,
++            "Shortlink receive budget exceeded"
++        );
++        Ok(bytes)
++    })?;
++    observe_rpc(observer, RpcPhase::MmtlsReplyDecode, || {
++        decode_short_reply(&bytes, session, &hello, &extensions)
++    })
+ }
+ fn early_hello(ticket: &Ticket) -> Result<(Vec<u8>, Vec<u8>)> {
+     ensure!(
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2ddd60e430954c17997a265735f6f7a2e0f60ed
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+@@ -0,0 +1,159 @@
++//! Optional typed observations. No request, identity, endpoint or error values.
++use anyhow::Result;
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Phase {
++    QuoteRequestPrepare,
++    SessionConnect,
++    DnsTcpConnect,
++    MmtlsHandshake,
++    AuthenticatedPacketPrepare,
++    ShortPacketPrepare,
++    HttpClientPrepare,
++    ShortHttp,
++    MmtlsReplyDecode,
++    AuthenticatedReplyDecode,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Outcome {
++    Ok,
++    Error,
++    Incomplete,
++}
++
++/// Observation callbacks cannot replace an RPC result. Callers supply a
++/// non-panicking sink; the native daemon uses its private bounded trace sink.
++pub trait Observer: Send + Sync {
++    fn begin(&self, phase: Phase);
++    fn end(&self, phase: Phase, duration: Duration, outcome: Outcome);
++}
++
++struct Span<'a> {
++    observer: &'a dyn Observer,
++    phase: Phase,
++    started: Option<Instant>,
++}
++
++impl Span<'_> {
++    fn finish(mut self, outcome: Outcome) {
++        if let Some(started) = self.started.take() {
++            self.observer.end(self.phase, started.elapsed(), outcome);
++        }
++    }
++}
++
++impl Drop for Span<'_> {
++    fn drop(&mut self) {
++        if let Some(started) = self.started.take() {
++            self.observer
++                .end(self.phase, started.elapsed(), Outcome::Incomplete);
++        }
++    }
++}
++
++pub(crate) fn measure<T>(
++    observer: Option<&dyn Observer>,
++    phase: Phase,
++    action: impl FnOnce() -> Result<T>,
++) -> Result<T> {
++    let Some(observer) = observer else {
++        // No timer, global sink, state or diagnostic allocation when disabled.
++        return action();
++    };
++    observer.begin(phase);
++    let span = Span {
++        observer,
++        phase,
++        started: Some(Instant::now()),
++    };
++    let result = action();
++    span.finish(if result.is_ok() {
++        Outcome::Ok
++    } else {
++        Outcome::Error
++    });
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::{
++        atomic::{AtomicUsize, Ordering},
++        Mutex,
++    };
++
++    #[derive(Debug, PartialEq, Eq)]
++    enum Event {
++        Begin(Phase),
++        End(Phase, Outcome),
++    }
++    #[derive(Default)]
++    struct Recorder(Mutex<Vec<Event>>);
++    impl Observer for Recorder {
++        fn begin(&self, phase: Phase) {
++            self.0.lock().unwrap().push(Event::Begin(phase));
++        }
++        fn end(&self, phase: Phase, _duration: Duration, outcome: Outcome) {
++            self.0.lock().unwrap().push(Event::End(phase, outcome));
++        }
++    }
++
++    #[test]
++    fn disabled_runs_the_original_action_once_and_preserves_error() {
++        let count = AtomicUsize::new(0);
++        let result: Result<()> = measure(None, Phase::SessionConnect, || {
++            count.fetch_add(1, Ordering::SeqCst);
++            anyhow::bail!("synthetic transport failure")
++        });
++        assert_eq!(count.load(Ordering::SeqCst), 1);
++        assert_eq!(
++            result.unwrap_err().to_string(),
++            "synthetic transport failure"
++        );
++    }
++
++    #[test]
++    fn enabled_nested_phases_preserve_order_and_result_without_error_values() {
++        let recorder = Recorder::default();
++        let result: Result<()> = measure(Some(&recorder), Phase::SessionConnect, || {
++            measure(Some(&recorder), Phase::DnsTcpConnect, || Ok(()))?;
++            measure(Some(&recorder), Phase::MmtlsHandshake, || {
++                anyhow::bail!("private synthetic error")
++            })
++        });
++        assert_eq!(result.unwrap_err().to_string(), "private synthetic error");
++        let events = recorder.0.lock().unwrap();
++        assert_eq!(
++            *events,
++            [
++                Event::Begin(Phase::SessionConnect),
++                Event::Begin(Phase::DnsTcpConnect),
++                Event::End(Phase::DnsTcpConnect, Outcome::Ok),
++                Event::Begin(Phase::MmtlsHandshake),
++                Event::End(Phase::MmtlsHandshake, Outcome::Error),
++                Event::End(Phase::SessionConnect, Outcome::Error)
++            ]
++        );
++        assert!(!format!("{events:?}").contains("private synthetic error"));
++    }
++
++    #[test]
++    fn unwound_phase_is_incomplete_not_successful() {
++        let recorder = Recorder::default();
++        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _: Result<()> = measure(Some(&recorder), Phase::ShortHttp, || {
++                panic!("synthetic unwind")
++            });
++        }));
++        assert_eq!(
++            *recorder.0.lock().unwrap(),
++            [
++                Event::Begin(Phase::ShortHttp),
++                Event::End(Phase::ShortHttp, Outcome::Incomplete)
++            ]
++        );
++    }
++}

@@ -1,0 +1,126 @@
+diff --git a/.changeset/session-renew-on-reject.md b/.changeset/session-renew-on-reject.md
+new file mode 100644
+--- /dev/null
++++ b/.changeset/session-renew-on-reject.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++On server -13 while desired=connected, attempt renew_session before local logout so a still-valid account can continue without phone confirmation. Explicit logout remains non-renewing.
+diff --git a/packages/native-client-rust/FEATURES.md b/packages/native-client-rust/FEATURES.md
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -268,3 +268,12 @@
+ closes handles before releasing ownership. Read snapshots use the live health view
+ without owning or stopping a second worker. Timing and fault fixtures do not
+ establish phone delivery or a measured end-to-end latency improvement.
++
++### Session renew on server -13
++
++When a still-desired connected session receives an authenticated service
++rejection (`-13`), Core attempts one `renew_session` before installing a local
++logout fence. A renewed authorization is installed under the same session fence
++and push reconnects with `session_renewed`. Unchanged credentials, renew
++transport failures, local logout, and desired!=connected keep the original
++logout path. Explicit logout never renews.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/push.rs b/packages/native-client-rust/crates/wechat-core/src/push.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/push.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/push.rs
+@@ -74,9 +74,16 @@
+                     }
+                     if let Err(error) = result {
+                         if core.push_allowed(&account).unwrap_or(false) {
++                            let reason = if authentication_required(&error) {
++                                "auth_required"
++                            } else if error.to_string() == "session_renewed" {
++                                "session_renewed"
++                            } else {
++                                "connection_unavailable"
++                            };
+                             let _ = core.store.append_event_once(&account,
+                                 &format!("push:reconnecting:{}", wechat_store::unix_seconds() / 60),
+-                                "account.push", &json!({"state":"reconnecting","fallback":"heartbeat_polling","reason":if authentication_required(&error){"auth_required"}else{"connection_unavailable"}}));
++                                "account.push", &json!({"state":"reconnecting","fallback":"heartbeat_polling","reason":reason}));
+                         }
+                     }
+                     tokio::time::sleep(Duration::from_secs(backoff)).await;
+diff --git a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/session_auth.rs
+@@ -83,6 +83,16 @@
+         .await?;
+         match request(fence.clone()).await {
+             Err(error) if authentication_required(&error) => {
++                // Server -13 while still desired=connected: renew once before
++                // installing a logout fence. Active local logout keeps desired
++                // away from connected and never reaches this renew path.
++                if auth_rejected(&error)
++                    && self
++                        .try_renew_rejected_session(account, &fence, source)
++                        .await?
++                {
++                    bail!("session_renewed");
++                }
+                 let logged_out = self
+                     .logout_rejected_session(account, &fence, &error, source)
+                     .await?;
+@@ -96,6 +106,58 @@
+         }
+     }
+ 
++    async fn try_renew_rejected_session(
++        &self,
++        account: &str,
++        fence: &SessionFence,
++        source: &str,
++    ) -> Result<bool> {
++        let (state, expected) = {
++            let _guard = self.lock_account(account).await?;
++            if self.store.runtime(account, "desired")?.as_deref() != Some(b"connected")
++                || self.store.runtime(account, "logged-out")?.is_some()
++                || self.session_fence(account).ok().as_ref() != Some(fence)
++            {
++                return Ok(false);
++            }
++            let state = self.account_state(account)?;
++            let expected = match self.store.runtime(account, "account-state")? {
++                Some(value) => value,
++                None => return Ok(false),
++            };
++            (state, expected)
++        };
++        let prior = authorization(&state)?;
++        let upstream = self.upstream.clone();
++        let renewed = match blocking(move || upstream.renew_session(&state, "agent-wechat")).await {
++            Ok(state) => state,
++            Err(_) => return Ok(false),
++        };
++        // Unchanged credentials are not a renewal (simulator no-op included).
++        if authorization(&renewed)? == prior {
++            return Ok(false);
++        }
++        let _guard = self.lock_account(account).await?;
++        if self.store.runtime(account, "desired")?.as_deref() != Some(b"connected")
++            || self.store.runtime(account, "logged-out")?.is_some()
++            || self.session_fence(account).ok().as_ref() != Some(fence)
++        {
++            return Ok(false);
++        }
++        self.save_network_state(account, &renewed, &expected, fence, Some(b"connected"))?;
++        self.store.append_event(
++            account,
++            "account.connection",
++            &json!({
++                "state": "renewed",
++                "source": source,
++                "serviceCode": -13,
++                "authentication": "renewed"
++            }),
++        )?;
++        Ok(true)
++    }
++
+     async fn logout_rejected_session(
+         &self,
+         account: &str,

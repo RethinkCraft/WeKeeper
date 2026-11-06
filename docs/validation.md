@@ -1,122 +1,33 @@
-# Validation and known limits
+# Validation and evidence boundaries
 
-This document records the 0.5.0 baseline on **2026-10-26**. Counts describe a
-specific verification snapshot, not advertised capacities or a guarantee that
-another local account contains the same data. No private account IDs, group names,
-message bodies, screenshots, media or acceptance reports are distributed here.
+## Release checks
 
-## Reproducible repository checks
+The 0.7.0 regression suite covers shared archival, schema 4/5 compatibility, message projection, media/document readers, permissions, synchronization, private questions and the protocol group bot. Default tests use synthetic data and mocked providers in temporary state directories. They must run without `private/`, an older checkout or machine-specific files.
 
-```bash
-python -m pip install -e '.[dev,mcp]'
-python -m pytest -q
-python -m chatlog_keeper.cli --help
-```
+Required checks are Python tests, frontend tests and production build, wheel/sdist content verification, the complete gateway patch checksum chain, source-package tests and frontend build, and installed-wheel CLI/MCP checks outside the checkout. The original fifteen-tool archive MCP contract remains: fourteen read-only queries and one gated native voice operation.
 
-The pre-publication package baseline passed **655 tests**. An additional **15
-local deployment-harness tests** passed outside this repository; they are not
-part of the public test suite or GitHub CI. Publication adds 23 mocked
-accessibility-setup tests, bringing this initial source snapshot to **678 passing
-tests**. The current CI result is authoritative for the published revision.
+Archive compatibility tests assert that schema 4 stays 4 and schema 5 stays 5 through read/write/reopen, sync projections and avatar writes. Existing old bot-event records are retained; new intake does not produce them. Bridge tests cover staged pages, committed writes before checkpoint, retries, source identity, row assignment, floor persistence and unchanged cursors.
 
-Repository tests use synthetic data and replace native UI primitives with
-fakes. They do not send messages, convert real voices, log in, download media or
-need access to an actual account. Coverage includes:
+Question tests cover group/time scoping, evidence references, privacy, leases, cancellation, interrupted model execution and completed-result replay. SIWC tests cover durable shared pauses, explicit resume and safe migration before retired summary files are removed. Cloud migration tests assert retained data and deletion of summary-only records.
 
-- Transaction interruption, duplicate collection, restart recovery, same-second
-  and late messages, shard discovery/reset, raw unknown payload retention and
-  stable references/checkpoints.
-- Read/search/context/statistics, scoped pagination, derived search indexes,
-  quote targets including missing originals, forwards, mentions and group events.
-- Cached media identity, decoding/quality, preserved originals, first-frame
-  animation output, corruption and offline reads.
-- Document input/output limits, inert HTML, encoded text, CSV, PDF, DOCX and XLSX
-  content, provenance, cursor changes and isolated worker failures.
-- Native target uniqueness, cache-proof contracts, queue reuse, build/account
-  verification, timeouts, parent exit, held output pipes and missing audio.
-- MCP SDK discovery/annotations, stdio transport and actual image content using
-  synthetic archives.
+Protocol bot tests cover real-mention admission, account/group isolation, business permissions, idempotent reports, partial success, persona/configuration changes, memory MCP isolation, frozen replies, unknown sends and restart reconciliation. Cloud control uses protocol snapshots and explicit initial alignment rather than the old UI worker.
 
-CI runs on Ubuntu 24.04 and Python 3.11 with tests and package-build verification.
-That environment validates the library and mocked boundaries, not a real WeChat
-desktop session.
+## 0.7.0 release verification — 2026-11-06
 
-## Real-client baseline
+The clean source distribution passed **2160 Python tests** and **19 frontend tests**, with a successful production build. An independently installed wheel passed all three CLI entrypoints and the fifteen-tool MCP contract; all twenty locked gateway patches passed checksum verification.
 
-| Item | Verified baseline |
-|---|---|
-| Host | Ubuntu 26.04 x86_64 |
-| Runtime | Python 3.11.15 |
-| Client | Official Linux WeChat 4.1.13.26, reviewed executable build |
-| Storage/parser | SQLite schema 4, parser 4 |
-| MCP | All fifteen tools invoked from the actual consuming Codex conversation |
-| Existing image | 1080×1920 full-cache pixels delivered as MCP image content; decoded content unchanged |
-| Voice assets | 74 original cached SILK assets associated and read back |
-| Avatar assets | 34 cached avatars associated and read back, including seven group avatars |
-| Notes | 24 notes expanded into 387 ordered direct components |
+Live checks confirmed schema 4 preservation, healthy synchronization with no pending partitions, cloud schema 3 removal of summary content, a completed private AI statistics question with the correct scoped count, and a cloud configuration save/application round trip that preserved the effective local model, persona and business settings. Final live acceptance passed on 2026-11-06: three fresh real mentions in the original bound test group each produced one accepted reply with matching source identities, one archived/cloud-synchronized message and one completed, synchronized usage record. The user confirmed a single corresponding phone-visible reply and working navigation to the quoted original. A normal business-worker restart preserved completed reply/send/usage records and consumer boundaries without duplicate sends; the gateway remained running. Recipient evidence is the explicit user confirmation in this chat, separate from machine-side gateway receipts.
 
-The schema 3→4 upgrade generated a private consistent backup. Read-only comparison
-confirmed preserved message references, first-seen times, origins/source
-generations and non-regressing collection checkpoints. Historical reparsing used
-batches of at most 500 and completed. New natural messages continued to arrive
-with health reported as `receiving`; no test message or file was sent.
+## Live acceptance
 
-Text and image quote targets, actual image delivery, scoped reading/search,
-context, statistics, forwards, member data, profile/avatar delivery, cards and
-explicit missing-media states were exercised through MCP. These checks are
-separate from a standalone stdio process passing its synthetic tests.
+A passing offline suite does not establish receiving-device delivery. Live acceptance must use an explicitly authorized existing test group and a newly received mention. Check the final message body, exact quoted original, quote navigation when available, and no duplicate reply. Gateway acceptance is tracked separately from that evidence.
 
-## Native voice acceptance
+During an upgrade, also check multiple sync/heartbeat cycles, a real private question, provider authorization/usage, cloud configuration acknowledgement and unchanged archive version. The protocol gateway must retain its authenticated profile and consumer boundaries throughout the Python cutover.
 
-An existing 2.260-second voice completed exact native targeting, WeChat's own
-conversion, accessibility-result capture, archive association and offline reading.
-The complete automation also reused the existing native text after proving the
-current authenticated `VoiceInfo` cache still matched the archived raw hash.
-An 8.280-second voice request was queued through MCP, completed with the existing
-client-native result, and returned the same stored result on a repeated request.
+## Historical boundaries
 
-The accepted scope is **same-day, uniquely visible history** on the reviewed
-build. Older dates, an unseen/ambiguous target, missing current audio, unavailable
-keys, a changed build/UI or login loss stop the operation. The task has one active
-worker and a 90-second deadline. A stored audio copy alone never authorizes an
-operation that could require an uncached client download.
+The official-client archive reader baseline was verified on Ubuntu 26.04 x86_64, Python 3.11.15 and Linux WeChat 4.1.13.26. Other client builds require separate compatibility checks. Optional native voice conversion remains bounded to separately accepted client/layout conditions.
 
-New installations and unverified builds remain disabled by default. No local or
-third-party ASR, OCR, message/file sending or automatic login participated in the
-acceptance. Accessibility restart preparation is not itself native acceptance.
+Cached file reading supports PDF, DOCX, XLSX, CSV/text and inert HTML. Cached-image identity, cache quality and explicit missing states remain part of results. Some note/forward media and Linux card variants still lack sufficient real-sample association evidence; synthetic format coverage is not proof of every real variant. There is no OCR, Moments reader, general media downloader or arbitrary desktop automation.
 
-## Media and semantic gaps
-
-The 387 real note components comprise **150 text, 213 image and 24 HTML attachment
-components**. All 237 media components remained unlinked: 213 reported an
-unverified image-content association and 24 an unresolved file link. Consequently,
-**zero real note images or HTML attachment bodies were accepted as readable**.
-Complete ordered note text does not imply complete media access. The extractor's
-synthetic HTML tests establish parser behavior only.
-
-Forward/note media associations must have exact identity or content proof.
-Bundled system emoji resources and similar filenames cannot substitute for a
-message's cache. First-frame animation behavior is tested with synthetic assets;
-real Linux sticker variants still require dedicated samples.
-
-Real samples are also outstanding for location, namecard, ordinary webpage/
-article, mini-program and video-channel variants. Those parsers have synthetic
-regressions and preserve raw data, but are not advertised as comprehensively
-Linux-validated. Naturally occurring ordinary file attachments/document bodies
-also need broader real-client acceptance; format fixtures are synthetic.
-
-Member directories describe observed local membership, not complete historical
-membership or verified administrator lists. Quit/kick and other unobserved
-system-event variants remain pending real samples. Source metadata that vanished
-before collection cannot be reconstructed.
-
-## Product boundaries
-
-Only data actually synchronized to this device and still available when collected
-can be preserved. Full remote history and uncached media cannot be recovered.
-Full-cache image quality is distinguished from proven sender-original quality.
-Quiet groups can lead to `sync_unverified`; the state is not a definite logout.
-
-OCR, video processing, Moments reading, external page-body fetching, active media
-downloads and a generic desktop automation API are outside this release. The
-next work is prioritized in [ROADMAP.md](../ROADMAP.md).
+Historical UI-bot and performance experiments are available in Git history. They do not establish acceptance of this protocol-only release or remain part of its runtime.

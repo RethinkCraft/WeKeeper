@@ -235,7 +235,7 @@ def test_cli_rejects_unbounded_work_before_reading_data(argv):
 
 def test_cli_has_only_linux_wechat_and_archive_commands():
     commands = next(action for action in cli.parser()._actions if hasattr(action, "choices") and isinstance(action.choices, dict))
-    assert set(commands.choices) == {"probe", "extract-key", "groups", "messages", "image-key", "image", "collect", "mcp"}
+    assert set(commands.choices) == {"probe", "extract-key", "groups", "messages", "image-key", "image", "collect", "enrich", "mcp"}
 
 
 def test_main_reports_a_short_reader_error_without_exception_content(monkeypatch, capsys):

@@ -1,0 +1,1283 @@
+diff --git a/.changeset/native-quote-phase-timings.md b/.changeset/native-quote-phase-timings.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..89ba174e343b93841837aacd09f025c94dc529ef
+--- /dev/null
++++ b/.changeset/native-quote-phase-timings.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Add optional private quote-send phase timings for queue waits, protocol calls, saved receipts, authorization storage and final send-state commits. Diagnostics use a bounded background writer, report missing context and dropped records, and do not change transport, retries or recovery. Server acceptance remains separate from recipient delivery.
+diff --git a/deploy/native/README.md b/deploy/native/README.md
+index 3c7d0a477b5a5b0651930910c0f5153f0189742e..4f33f2411c3aa026ae8d2a7e553cff93c28bb849 100644
+--- a/deploy/native/README.md
++++ b/deploy/native/README.md
+@@ -99,6 +99,12 @@ Preserve the profile's ownership and backups when preparing permissions. For the
+ 
+ ## Configuration and durable data
+ 
++For local quote-send diagnostics, set `WX_QUOTE_TIMINGS=1` before starting the daemon and redirect stdout to a private regular file. On Unix, the file must belong to the daemon's effective user and have no group/other permissions; pipes, terminals and unsupported platforms leave this diagnostic disabled. Use a private directory and `umask 077` when preparing the file. The initial `quote_phase_timing` record with stage `sink` confirms that capture started. The flag is off by default and does not change the HTTP API.
++
++JSON lines contain diagnostic command/key hashes, intent/attempt IDs, native/simulator markers, UTC microseconds and monotonic phase boundaries. They omit message bodies, account names, destinations, credentials and raw receipts. Capture starts before admission, so an early failure may have no intent ID. Replays bind to the existing intent without another submission. Recovery records explicitly mark missing original command context; general recovered send workers can appear before their payload kind is known. An attempt ID identifies a local worker, not proof of a network send.
++
++The writer is bounded and never makes send workers wait for stdout. Check sequence gaps, `dropped_records`, missing end records and `incomplete` outcomes before using a trace. Logging failure or shutdown can lose records; absence is not zero latency or a successful send. Store spans include admission/open/transaction work through commit return, not just disk flush time. Parent spans overlap their children and command responses can overlap worker execution; do not sum them or add their percentiles. `raw_rpc` means response bytes returned, while `final_state_persist` records the local send-state result after its existing transaction. Neither proves a phone displayed the reply. This diagnostic does not pool sessions, change retries, write a new database or fsync logs.
++
+ `server.user.toml` follows the Linux default `~/.config/agent-wechat/server/config.toml`. `server.toml` selects the explicit container locations:
+ 
+ | Path | Purpose |
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+index a1098184912572b4a208b9fa07dbd146ac4707bd..da24966f5d7090efdc3c9c2a8e6778bcb1124621 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -70,12 +70,24 @@ pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
+ }
+ 
+ impl Core {
++    #[cfg(test)]
+     pub(super) fn send_quote_with_receipt(
+         &self,
+         account: &str,
+         id: &str,
+         state: &mut AccountState,
+         payload: &SendPayload,
++    ) -> Result<SendReceipt> {
++        self.send_quote_with_receipt_observed(account, id, state, payload, &QuoteTrace::default())
++    }
++
++    pub(super) fn send_quote_with_receipt_observed(
++        &self,
++        account: &str,
++        id: &str,
++        state: &mut AccountState,
++        payload: &SendPayload,
++        trace: &QuoteTrace,
+     ) -> Result<SendReceipt> {
+         let quote = payload.quote.as_ref().context("missing_quote_intent")?;
+         if self.upstream_kind() == crate::upstream::UpstreamKind::Simulator {
+@@ -90,16 +102,23 @@ impl Core {
+             )?);
+         }
+         let sender = state.own_username.clone();
+-        let raw = Zeroizing::new(self.upstream.send_quote_raw(
+-            state,
+-            &payload.thread_id,
+-            &payload.client_id.to_string(),
+-            payload.created_at,
+-            &quote.xml,
+-        )?);
+-        self.retain_quote_receipt(account, id, payload, &sender, &raw)
++        let raw = Zeroizing::new(trace.measure(TimingStage::RawRpc, || {
++            self.upstream.send_quote_raw(
++                state,
++                &payload.thread_id,
++                &payload.client_id.to_string(),
++                payload.created_at,
++                &quote.xml,
++            )
++        })?);
++        trace
++            .measure(TimingStage::ReceiptRetain, || {
++                self.retain_quote_receipt(account, id, payload, &sender, &raw)
++            })
+             .map_err(|_| anyhow::anyhow!("quote_receipt_persistence_failed"))?;
+-        self.decode_retained_quote_receipt(account, id, payload)
++        trace.measure(TimingStage::ReceiptLoadDecode, || {
++            self.decode_retained_quote_receipt(account, id, payload)
++        })
+     }
+ 
+     fn retain_quote_receipt(
+@@ -181,16 +200,21 @@ impl Core {
+             .pending_send_receipt_ids(account, RECEIPT_PREFIX)?;
+         let mut changed = 0;
+         for id in ids {
++            let trace = self
++                .quote_timings
++                .recovered_worker(&id, self.timing_runtime());
++            let recovery = trace.span(TimingStage::ReceiptRecovery);
+             let old = self.store.send(account, &id)?;
+-            let outcome = (|| -> Result<SendReceipt> {
+-                let sealed = self.store.send_payload(account, &id)?;
+-                let payload: SendPayload = serde_json::from_slice(&self.vault.open_record(
+-                    account,
+-                    "send-payload",
+-                    &sealed,
+-                )?)?;
+-                self.decode_retained_quote_receipt(account, &id, &payload)
+-            })();
++            let outcome =
++                trace.measure(TimingStage::ReceiptLoadDecode, || -> Result<SendReceipt> {
++                    let sealed = self.store.send_payload(account, &id)?;
++                    let payload: SendPayload = serde_json::from_slice(&self.vault.open_record(
++                        account,
++                        "send-payload",
++                        &sealed,
++                    )?)?;
++                    self.decode_retained_quote_receipt(account, &id, &payload)
++                });
+             let (state, server_id, error) = match outcome {
+                 Ok(receipt) if receipt.accepted => ("accepted", receipt.server_message_id, None),
+                 Ok(_) => ("failed", None, Some("service_rejected")),
+@@ -202,10 +226,13 @@ impl Core {
+                     .is_some_and(|server| old.server_id.as_ref() != Some(server))
+                 || old.error_code.as_deref() != error
+             {
+-                self.store
+-                    .update_send(account, &id, state, server_id.as_deref(), error)?;
++                trace.send_update(|| {
++                    self.store
++                        .update_send(account, &id, state, server_id.as_deref(), error)
++                })?;
+                 changed += 1;
+             }
++            recovery.finish(TimingOutcome::Ok);
+         }
+         Ok(changed)
+     }
+@@ -220,7 +247,7 @@ mod tests {
+ 
+     struct RawReply {
+         calls: AtomicUsize,
+-        response: Vec<u8>,
++        response: Mutex<Vec<u8>>,
+     }
+ 
+     impl Upstream for RawReply {
+@@ -237,7 +264,7 @@ mod tests {
+             _content: &str,
+         ) -> Result<Vec<u8>> {
+             self.calls.fetch_add(1, Ordering::SeqCst);
+-            Ok(self.response.clone())
++            Ok(self.response.lock().unwrap().clone())
+         }
+     }
+ 
+@@ -255,7 +282,7 @@ mod tests {
+         store.create_account("two").unwrap();
+         let upstream = Arc::new(RawReply {
+             calls: AtomicUsize::new(0),
+-            response: raw,
++            response: Mutex::new(raw),
+         });
+         let core = Core::with_upstream(store.clone(), None, upstream.clone()).unwrap();
+         Fixture {
+@@ -368,6 +395,116 @@ mod tests {
+         .unwrap()
+     }
+ 
++    #[test]
++    fn quote_timings_observe_retention_and_recovery_without_another_rpc() {
++        let mut f = fixture(vec![]);
++        let (timings, receiver) = quote_timing::Timings::test_channel(128);
++        Arc::get_mut(&mut Arc::get_mut(&mut f.core).unwrap().shared)
++            .unwrap()
++            .quote_timings = timings;
++        let (send, payload) = intent(&f.core, "timed-private-key");
++        *f.upstream.response.lock().unwrap() = accepted_response(&payload);
++        let trace = f
++            .core
++            .quote_timings
++            .command("one", "timed-private-key", quote_timing::Runtime::Native)
++            .bind(&send.id, TimingOutcome::Created)
++            .worker();
++        let result = f
++            .core
++            .send_quote_with_receipt_observed(
++                "one",
++                &send.id,
++                &mut super::super::tests::state(),
++                &payload,
++                &trace,
++            )
++            .unwrap();
++        assert!(result.accepted && result.correlated);
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "submitting");
++        assert!(f
++            .store
++            .runtime("one", &format!("{RECEIPT_PREFIX}{}", send.id))
++            .unwrap()
++            .is_some());
++        // Startup first fences interrupted submissions, then reads receipts.
++        f.store.recover_uncertain_sends("one").unwrap();
++        assert_eq!(f.core.recover_quote_receipts("one").unwrap(), 1);
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "accepted");
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 1);
++        let rows: Vec<Value> = receiver
++            .try_iter()
++            .map(|row| serde_json::to_value(row).unwrap())
++            .collect();
++        let completed: Vec<_> = rows
++            .iter()
++            .filter(|row| row["edge"] == "end")
++            .map(|row| row["stage"].as_str().unwrap())
++            .collect();
++        assert_eq!(
++            completed,
++            [
++                "raw_rpc",
++                "receipt_retain",
++                "receipt_load_decode",
++                "receipt_load_decode",
++                "final_state_persist",
++                "receipt_recovery"
++            ]
++        );
++        assert!(rows.iter().all(|row| row["intent_id"] == send.id));
++        assert!(rows.iter().any(|row| row["stage"] == "final_state_persist"
++            && row["edge"] == "end"
++            && row["outcome"] == "accepted"));
++        assert!(rows.iter().any(|row| row["stage"] == "receipt_recovery"
++            && row["recovery_context_missing"] == true
++            && row["command_key_hash"].is_null()));
++        let rendered = serde_json::to_string(&rows).unwrap();
++        for secret in [
++            "timed-private-key",
++            "synthetic reply",
++            "synthetic-room@chatroom",
++            "synthetic_self",
++            "<appmsg>",
++        ] {
++            assert!(!rendered.contains(secret));
++        }
++    }
++
++    #[test]
++    fn quote_timings_record_parse_failure_after_retention_without_claiming_success() {
++        let f = fixture(p::bytes(1, &p::int32(1, 0)));
++        let (send, payload) = intent(&f.core, "timed-invalid");
++        let (timings, receiver) = quote_timing::Timings::test_channel(32);
++        let trace = timings.recovered_worker(&send.id, quote_timing::Runtime::Native);
++        let error = f
++            .core
++            .send_quote_with_receipt_observed(
++                "one",
++                &send.id,
++                &mut super::super::tests::state(),
++                &payload,
++                &trace,
++            )
++            .err()
++            .unwrap();
++        assert_eq!(error_code(&error), "quote_receipt_invalid");
++        assert!(f
++            .store
++            .runtime("one", &format!("{RECEIPT_PREFIX}{}", send.id))
++            .unwrap()
++            .is_some());
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "submitting");
++        let rows: Vec<Value> = receiver
++            .try_iter()
++            .map(|row| serde_json::to_value(row).unwrap())
++            .collect();
++        assert_eq!(rows.last().unwrap()["stage"], "receipt_load_decode");
++        assert_eq!(rows.last().unwrap()["outcome"], "error");
++        assert!(!rows.iter().any(|row| row["outcome"] == "accepted"));
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 1);
++    }
++
+     #[tokio::test]
+     async fn existing_sealed_quote_success_is_redecoded_on_restart_without_a_send() {
+         let f = fixture(vec![]);
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1455897c07935520f4d58cce70d8f21881ed5b91
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+@@ -0,0 +1,480 @@
++//! Optional, lossy observations. Never part of send authority or recovery.
++use serde::Serialize;
++use sha2::{Digest, Sha256};
++use std::{
++    io::Write,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        mpsc::{self, Receiver, SyncSender},
++        Arc,
++    },
++    time::{Instant, SystemTime, UNIX_EPOCH},
++};
++
++const CAPACITY: usize = 1024;
++
++#[derive(Clone, Copy, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub(super) enum Runtime {
++    Native,
++    Simulator,
++}
++
++#[derive(Clone, Copy, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub(super) enum Stage {
++    Sink,
++    CommandBinding,
++    QueueTotal,
++    QueueGateWait,
++    QueueReplayCheck,
++    QueueAccountValidation,
++    ClientIdReserve,
++    SourceResolve,
++    PayloadPrepare,
++    IntentCreate,
++    AsyncScheduleWait,
++    WorkerTotal,
++    WorkerGateWait,
++    BlockingScheduleWait,
++    WorkerPrepare,
++    SourceRecheck,
++    Claim,
++    RawRpc,
++    ReceiptRetain,
++    ReceiptLoadDecode,
++    ReceiptRecovery,
++    StateValidateSeal,
++    AuthorizationPersist,
++    SavedLoginProjection,
++    ValidatedMarker,
++    FinalStatePersist,
++}
++
++#[derive(Clone, Copy, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub(super) enum Outcome {
++    Ok,
++    Error,
++    Incomplete,
++    Created,
++    Replay,
++    Claimed,
++    ClaimLost,
++    Accepted,
++    Rejected,
++    Unknown,
++    Cancelled,
++    Skipped,
++    Pending,
++    Unchanged,
++    Other,
++}
++
++#[derive(Clone, Copy, Serialize)]
++#[serde(rename_all = "snake_case")]
++enum Edge {
++    Begin,
++    End,
++    Bind,
++}
++
++#[derive(Clone, Default)]
++pub(super) struct Timings(Option<Arc<Sink>>);
++
++struct Sink {
++    sender: SyncSender<Record>,
++    dropped: Arc<AtomicU64>,
++    sequence: AtomicU64,
++    origin: Instant,
++    boot_id: String,
++}
++
++#[derive(Clone, Default)]
++pub(super) struct Trace {
++    sink: Option<Arc<Sink>>,
++    runtime: Option<Runtime>,
++    command_id: Option<String>,
++    command_key_hash: Option<String>,
++    intent_id: Option<String>,
++    attempt_id: Option<String>,
++    recovery_context_missing: bool,
++}
++
++#[derive(Serialize)]
++pub(super) struct Record {
++    schema: u8,
++    event: &'static str,
++    source_tree: &'static str,
++    boot_id: String,
++    runtime: Option<Runtime>,
++    sequence: u64,
++    dropped_records: u64,
++    unix_us: u64,
++    monotonic_us: u64,
++    command_id: Option<String>,
++    command_key_hash: Option<String>,
++    intent_id: Option<String>,
++    attempt_id: Option<String>,
++    recovery_context_missing: bool,
++    stage: Stage,
++    edge: Edge,
++    duration_us: Option<u64>,
++    outcome: Option<Outcome>,
++}
++
++fn micros(value: std::time::Duration) -> u64 {
++    value.as_micros().try_into().unwrap_or(u64::MAX)
++}
++
++fn source_tree() -> &'static str {
++    let value = option_env!("WEKEEPER_GATEWAY_SOURCE_TREE").unwrap_or("");
++    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        value
++    } else {
++        "unavailable"
++    }
++}
++
++fn private_stdout() -> Option<std::fs::File> {
++    #[cfg(unix)]
++    {
++        use std::os::{fd::AsFd, unix::fs::MetadataExt};
++        let file = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned().ok()?);
++        let metadata = file.metadata().ok()?;
++        // SAFETY: geteuid has no arguments, pointers, or process side effects.
++        let owner = unsafe { libc::geteuid() };
++        if metadata.is_file() && metadata.mode() & 0o077 == 0 && metadata.uid() == owner {
++            return Some(file);
++        }
++    }
++    None
++}
++
++fn write_records(mut output: impl Write, receiver: Receiver<Record>, dropped: Arc<AtomicU64>) {
++    for mut record in receiver {
++        record.dropped_records = dropped.load(Ordering::Relaxed);
++        // Serialize only this closed schema, never errors or protocol values.
++        let Ok(mut bytes) = serde_json::to_vec(&record) else {
++            dropped.fetch_add(1, Ordering::Relaxed);
++            continue;
++        };
++        bytes.push(b'\n');
++        if bytes.len() > 2048 || output.write_all(&bytes).is_err() {
++            dropped.fetch_add(1, Ordering::Relaxed);
++            break;
++        }
++    }
++}
++
++impl Timings {
++    pub(super) fn from_env() -> Self {
++        if std::env::var_os("WX_QUOTE_TIMINGS").is_none_or(|value| value != "1") {
++            return Self::default();
++        }
++        let Some(output) = private_stdout() else {
++            return Self::default();
++        };
++        let (timings, receiver) = Self::channel(CAPACITY);
++        let Some(sink) = &timings.0 else {
++            return Self::default();
++        };
++        let dropped = sink.dropped.clone();
++        if std::thread::Builder::new()
++            .name("quote-timings".into())
++            .spawn(move || write_records(output, receiver, dropped))
++            .is_err()
++        {
++            return Self::default();
++        }
++        Trace {
++            sink: timings.0.clone(),
++            ..Trace::default()
++        }
++        .emit(Stage::Sink, Edge::End, Some(0), Some(Outcome::Ok));
++        timings
++    }
++
++    fn channel(capacity: usize) -> (Self, Receiver<Record>) {
++        let (sender, receiver) = mpsc::sync_channel(capacity);
++        (
++            Self(Some(Arc::new(Sink {
++                sender,
++                dropped: Arc::new(AtomicU64::new(0)),
++                sequence: AtomicU64::new(0),
++                origin: Instant::now(),
++                boot_id: uuid::Uuid::new_v4().to_string(),
++            }))),
++            receiver,
++        )
++    }
++
++    pub(super) fn command(&self, account: &str, key: &str, runtime: Runtime) -> Trace {
++        let Some(sink) = &self.0 else {
++            return Trace::default();
++        };
++        let mut hash = Sha256::new();
++        hash.update(b"wx-quote-command-v1\0");
++        for value in [account, key] {
++            hash.update((value.len() as u64).to_be_bytes());
++            hash.update(value.as_bytes());
++        }
++        Trace {
++            sink: Some(sink.clone()),
++            runtime: Some(runtime),
++            command_id: Some(uuid::Uuid::new_v4().to_string()),
++            command_key_hash: Some(format!("{:x}", hash.finalize())),
++            ..Trace::default()
++        }
++    }
++
++    pub(super) fn recovered_worker(&self, id: &str, runtime: Runtime) -> Trace {
++        if self.0.is_none() {
++            return Trace::default();
++        }
++        Trace {
++            sink: self.0.clone(),
++            runtime: Some(runtime),
++            intent_id: uuid::Uuid::parse_str(id).ok().map(|id| id.to_string()),
++            attempt_id: Some(uuid::Uuid::new_v4().to_string()),
++            recovery_context_missing: true,
++            ..Trace::default()
++        }
++    }
++
++    #[cfg(test)]
++    pub(super) fn test_channel(capacity: usize) -> (Self, Receiver<Record>) {
++        Self::channel(capacity)
++    }
++}
++
++impl Trace {
++    fn emit(&self, stage: Stage, edge: Edge, duration_us: Option<u64>, outcome: Option<Outcome>) {
++        let Some(sink) = &self.sink else {
++            return;
++        };
++        let record = Record {
++            schema: 1,
++            event: "quote_phase_timing",
++            source_tree: source_tree(),
++            boot_id: sink.boot_id.clone(),
++            runtime: self.runtime,
++            sequence: sink.sequence.fetch_add(1, Ordering::Relaxed),
++            dropped_records: sink.dropped.load(Ordering::Relaxed),
++            unix_us: micros(
++                SystemTime::now()
++                    .duration_since(UNIX_EPOCH)
++                    .unwrap_or_default(),
++            ),
++            monotonic_us: micros(sink.origin.elapsed()),
++            command_id: self.command_id.clone(),
++            command_key_hash: self.command_key_hash.clone(),
++            intent_id: self.intent_id.clone(),
++            attempt_id: self.attempt_id.clone(),
++            recovery_context_missing: self.recovery_context_missing,
++            stage,
++            edge,
++            duration_us,
++            outcome,
++        };
++        if sink.sender.try_send(record).is_err() {
++            sink.dropped.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    pub(super) fn bind(&self, id: &str, outcome: Outcome) -> Self {
++        if self.sink.is_none() {
++            return Self::default();
++        }
++        let mut bound = self.clone();
++        bound.intent_id = uuid::Uuid::parse_str(id).ok().map(|id| id.to_string());
++        bound.emit(Stage::CommandBinding, Edge::Bind, None, Some(outcome));
++        bound
++    }
++
++    pub(super) fn worker(&self) -> Self {
++        if self.sink.is_none() {
++            return Self::default();
++        }
++        let mut worker = self.clone();
++        worker.attempt_id = Some(uuid::Uuid::new_v4().to_string());
++        worker
++    }
++
++    pub(super) fn span(&self, stage: Stage) -> Span {
++        let start = self.sink.as_ref().map(|_| Instant::now());
++        self.emit(stage, Edge::Begin, None, None);
++        Span {
++            trace: self.clone(),
++            stage,
++            start,
++        }
++    }
++
++    pub(super) fn measure<T, E>(
++        &self,
++        stage: Stage,
++        action: impl FnOnce() -> Result<T, E>,
++    ) -> Result<T, E> {
++        let span = self.span(stage);
++        let result = action();
++        span.result(&result);
++        result
++    }
++
++    pub(super) fn send_update<E>(
++        &self,
++        action: impl FnOnce() -> Result<wechat_store::SendIntent, E>,
++    ) -> Result<wechat_store::SendIntent, E> {
++        let span = self.span(Stage::FinalStatePersist);
++        let result = action();
++        span.send_result(&result);
++        result
++    }
++}
++
++pub(super) struct Span {
++    trace: Trace,
++    stage: Stage,
++    start: Option<Instant>,
++}
++
++impl Span {
++    pub(super) fn finish(mut self, outcome: Outcome) {
++        if let Some(start) = self.start.take() {
++            self.trace.emit(
++                self.stage,
++                Edge::End,
++                Some(micros(start.elapsed())),
++                Some(outcome),
++            );
++        }
++    }
++
++    pub(super) fn result<T, E>(self, result: &Result<T, E>) {
++        self.finish(if result.is_ok() {
++            Outcome::Ok
++        } else {
++            Outcome::Error
++        });
++    }
++
++    pub(super) fn send_result<E>(self, result: &Result<wechat_store::SendIntent, E>) {
++        self.finish(match result.as_ref().map(|intent| intent.state.as_str()) {
++            Ok("accepted") => Outcome::Accepted,
++            Ok("failed") => Outcome::Rejected,
++            Ok("needs_review") => Outcome::Unknown,
++            Ok("cancelled") => Outcome::Cancelled,
++            Ok(_) => Outcome::Other,
++            Err(_) => Outcome::Error,
++        });
++    }
++}
++
++impl Drop for Span {
++    fn drop(&mut self) {
++        if let Some(start) = self.start.take() {
++            self.trace.emit(
++                self.stage,
++                Edge::End,
++                Some(micros(start.elapsed())),
++                Some(Outcome::Incomplete),
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn disabled_has_no_identity_allocation_or_events() {
++        let trace = Timings::default().command("private-account", "private-key", Runtime::Native);
++        assert!(trace.sink.is_none());
++        assert!(trace.command_id.is_none());
++        assert!(trace.command_key_hash.is_none());
++        assert_eq!(trace.measure(Stage::RawRpc, || Ok::<_, ()>(7)), Ok(7));
++    }
++
++    #[test]
++    fn command_hashes_are_length_delimited_and_events_exclude_raw_inputs() {
++        let (sink, receiver) = Timings::channel(32);
++        let a = sink.command("private-account", "private-key", Runtime::Native);
++        let again = sink.command("private-account", "private-key", Runtime::Native);
++        assert_eq!(a.command_key_hash, again.command_key_hash);
++        assert_ne!(a.command_id, again.command_id);
++        assert_ne!(
++            sink.command("ab", "c", Runtime::Native).command_key_hash,
++            sink.command("a", "bc", Runtime::Native).command_key_hash
++        );
++        let id = uuid::Uuid::new_v4().to_string();
++        let worker = a.bind(&id, Outcome::Created).worker();
++        assert_eq!(
++            worker.measure(Stage::RawRpc, || Err::<(), _>("private-token-error")),
++            Err("private-token-error")
++        );
++        let rows: Vec<_> = receiver
++            .try_iter()
++            .map(|row| serde_json::to_value(row).unwrap())
++            .collect();
++        let text = serde_json::to_string(&rows).unwrap();
++        for secret in ["private-account", "private-key", "private-token-error"] {
++            assert!(!text.contains(secret));
++        }
++        assert_eq!(rows[0]["intent_id"], id);
++        assert_eq!(rows[2]["outcome"], "error");
++        assert!(rows[2]["duration_us"].is_u64());
++        assert!(rows[2]["unix_us"].as_u64().unwrap() > 0);
++    }
++
++    #[test]
++    fn incomplete_scope_and_recovered_worker_are_explicit() {
++        let (sink, receiver) = Timings::channel(8);
++        let trace = sink.recovered_worker(&uuid::Uuid::new_v4().to_string(), Runtime::Native);
++        drop(trace.span(Stage::WorkerTotal));
++        let rows: Vec<_> = receiver
++            .try_iter()
++            .map(|row| serde_json::to_value(row).unwrap())
++            .collect();
++        assert_eq!(rows[1]["outcome"], "incomplete");
++        assert_eq!(rows[1]["recovery_context_missing"], true);
++        assert!(rows[1]["command_key_hash"].is_null());
++        assert!(rows[1]["attempt_id"].is_string());
++    }
++
++    #[test]
++    fn full_or_disconnected_sink_keeps_result_and_reports_loss() {
++        let (sink, receiver) = Timings::channel(1);
++        let trace = sink.command("account", "key", Runtime::Simulator);
++        assert_eq!(trace.measure(Stage::RawRpc, || Ok::<_, ()>(42)), Ok(42));
++        let _ = receiver.try_recv().unwrap();
++        trace.span(Stage::ReceiptRetain).finish(Outcome::Ok);
++        let row = receiver.try_recv().unwrap();
++        assert!(row.dropped_records > 0);
++        assert!(row.sequence > 1);
++        drop(receiver);
++        assert_eq!(trace.measure(Stage::RawRpc, || Err::<(), _>(9)), Err(9));
++    }
++
++    #[test]
++    fn writer_error_disconnects_without_affecting_send() {
++        struct Broken;
++        impl Write for Broken {
++            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
++                Err(std::io::ErrorKind::BrokenPipe.into())
++            }
++            fn flush(&mut self) -> std::io::Result<()> {
++                panic!("timings must not flush")
++            }
++        }
++        let (sink, receiver) = Timings::channel(8);
++        let trace = sink.command("account", "key", Runtime::Native);
++        trace.span(Stage::RawRpc).finish(Outcome::Ok);
++        write_records(Broken, receiver, sink.0.as_ref().unwrap().dropped.clone());
++        assert_eq!(
++            trace.measure(Stage::ReceiptRetain, || Ok::<_, ()>(1)),
++            Ok(1)
++        );
++        assert!(sink.0.as_ref().unwrap().dropped.load(Ordering::Relaxed) >= 2);
++    }
++}
+diff --git a/packages/native-client-rust/crates/wechat-core/src/runtime.rs b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+index a59d5fb48e9bc820952f3a783c91a7ea98632301..5609e6c7e7b11457cda7b282206499ab0c62a6fc 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -33,6 +33,9 @@ mod profile_network;
+ mod push;
+ #[path = "quote_receipts.rs"]
+ mod quote_receipts;
++#[path = "quote_timing.rs"]
++mod quote_timing;
++use quote_timing::{Outcome as TimingOutcome, Stage as TimingStage, Trace as QuoteTrace};
+ #[path = "read_control.rs"]
+ mod read_control;
+ #[path = "read_sync.rs"]
+@@ -95,6 +98,7 @@ impl std::ops::Deref for Core {
+ #[doc(hidden)]
+ pub struct CoreShared {
+     pub(crate) upstream: Arc<dyn crate::upstream::Upstream>,
++    quote_timings: quote_timing::Timings,
+     pub ownership_generation: String,
+     pub(crate) leases: Mutex<BTreeMap<String, Vec<wechat_store::Lease>>>,
+     pub(crate) vault: Arc<Vault>,
+@@ -318,6 +322,7 @@ impl Core {
+             live_store: None,
+             shared: Arc::new(CoreShared {
+                 upstream,
++                quote_timings: quote_timing::Timings::from_env(),
+                 leases: Mutex::new(leases),
+                 vault: Arc::new(vault),
+                 cursor_vault: Arc::new(cursor_vault),
+@@ -531,19 +536,41 @@ impl Core {
+         self.persist_state(account, state, true)
+     }
+     fn persist_state(&self, account: &str, state: &AccountState, accepted: bool) -> Result<()> {
+-        self.upstream.validate_state(state)?;
+-        self.check_state_profile(account, state)?;
+-        if let Ok(prior) = self.state_unfenced(account) {
+-            if prior.uin != state.uin || prior.own_username != state.own_username {
+-                bail!("account_identity_mismatch");
++        self.persist_state_observed(account, state, accepted, &QuoteTrace::default())
++    }
++    fn persist_state_observed(
++        &self,
++        account: &str,
++        state: &AccountState,
++        accepted: bool,
++        trace: &QuoteTrace,
++    ) -> Result<()> {
++        let sealed = trace.measure(TimingStage::StateValidateSeal, || -> Result<_> {
++            self.upstream.validate_state(state)?;
++            self.check_state_profile(account, state)?;
++            if let Ok(prior) = self.state_unfenced(account) {
++                if prior.uin != state.uin || prior.own_username != state.own_username {
++                    bail!("account_identity_mismatch");
++                }
+             }
+-        }
+-        let sealed = self
+-            .vault
+-            .seal(account, "account-state", &serde_json::to_vec(state)?)?;
++            self.vault
++                .seal(account, "account-state", &serde_json::to_vec(state)?)
++        })?;
+         if accepted {
+-            self.store.save_accepted_authorization(account, &sealed)?;
+-            let _ = self.project_saved_login(account, state);
++            trace.measure(TimingStage::AuthorizationPersist, || {
++                self.store.save_accepted_authorization(account, &sealed)
++            })?;
++            let span = trace.span(TimingStage::SavedLoginProjection);
++            let projected = self.project_saved_login(account, state);
++            span.finish(match projected.as_ref() {
++                Err(_) => TimingOutcome::Error,
++                Ok(value) if value["unchanged"] == true || value["state"] == "unchanged" => {
++                    TimingOutcome::Unchanged
++                }
++                Ok(value) if value["state"] == "complete" => TimingOutcome::Ok,
++                Ok(value) if value["state"] == "pending" => TimingOutcome::Pending,
++                Ok(_) => TimingOutcome::Other,
++            });
+             Ok(())
+         } else {
+             self.store.save_active_authorization(account, &sealed)
+@@ -1295,6 +1322,34 @@ impl Core {
+         destination: &str,
+         text: &str,
+         options: SendOptions,
++    ) -> Result<SendIntent> {
++        let trace = if options.quote.is_some() {
++            self.quote_timings
++                .command(account, key, self.timing_runtime())
++        } else {
++            QuoteTrace::default()
++        };
++        let total = trace.span(TimingStage::QueueTotal);
++        let result = self
++            .queue_message_send_observed(account, key, destination, text, options, trace)
++            .await;
++        total.result(&result);
++        result
++    }
++    fn timing_runtime(&self) -> quote_timing::Runtime {
++        match self.upstream_kind() {
++            crate::upstream::UpstreamKind::Native => quote_timing::Runtime::Native,
++            crate::upstream::UpstreamKind::Simulator => quote_timing::Runtime::Simulator,
++        }
++    }
++    async fn queue_message_send_observed(
++        self: &Arc<Self>,
++        account: &str,
++        key: &str,
++        destination: &str,
++        text: &str,
++        options: SendOptions,
++        trace: QuoteTrace,
+     ) -> Result<SendIntent> {
+         let SendOptions {
+             share,
+@@ -1303,13 +1358,17 @@ impl Core {
+         } = options;
+         let gate = self.gate(account)?;
+         let _guard = if quote.is_some() || mentions.is_some() {
+-            Some(gate.lock().await)
++            let wait = trace.span(TimingStage::QueueGateWait);
++            let guard = gate.lock().await;
++            wait.finish(TimingOutcome::Ok);
++            Some(guard)
+         } else {
+             None
+         };
+         // A replay uses the sealed reference even if the profile row was later
+         // removed or changed. It must never create a second submission.
+         if quote.is_some() || mentions.is_some() {
++            let replay = trace.span(TimingStage::QueueReplayCheck);
+             if let Ok(prior) = self.store.send_by_key(account, key) {
+                 let sealed = self.store.send_payload(account, &prior.id)?;
+                 let old: SendPayload = serde_json::from_slice(&self.vault.open_record(
+@@ -1323,11 +1382,16 @@ impl Core {
+                     || old.quote.as_ref().map(|q| &q.target) != quote.as_ref()
+                     || old.mentions.as_ref().map(|m| &m.request) != mentions.as_ref()
+                 {
++                    replay.finish(TimingOutcome::Error);
+                     bail!("idempotency_conflict");
+                 }
++                replay.finish(TimingOutcome::Replay);
++                trace.bind(&prior.id, TimingOutcome::Replay);
+                 return Ok(prior);
+             }
++            replay.finish(TimingOutcome::Ok);
+         }
++        let validation = trace.span(TimingStage::QueueAccountValidation);
+         let state = self.account_state(account)?;
+         if self.media_job_by_key(account, key).is_ok() {
+             bail!("idempotency_conflict");
+@@ -1345,11 +1409,14 @@ impl Core {
+         {
+             bail!("invalid send request");
+         }
+-        let client_id = self.store.reserve_client_id(
+-            account,
+-            key,
+-            wechat_protocol::wire::client_message_id(format!("{account}:{key}").as_bytes()),
+-        )?;
++        validation.finish(TimingOutcome::Ok);
++        let client_id = trace.measure(TimingStage::ClientIdReserve, || {
++            self.store.reserve_client_id(
++                account,
++                key,
++                wechat_protocol::wire::client_message_id(format!("{account}:{key}").as_bytes()),
++            )
++        })?;
+         let payload = SendPayload {
+             thread_id: destination.into(),
+             text: text.into(),
+@@ -1359,7 +1426,15 @@ impl Core {
+             quote: quote
+                 .as_ref()
+                 .map(|q| {
+-                    self.resolve_quote_source(account, destination, text, q, &state.own_username)
++                    trace.measure(TimingStage::SourceResolve, || {
++                        self.resolve_quote_source(
++                            account,
++                            destination,
++                            text,
++                            q,
++                            &state.own_username,
++                        )
++                    })
+                 })
+                 .transpose()?,
+             mentions: mentions
+@@ -1375,6 +1450,7 @@ impl Core {
+                 })
+                 .transpose()?,
+         };
++        let preparation = trace.span(TimingStage::PayloadPrepare);
+         let hash = format!(
+             "{:x}",
+             Sha256::digest(match &payload.share {
+@@ -1395,20 +1471,37 @@ impl Core {
+         let encrypted = self
+             .vault
+             .seal(account, "send-payload", &serde_json::to_vec(&payload)?)?;
+-        let (intent, created) = self.store.create_send(
+-            account,
+-            key,
+-            destination,
+-            &hash,
+-            &encrypted,
+-            &client_id.to_string(),
+-        )?;
++        preparation.finish(TimingOutcome::Ok);
++        let (intent, created) = trace.measure(TimingStage::IntentCreate, || {
++            self.store.create_send(
++                account,
++                key,
++                destination,
++                &hash,
++                &encrypted,
++                &client_id.to_string(),
++            )
++        })?;
++        let trace = trace.bind(
++            &intent.id,
++            if created {
++                TimingOutcome::Created
++            } else {
++                TimingOutcome::Replay
++            },
++        );
+         if created {
+             let core = self.clone();
+             let account = account.to_string();
+             let id = intent.id.clone();
++            let scheduled = trace.span(TimingStage::AsyncScheduleWait);
+             tokio::spawn(async move {
+-                if core.perform_send(&account, &id).await.is_err() {
++                scheduled.finish(TimingOutcome::Ok);
++                if core
++                    .perform_send_observed(&account, &id, trace.worker())
++                    .await
++                    .is_err()
++                {
+                     if let Ok(intent) = core.store.send(&account, &id) {
+                         let state = if intent.state == "queued" {
+                             "failed"
+@@ -1429,19 +1522,50 @@ impl Core {
+         Ok(intent)
+     }
+     async fn perform_send(self: &Arc<Self>, account: &str, id: &str) -> Result<()> {
++        // A recovery caller has no original in-memory command context. Do not
++        // add a database read or pretend that its original gate wait is known.
++        let trace = self
++            .quote_timings
++            .recovered_worker(id, self.timing_runtime());
++        self.perform_send_observed(account, id, trace).await
++    }
++    async fn perform_send_observed(
++        self: &Arc<Self>,
++        account: &str,
++        id: &str,
++        trace: QuoteTrace,
++    ) -> Result<()> {
++        let total = trace.span(TimingStage::WorkerTotal);
++        let result = self.perform_send_inner(account, id, trace).await;
++        total.result(&result);
++        result
++    }
++    async fn perform_send_inner(
++        self: &Arc<Self>,
++        account: &str,
++        id: &str,
++        trace: QuoteTrace,
++    ) -> Result<()> {
+         let gate = self.gate(account)?;
++        let wait = trace.span(TimingStage::WorkerGateWait);
+         let _guard = gate.lock().await;
++        wait.finish(TimingOutcome::Ok);
+         let core = self.clone();
+         let account = account.to_string();
+         let id = id.to_string();
++        let scheduled = trace.span(TimingStage::BlockingScheduleWait);
+         blocking(move || {
++            scheduled.finish(TimingOutcome::Ok);
++            let preparation = trace.span(TimingStage::WorkerPrepare);
+             let intent = core.store.send(&account, &id)?;
+             if core.stopping.load(Ordering::SeqCst)
+                 || core.store.runtime(&account, "desired")?.as_deref() != Some(b"connected")
+             {
++                preparation.finish(TimingOutcome::Skipped);
+                 return Ok(());
+             }
+             if intent.state != "queued" {
++                preparation.finish(TimingOutcome::Skipped);
+                 return Ok(());
+             }
+             let encrypted = core.store.send_payload(&account, &id)?;
+@@ -1450,6 +1574,7 @@ impl Core {
+                 .open_record(&account, "send-payload", &encrypted)?;
+             let payload: SendPayload = serde_json::from_slice(&plain)?;
+             let mut state = core.account_state(&account)?;
++            preparation.finish(TimingOutcome::Ok);
+             let native = &core.upstream;
+             if payload.mentions.as_ref().is_some_and(|m| m.request.all) {
+                 if let Err(error) =
+@@ -1469,29 +1594,40 @@ impl Core {
+                 }
+             }
+             if let Some(quote) = &payload.quote {
+-                if core
+-                    .require_quote_source(&account, &payload.thread_id, &quote.target)
++                if trace
++                    .measure(TimingStage::SourceRecheck, || {
++                        core.require_quote_source(&account, &payload.thread_id, &quote.target)
++                    })
+                     .is_err()
+                 {
+                     // Compete with cancellation/logout before recording a
+                     // known pre-submission failure. No network call follows.
+-                    if core.store.claim_send(&account, &id)? {
+-                        core.store.update_send(
+-                            &account,
+-                            &id,
+-                            "failed",
+-                            None,
+-                            Some("quote_target_unavailable"),
+-                        )?;
++                    if trace.measure(TimingStage::Claim, || core.store.claim_send(&account, &id))? {
++                        trace.send_update(|| {
++                            core.store.update_send(
++                                &account,
++                                &id,
++                                "failed",
++                                None,
++                                Some("quote_target_unavailable"),
++                            )
++                        })?;
+                     }
+                     return Ok(());
+                 }
+             }
+-            if !core.store.claim_send(&account, &id)? {
++            let claim = trace.span(TimingStage::Claim);
++            let claimed = core.store.claim_send(&account, &id);
++            claim.finish(match claimed.as_ref() {
++                Ok(true) => TimingOutcome::Claimed,
++                Ok(false) => TimingOutcome::ClaimLost,
++                Err(_) => TimingOutcome::Error,
++            });
++            if !claimed? {
+                 return Ok(());
+             }
+             let result = if payload.quote.is_some() {
+-                core.send_quote_with_receipt(&account, &id, &mut state, &payload)
++                core.send_quote_with_receipt_observed(&account, &id, &mut state, &payload, &trace)
+             } else if let Some(share) = &payload.share {
+                 let xml = share.xml(&state.own_username)?;
+                 native
+@@ -1542,10 +1678,14 @@ impl Core {
+             };
+             // A logout may suppress credential installation during this RPC,
+             // but cannot erase an authenticated, accepted send receipt.
+-            let authorization_saved = core.save_state(&account, &state).is_ok();
++            let authorization_saved = core
++                .persist_state_observed(&account, &state, true, &trace)
++                .is_ok();
+             if authorization_saved {
+-                core.store
+-                    .mark_validated_if_active(&account, &core.ownership_generation)?;
++                trace.measure(TimingStage::ValidatedMarker, || {
++                    core.store
++                        .mark_validated_if_active(&account, &core.ownership_generation)
++                })?;
+             }
+             let unknown_code = result
+                 .as_ref()
+@@ -1553,6 +1693,7 @@ impl Core {
+                 .filter(|_| payload.quote.is_some())
+                 .map(quote_receipts::error_code)
+                 .unwrap_or("submission_outcome_unknown");
++            let update_span = trace.span(TimingStage::FinalStatePersist);
+             let updated = match result {
+                 Ok(result) if result.accepted && result.correlated => core.store.update_send(
+                     &account,
+@@ -1560,22 +1701,18 @@ impl Core {
+                     "accepted",
+                     result.server_message_id.as_deref(),
+                     None,
+-                )?,
+-                Ok(result) if !result.accepted => core.store.update_send(
+-                    &account,
+-                    &id,
+-                    "failed",
+-                    None,
+-                    Some("service_rejected"),
+-                )?,
+-                _ => core.store.update_send(
+-                    &account,
+-                    &id,
+-                    "needs_review",
+-                    None,
+-                    Some(unknown_code),
+-                )?,
++                ),
++                Ok(result) if !result.accepted => {
++                    core.store
++                        .update_send(&account, &id, "failed", None, Some("service_rejected"))
++                }
++                _ => {
++                    core.store
++                        .update_send(&account, &id, "needs_review", None, Some(unknown_code))
++                }
+             };
++            update_span.send_result(&updated);
++            let updated = updated?;
+             let native_source = payload.quote.as_ref().is_some_and(|quote| {
+                 matches!(quote.target, crate::QuoteSourceReference::Received(_))
+             });
+@@ -3244,6 +3381,97 @@ mod tests {
+             1
+         );
+     }
++    #[tokio::test]
++    async fn quote_timings_separate_queue_and_worker_gate_waits_without_submitting() {
++        let temp = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&temp.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        let mut core = Core::new(store, None).unwrap();
++        let (timings, receiver) = quote_timing::Timings::test_channel(128);
++        Arc::get_mut(&mut Arc::get_mut(&mut core).unwrap().shared)
++            .unwrap()
++            .quote_timings = timings;
++        let gate = core.gate("one").unwrap();
++        let held = gate.lock().await;
++        let queued_core = core.clone();
++        let queued = tokio::spawn(async move {
++            queued_core
++                .queue_message_send(
++                    "one",
++                    "private-timed-key",
++                    "private-destination",
++                    "private-text",
++                    SendOptions {
++                        quote: Some(
++                            crate::QuoteSendReference {
++                                message_id: "synthetic-source".into(),
++                                server_id: "999".into(),
++                            }
++                            .into(),
++                        ),
++                        ..Default::default()
++                    },
++                )
++                .await
++        });
++        let recovered_core = core.clone();
++        let worker = tokio::spawn(async move {
++            recovered_core
++                .perform_send("one", &uuid::Uuid::new_v4().to_string())
++                .await
++        });
++        let mut rows = Vec::<Value>::new();
++        tokio::time::timeout(Duration::from_secs(5), async {
++            loop {
++                rows.extend(
++                    receiver
++                        .try_iter()
++                        .map(|row| serde_json::to_value(row).unwrap()),
++                );
++                if ["queue_gate_wait", "worker_gate_wait"].iter().all(|stage| {
++                    rows.iter()
++                        .any(|row| row["stage"] == *stage && row["edge"] == "begin")
++                }) {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++        assert!(!queued.is_finished() && !worker.is_finished());
++        assert!(!rows
++            .iter()
++            .any(|row| ["queue_gate_wait", "worker_gate_wait"]
++                .contains(&row["stage"].as_str().unwrap())
++                && row["edge"] == "end"));
++        drop(held);
++        assert!(queued.await.unwrap().is_err());
++        assert!(worker.await.unwrap().is_err());
++        rows.extend(
++            receiver
++                .try_iter()
++                .map(|row| serde_json::to_value(row).unwrap()),
++        );
++        for stage in [
++            "queue_gate_wait",
++            "worker_gate_wait",
++            "blocking_schedule_wait",
++        ] {
++            assert_eq!(
++                rows.iter()
++                    .filter(|row| row["stage"] == stage && row["edge"] == "end")
++                    .count(),
++                1
++            );
++        }
++        assert!(!rows.iter().any(|row| row["stage"] == "raw_rpc"));
++        let rendered = serde_json::to_string(&rows).unwrap();
++        for value in ["private-timed-key", "private-destination", "private-text"] {
++            assert!(!rendered.contains(value));
++        }
++    }
++
+     #[tokio::test]
+     async fn quote_intents_bind_source_identity_and_reuse_sealed_material_for_replay_and_projection(
+     ) {

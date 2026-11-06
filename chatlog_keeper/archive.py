@@ -20,7 +20,7 @@ from chatlog_keeper.archive_semantics import SemanticsMixin
 from chatlog_keeper.archive_p2 import P2Mixin
 
 ZONE = ZoneInfo("Asia/Shanghai")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ArchiveError(ValueError):
@@ -171,15 +171,16 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
             self.conn = sqlite3.connect(location, uri=readonly, timeout=5, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA busy_timeout=5000")
+            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION) or (readonly and version not in (4, SCHEMA_VERSION)):
+                raise ArchiveError("unsupported_archive_version")
+            self.schema_version = version if version in (4, SCHEMA_VERSION) else SCHEMA_VERSION
             if readonly:
                 self.conn.execute("PRAGMA query_only=ON")
             else:
                 self.path.chmod(0o600)
                 self.conn.execute("PRAGMA journal_mode=WAL")
                 self.conn.execute("PRAGMA synchronous=FULL")
-            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, SCHEMA_VERSION) or (readonly and version != SCHEMA_VERSION):
-                raise ArchiveError("unsupported_archive_version")
             if not readonly:
                 if version in (1, 2, 3):
                     backups = self.archive_dir / "backups"
@@ -203,8 +204,12 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
                     self.conn.execute("ALTER TABLE media ADD COLUMN forward_ref TEXT")
                 self.conn.execute("CREATE INDEX IF NOT EXISTS media_forward ON media(forward_ref)")
                 self._migrate_p2()
-                self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self.conn.execute(f"PRAGMA user_version={self.schema_version}")
                 self.conn.commit()
+        except BaseException:
+            if hasattr(self, "conn"):
+                self.conn.close()
+            raise
         finally:
             os.umask(old_mask)
 
@@ -429,13 +434,22 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
         self._bump_revision()
         self._merge_forwarded(old_ref, canonical)
         self._merge_p2(old_ref, canonical)
+        # Retired bot-event journals remain historical records. Aliases resolve
+        # their original references without rewriting or deleting those rows.
         self.conn.execute("UPDATE origins SET message_ref=? WHERE message_ref=?", (canonical, old_ref))
         self.conn.execute("UPDATE media SET message_ref=? WHERE message_ref=?", (canonical, old_ref))
         self.conn.execute("UPDATE aliases SET message_ref=? WHERE message_ref=?", (canonical, old_ref))
         self.conn.execute("INSERT OR REPLACE INTO aliases VALUES(?,?)", (old_ref, canonical))
         self.conn.execute("DELETE FROM messages WHERE message_ref=?", (old_ref,))
 
-    def commit_page(self, source_ref, generation, table_name, group_id, rows, mode="live", checkpoint=0, complete=False):
+    def commit_page(self, source_ref, generation, table_name, group_id, rows, mode="live", checkpoint=0, complete=False,
+                    *, preserve_existing=False):
+        """Commit source evidence; sparse projections may only fill missing display fields.
+
+        Normal collection remains authoritative for parsed message updates.
+        Protocol archive projections retain existing rich semantics and only
+        attach their independent origin/checkpoint to a known message.
+        """
         from chatlog_keeper.message_model import parse_record, source_row_hash
         self._write()
         if mode not in {"live", "backfill", "reconcile"} or type(checkpoint) is not int or checkpoint < 0:
@@ -476,7 +490,18 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
                 now = time.time()
                 existing = self.conn.execute("SELECT * FROM messages WHERE message_ref=?", (message_ref,)).fetchone()
                 values = (str(raw.get("sender_id", raw.get("sender", "")) or ""), str(raw.get("sender_name") or ""), int(parsed.get("msg_type", 0)), parsed.get("sub_type"), parsed.get("text") or "", parsed.get("parse_status") or "unparsed", _json(parsed.get("reply")) if parsed.get("reply") else None, _json(parsed.get("attachment")) if parsed.get("attachment") else None, _json(parsed.get("mentions", [])), _json(parsed.get("event")) if parsed.get("event") else None)
-                if existing:
+                if existing and preserve_existing:
+                    missing = {key: value for key, value in (("sender_id", values[0]), ("sender_name", values[1]))
+                               if not existing[key] and value}
+                    if existing["msg_type"] == 1 and not existing["text"] and values[4]:
+                        missing["text"] = values[4]
+                    if missing:
+                        self._bump_revision()
+                        missing["updated_at"] = now
+                        self.conn.execute("UPDATE messages SET " + ",".join(key + "=?" for key in missing) +
+                                          " WHERE message_ref=?", (*missing.values(), message_ref))
+                    updated += 1
+                elif existing:
                     keys = ("sender_id", "sender_name", "msg_type", "sub_type", "text", "parse_status", "reply", "attachment", "mentions", "event")
                     if (sid and sid != existing["server_id"]) or any(existing[k] != v for k, v in zip(keys, values)):
                         self._bump_revision()
@@ -487,10 +512,11 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
                     inserted += 1
                 self.conn.execute("INSERT INTO origins(source_ref,generation,table_name,row_id,message_ref,raw_type,raw_sender,raw_content,raw_is_text,packed_info_data,message_source,payload_hash,last_seen,raw_server_id,raw_create_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_ref,generation,table_name,row_id) DO UPDATE SET message_ref=excluded.message_ref,raw_type=excluded.raw_type,raw_sender=excluded.raw_sender,raw_content=excluded.raw_content,raw_is_text=excluded.raw_is_text,packed_info_data=excluded.packed_info_data,message_source=excluded.message_source,payload_hash=excluded.payload_hash,last_seen=excluded.last_seen,raw_server_id=excluded.raw_server_id,raw_create_time=excluded.raw_create_time", (source_ref, generation, table_name, row_id, message_ref, raw.get("local_type"), str(raw.get("real_sender_id", raw.get("sender_id", ""))), _blob(raw.get("message_content")), int(isinstance(raw.get("message_content"), str)), _blob(raw.get("packed_info_data")), _blob(raw.get("message_source")), source_row_hash(raw), now, sid, int(raw.get("create_time") or 0)))
                 self.conn.execute("UPDATE origins SET source_compression=?,source_metadata_checked=? WHERE source_ref=? AND generation=? AND table_name=? AND row_id=?", (raw.get("source_compression"), int(raw.get("source_metadata_checked", bool(raw.get("message_source")))), source_ref, generation, table_name, row_id))
-                self._store_semantics(message_ref, parsed, existing is not None)
+                if existing is None or not preserve_existing:
+                    self._store_semantics(message_ref, parsed, existing is not None)
                 attachment = parsed.get("attachment") or {}
                 kind = attachment.get("kind")
-                if kind in {"image", "video", "voice", "file", "sticker"}:
+                if kind in {"image", "video", "voice", "file", "sticker"} and (existing is None or not preserve_existing):
                     file_key = str(attachment.get("file_md5") or attachment.get("md5") or attachment.get("filename") or "primary")
                     media_ref = _ref("media_", message_ref, kind, file_key)
                     self.conn.execute("INSERT INTO media(media_ref,message_ref,account_id,group_id,create_time,kind,file_key,attachment,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(media_ref) DO UPDATE SET attachment=excluded.attachment,updated_at=excluded.updated_at", (media_ref, message_ref, account_id, group_id, int(raw.get("create_time") or 0), kind, file_key, _json(attachment), now))
@@ -621,7 +647,8 @@ class ArchiveStore(SemanticsMixin, P2Mixin):
             media = {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM media GROUP BY status")}
             cycle_age = self._cycle_age(collector, time.time())
             stale = cycle_age > max(120, float(collector.get("poll_interval") or 30) * 2 + 30) if cycle_age is not None else None
-            return {"archive_initialized": True, "version": __version__, "schema_version": SCHEMA_VERSION,
+            return {"archive_initialized": True, "version": __version__,
+                    "schema_version": self.conn.execute("PRAGMA user_version").fetchone()[0],
                     "groups": self.conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0],
                     "messages": counts[0], "earliest_message_time": counts[1], "latest_message_time": counts[2],
                     "last_ingest_at": counts[3], "collector": {k: v for k, v in collector.items() if k != "data_root"}, "collector_stale": stale,

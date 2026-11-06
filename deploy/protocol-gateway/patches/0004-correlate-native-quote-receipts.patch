@@ -1,0 +1,507 @@
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs b/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
+--- a/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/quote_send.rs
+@@ -13,9 +13,9 @@
+ pub const MAX_QUOTE_XML_BYTES: usize = 256 * 1024;
+ pub const QUOTE_RECEIPT_SCHEMA_UNVERIFIED: &str = "quote_receipt_schema_unverified";
+ 
+-/// Decode only the shared BaseResponse rejection until the supported Linux
+-/// quoted-send response has independent field/presence evidence. A successful
+-/// file receipt is not evidence for a quoted-send receipt, even on CGI222.
++/// Without the original intent, decode only the shared BaseResponse rejection.
++/// Success requires `decode_quote_send_correlated`; an arbitrary client-ID scan
++/// across strings is not evidence for a quoted-send receipt, even on CGI222.
+ /// Callers must retain authenticated bytes before calling this function.
+ /// An error is an uncertain submitted send, never permission to resend.
+ pub fn decode_quote_send(input: &[u8]) -> Result<MediaSendResult> {
+@@ -36,6 +36,92 @@
+         });
+     }
+     bail!(QUOTE_RECEIPT_SCHEMA_UNVERIFIED)
++}
++
++/// Correlate an authenticated Linux 4.1.13.26 CGI222 subtype-57 response with
++/// the saved attempt. The owner must seal the original bytes before decoding.
++/// Shape evidence: one isolated live quote response, 359 bytes, SHA-256
++/// 96da66294d9e29c2254da90e83b88d42b25ee8f503a8d14326e272fd28df2cd1.
++/// Fields 3/4/6 matched the saved sender/destination/client ID independently;
++/// their positions also agree with the existing strict app-message file decoder.
++/// Field 8 was 57. Fields 5/7 are checked as nonzero u32, not correlated with
++/// the request timestamp (the live response was one second later). Unknown
++/// extension contents establish neither quote-target identity nor phone receipt.
++pub fn decode_quote_send_correlated(
++    input: &[u8],
++    sender: &str,
++    destination: &str,
++    client_id: &str,
++) -> Result<MediaSendResult> {
++    ensure!(
++        identity(sender, false)
++            && identity(destination, false)
++            && client_id
++                .parse::<u32>()
++                .is_ok_and(|id| id > 0 && id.to_string() == client_id),
++        "invalid_quote_receipt_identity"
++    );
++    let fields = p::decode(input)?;
++    // Even ignored extensions cannot smuggle competing values into this single
++    // response. Do not select the first/last duplicate or search arbitrary fields.
++    let mut seen = std::collections::BTreeSet::new();
++    for field in &fields {
++        ensure!(seen.insert(field.number), "ambiguous_quote_response_field");
++    }
++    let base = p::decode(p::data(&fields, 1)?)?;
++    seen.clear();
++    for field in &base {
++        ensure!(seen.insert(field.number), "ambiguous_quote_response_status");
++    }
++    let raw_code = p::scalar(&base, 1)?;
++    let code = raw_code as i32;
++    ensure!(
++        raw_code == code as i64 as u64,
++        "invalid_quote_response_status"
++    );
++    p::optional_data(&base, 2)?;
++    if code != 0 {
++        return Ok(MediaSendResult {
++            status: SendStatus::Rejected,
++            service_code: code,
++            server_message_id: None,
++            client_id_matches: None,
++        });
++    }
++    for (number, expected) in [(3, sender), (4, destination), (6, client_id)] {
++        ensure!(
++            p::data(&fields, number)? == expected.as_bytes(),
++            "quote_receipt_identity_mismatch"
++        );
++    }
++    for number in [5, 7] {
++        ensure!(
++            u32::try_from(p::scalar(&fields, number)?)? > 0,
++            "invalid_quote_response_scalar"
++        );
++    }
++    ensure!(
++        p::scalar(&fields, 8)? == 57,
++        "quote_receipt_subtype_mismatch"
++    );
++    let server = p::scalar(&fields, 9)?;
++    ensure!(server > 0, "quote_receipt_server_id_missing");
++    // Observed extension wires only; no AES key requirement or inferred meaning.
++    for number in [11, 14] {
++        p::optional_data(&fields, number)?;
++    }
++    if let Some(value) = p::optional(&fields, 12)? {
++        ensure!(
++            matches!(value, p::Value::Varint(_)),
++            "invalid_quote_response_extension"
++        );
++    }
++    Ok(MediaSendResult {
++        status: SendStatus::ServerAccepted,
++        service_code: 0,
++        server_message_id: Some(server.to_string()),
++        client_id_matches: Some(true),
++    })
+ }
+ 
+ /// A reference to the immediate selected message. App messages retain raw type
+@@ -200,6 +286,147 @@
+ mod tests {
+     use super::*;
+ 
++    fn sanitized_quote_response() -> Vec<Vec<u8>> {
++        // Field/wire shape derived from the isolated 359-byte Linux response
++        // cited on decode_quote_send_correlated, not from our request encoder.
++        // All identities, scalar values and extension bodies below are synthetic.
++        vec![
++            p::bytes(1, &p::message(&[p::int32(1, 0), p::bytes(2, b"")]).unwrap()),
++            p::bytes(3, b"synthetic_self"),
++            p::bytes(4, b"synthetic-room@chatroom"),
++            p::uint(5, 17),
++            p::bytes(6, b"12345"),
++            p::uint(7, 1700000001),
++            p::uint(8, 57),
++            p::uint(9, u64::MAX),
++            p::bytes(11, b"synthetic opaque extension"),
++            p::uint(12, 0),
++            p::bytes(14, b"synthetic other extension"),
++        ]
++    }
++
++    fn correlated(parts: &[Vec<u8>]) -> Result<MediaSendResult> {
++        decode_quote_send_correlated(
++            &p::message(parts)?,
++            "synthetic_self",
++            "synthetic-room@chatroom",
++            "12345",
++        )
++    }
++
++    #[test]
++    fn quote_response_correlates_only_exact_saved_identities_and_full_u64() {
++        let parts = sanitized_quote_response();
++        let result = correlated(&parts).unwrap();
++        assert_eq!(result.status, SendStatus::ServerAccepted);
++        assert_eq!(
++            result.server_message_id.as_deref(),
++            Some(u64::MAX.to_string().as_str())
++        );
++        assert_eq!(result.client_id_matches, Some(true));
++        let wire = p::message(&parts).unwrap();
++        for (sender, destination, client) in [
++            ("wrong", "synthetic-room@chatroom", "12345"),
++            ("synthetic_self", "wrong", "12345"),
++            ("synthetic_self", "synthetic-room@chatroom", "12346"),
++            ("synthetic_self", "synthetic-room@chatroom", "012345"),
++            ("synthetic_self", "synthetic-room@chatroom", "0"),
++            ("synthetic_self", "synthetic-room@chatroom", "4294967296"),
++        ] {
++            assert!(decode_quote_send_correlated(&wire, sender, destination, client).is_err());
++        }
++        // Missing opaque extensions are not guessed to be required credentials.
++        assert_eq!(
++            correlated(&parts[..8]).unwrap().status,
++            SendStatus::ServerAccepted
++        );
++    }
++
++    #[test]
++    fn quote_response_rejects_every_required_absence_duplicate_and_wrong_wire() {
++        let parts = sanitized_quote_response();
++        for index in 0..parts.len() {
++            let number = p::decode(&parts[index]).unwrap()[0].number;
++            let mut duplicate = parts.clone();
++            duplicate.push(parts[index].clone());
++            assert!(correlated(&duplicate).is_err(), "duplicate field {number}");
++            let mut wrong_wire = parts.clone();
++            wrong_wire[index] = if matches!(
++                p::decode(&parts[index]).unwrap()[0].value,
++                p::Value::Varint(_)
++            ) {
++                p::bytes(number, b"0")
++            } else {
++                p::uint(number, 0)
++            };
++            assert!(
++                correlated(&wrong_wire).is_err(),
++                "wrong wire field {number}"
++            );
++            if index < 8 {
++                let mut absent = parts.clone();
++                absent.remove(index);
++                assert!(correlated(&absent).is_err(), "missing field {number}");
++            }
++        }
++        for (index, replacement) in [
++            (1, p::bytes(3, b"wrong")),
++            (2, p::bytes(4, b"wrong")),
++            (4, p::bytes(6, b"wrong")),
++            (3, p::uint(5, 0)),
++            (3, p::uint(5, u32::MAX as u64 + 1)),
++            (5, p::uint(7, 0)),
++            (5, p::uint(7, u32::MAX as u64 + 1)),
++            (6, p::uint(8, 6)),
++            (6, p::uint(8, (1u64 << 32) + 57)),
++            (7, p::uint(9, 0)),
++        ] {
++            let mut changed = parts.clone();
++            changed[index] = replacement;
++            // An exact client ID in an unrelated field cannot rescue mismatch.
++            changed.push(p::bytes(13, b"12345"));
++            assert!(correlated(&changed).is_err());
++        }
++        for extension_index in [8, 10] {
++            let mut changed = parts.clone();
++            let field = p::decode(&changed[extension_index]).unwrap()[0].number;
++            changed[extension_index] = p::bytes(field, b"12345");
++            changed.remove(4); // The client ID must be in field 6 itself.
++            assert!(correlated(&changed).is_err());
++        }
++        for base in [
++            p::message(&[p::int32(1, 0), p::int32(1, 0)]).unwrap(),
++            p::message(&[p::int32(1, 0), p::bytes(2, b""), p::bytes(2, b"")]).unwrap(),
++            p::message(&[p::int32(1, 0), p::uint(2, 0)]).unwrap(),
++            p::uint(1, 1u64 << 32),
++            p::bytes(1, b"0"),
++            vec![],
++        ] {
++            let mut changed = parts.clone();
++            changed[0] = p::bytes(1, &base);
++            assert!(correlated(&changed).is_err());
++        }
++        let mut truncated = p::message(&parts).unwrap();
++        truncated.pop();
++        assert!(decode_quote_send_correlated(
++            &truncated,
++            "synthetic_self",
++            "synthetic-room@chatroom",
++            "12345"
++        )
++        .is_err());
++    }
++
++    #[test]
++    fn quote_correlated_decoder_preserves_only_canonical_explicit_rejection() {
++        let response = [p::bytes(1, &p::int32(1, -13))];
++        let result = correlated(&response).unwrap();
++        assert_eq!(result.status, SendStatus::Rejected);
++        assert_eq!(result.service_code, -13);
++        assert_eq!(result.server_message_id, None);
++        assert!(correlated(&[p::bytes(1, &p::uint(1, u32::MAX as u64 - 12))]).is_err());
++    }
++
+     #[test]
+     fn quote_success_requires_independent_response_evidence() {
+         // These are adversarial file-shaped inputs, not quote acceptance
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/client.rs b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+--- a/packages/native-client-rust/crates/wechat-protocol/src/client.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/client.rs
+@@ -1124,13 +1124,9 @@
+         created_at: u32,
+         content: &str,
+     ) -> Result<crate::media_send::MediaSendResult> {
+-        crate::quote_send::decode_quote_send(&self.send_quote_raw(
+-            state,
+-            destination,
+-            client_id,
+-            created_at,
+-            content,
+-        )?)
++        let sender = state.own_username.clone();
++        let raw = self.send_quote_raw(state, destination, client_id, created_at, content)?;
++        crate::quote_send::decode_quote_send_correlated(&raw, &sender, destination, client_id)
+     }
+     /// Submit once and return authenticated business-response bytes. The owner
+     /// must persist these bytes before interpreting or projecting the result.
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_receipts.rs
+@@ -137,7 +137,7 @@
+         id: &str,
+         payload: &SendPayload,
+     ) -> Result<SendReceipt> {
+-        let load = || -> Result<Zeroizing<Vec<u8>>> {
++        let load = || -> Result<(QuoteReceipt, Zeroizing<Vec<u8>>)> {
+             let purpose = format!("{RECEIPT_PREFIX}{id}");
+             let sealed = self
+                 .store
+@@ -156,16 +156,20 @@
+                 raw.len() <= wechat_protocol::MAX_MESSAGE_BYTES,
+                 "invalid_quote_receipt"
+             );
+-            Ok(raw)
++            Ok((receipt, raw))
+         };
+-        let raw = load().map_err(|_| anyhow::anyhow!("quote_receipt_integrity_failed"))?;
+-        let result = wechat_protocol::quote_send::decode_quote_send(&raw).map_err(|error| {
+-            if error.to_string() == wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED {
+-                error
+-            } else {
+-                anyhow::anyhow!("quote_receipt_invalid")
+-            }
+-        })?;
++        let (receipt, raw) =
++            load().map_err(|_| anyhow::anyhow!("quote_receipt_integrity_failed"))?;
++        // The sender is the authenticated account at submission, sealed under
++        // this account/send purpose. Recovery does not require current login
++        // credentials and must never substitute a new account or resend.
++        let result = wechat_protocol::quote_send::decode_quote_send_correlated(
++            &raw,
++            &receipt.sender,
++            &payload.thread_id,
++            &payload.client_id.to_string(),
++        )
++        .map_err(|_| anyhow::anyhow!("quote_receipt_invalid"))?;
+         decoded_receipt(result)
+     }
+ 
+@@ -321,10 +325,7 @@
+             .send_quote_with_receipt("one", &send.id, &mut super::super::tests::state(), &payload)
+             .err()
+             .unwrap();
+-        assert_eq!(
+-            error_code(&error),
+-            wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED
+-        );
++        assert_eq!(error_code(&error), "quote_receipt_invalid");
+         let purpose = format!("{RECEIPT_PREFIX}{}", send.id);
+         let sealed = store.runtime("one", &purpose).unwrap().unwrap();
+         let receipt: QuoteReceipt =
+@@ -340,7 +341,7 @@
+         assert_eq!(recovered.state, "needs_review");
+         assert_eq!(
+             recovered.error_code.as_deref(),
+-            Some(wechat_protocol::quote_send::QUOTE_RECEIPT_SCHEMA_UNVERIFIED)
++            Some("quote_receipt_invalid")
+         );
+         assert_eq!(recovered.server_id, None);
+         assert_eq!(recovered.local_message_id, None);
+@@ -348,6 +349,118 @@
+         assert_eq!(store.runtime("one", &purpose).unwrap().unwrap(), sealed);
+         assert_eq!(reopened.recover_quote_receipts("one").unwrap(), 0);
+         assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
++    }
++
++    fn accepted_response(payload: &SendPayload) -> Vec<u8> {
++        // Sanitized shape from the isolated Linux capture documented by the
++        // protocol decoder; this is local recovery coverage, not peer evidence.
++        p::message(&[
++            p::bytes(1, &p::int32(1, 0)),
++            p::bytes(3, b"synthetic_self"),
++            p::bytes(4, payload.thread_id.as_bytes()),
++            p::uint(5, 17),
++            p::bytes(6, payload.client_id.to_string().as_bytes()),
++            p::uint(7, u64::from(payload.created_at) + 1),
++            p::uint(8, 57),
++            p::uint(9, u64::MAX),
++        ])
++        .unwrap()
++    }
++
++    #[tokio::test]
++    async fn existing_sealed_quote_success_is_redecoded_on_restart_without_a_send() {
++        let f = fixture(vec![]);
++        let (send, payload) = intent(&f.core, "old-sealed-quote");
++        let raw = accepted_response(&payload);
++        f.core
++            .retain_quote_receipt("one", &send.id, &payload, "synthetic_self", &raw)
++            .unwrap();
++        f.store
++            .update_send(
++                "one",
++                &send.id,
++                "needs_review",
++                None,
++                Some("quote_receipt_schema_unverified"),
++            )
++            .unwrap();
++        let purpose = format!("{RECEIPT_PREFIX}{}", send.id);
++        let original_sealed = f.store.runtime("one", &purpose).unwrap().unwrap();
++        drop(f.core);
++        let reopened = Core::with_upstream(f.store.clone(), None, f.upstream.clone()).unwrap();
++        let recovered = f.store.send("one", &send.id).unwrap();
++        assert_eq!(recovered.state, "accepted");
++        assert_eq!(recovered.server_id, Some(u64::MAX.to_string()));
++        assert_eq!(recovered.error_code, None);
++        assert_eq!(
++            f.store.runtime("one", &purpose).unwrap().unwrap(),
++            original_sealed
++        );
++        assert_eq!(reopened.recover_quote_receipts("one").unwrap(), 0);
++        // This fixture has no profile/login for local projection. A projection
++        // failure cannot demote service acceptance or requeue the native send.
++        assert_eq!(reopened.recover_text_projections("one").unwrap(), 0);
++        assert!(f
++            .store
++            .pending_text_projections("one")
++            .unwrap()
++            .contains(&send.id));
++        assert_eq!(
++            f.store.send("one", &send.id).unwrap().local_message_id,
++            None
++        );
++        reopened.perform_send("one", &send.id).await.unwrap();
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "accepted");
++        drop(reopened);
++        let second_restart =
++            Core::with_upstream(f.store.clone(), None, f.upstream.clone()).unwrap();
++        assert_eq!(f.store.send("one", &send.id).unwrap().state, "accepted");
++        second_restart.perform_send("one", &send.id).await.unwrap();
++        assert_eq!(
++            f.store.runtime("one", &purpose).unwrap().unwrap(),
++            original_sealed
++        );
++        assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn sealed_sender_destination_and_client_must_all_match_after_restart() {
++        for mismatch in ["sender", "destination", "client"] {
++            let f = fixture(vec![]);
++            let (send, payload) = intent(&f.core, "wrong-identity");
++            let mut other: SendPayload =
++                serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
++            if mismatch == "destination" {
++                other.thread_id = "other-room@chatroom".into();
++            }
++            if mismatch == "client" {
++                other.client_id = other.client_id.wrapping_add(1).max(1);
++            }
++            let sender = if mismatch == "sender" {
++                "other_account"
++            } else {
++                "synthetic_self"
++            };
++            f.core
++                .retain_quote_receipt(
++                    "one",
++                    &send.id,
++                    &payload,
++                    sender,
++                    &accepted_response(&other),
++                )
++                .unwrap();
++            f.store.recover_uncertain_sends("one").unwrap();
++            f.core.recover_quote_receipts("one").unwrap();
++            let recovered = f.store.send("one", &send.id).unwrap();
++            assert_eq!(recovered.state, "needs_review");
++            assert_eq!(recovered.server_id, None);
++            assert_eq!(
++                recovered.error_code.as_deref(),
++                Some("quote_receipt_invalid")
++            );
++            assert_eq!(f.upstream.calls.load(Ordering::SeqCst), 0);
++        }
+     }
+ 
+     #[test]
+diff --git a/packages/native-client-rust/crates/wechat-protocol/README.md b/packages/native-client-rust/crates/wechat-protocol/README.md
+--- a/packages/native-client-rust/crates/wechat-protocol/README.md
++++ b/packages/native-client-rust/crates/wechat-protocol/README.md
+@@ -69,12 +69,16 @@
+ Native quoted sends return authenticated bytes through `send_quote_raw` so the
+ owner can seal the response before parsing. Core binds each saved response to its
+ account, send and original payload, then reopens it locally after a restart.
+-The public quote fixture establishes request fields only. A zero service status
+-does not establish a verified quote receipt: successful native quote responses
+-currently remain `needs_review` with `quote_receipt_schema_unverified`. The prior
+-file-response identity scan is no longer used for quotes. A matching Linux quote
+-response and independent recipient evidence are required before enabling success
+-decoding; synthetic file-shaped replies do not satisfy that requirement.
++`decode_quote_send_correlated` checks a CGI222 subtype-57 reply against the saved
++sender, destination and client ID before returning its nonzero u64 server ID.
++Its field/wire shape was checked against one authenticated Linux 4.1.13.26 quote
++response; public regression values are sanitized. Missing, duplicate, malformed
++or mismatched required fields remain `needs_review`. The context-free decoder
++still cannot accept success, and no file-response string scan or AES requirement
++is used for quotes. Restart can reparse an already sealed response without
++another submission. This establishes service acceptance of that quote attempt,
++not the quote target, recipient rendering, navigation or phone delivery: those
++require independent recipient evidence.
+ 
+ `AccountState` and `LoginAttempt` are serializable **secret state**, with redacted
+ Debug implementations and zeroization on drop. Store them only in the encrypted
+diff --git a/docs/src/content/docs/how-it-works/sends.mdx b/docs/src/content/docs/how-it-works/sends.mdx
+--- a/docs/src/content/docs/how-it-works/sends.mdx
++++ b/docs/src/content/docs/how-it-works/sends.mdx
+@@ -41,7 +41,7 @@
+ Stopping the daemon (or disconnecting) doesn't log you out. Only `wx auth logout` does, and after that the daemon won't reconnect on its own until you log in again.
+ 
+ <Aside title="Good to know">
+-- **Native quoted replies still need response validation.** A success-shaped reply currently stays `needs_review` with `quote_receipt_schema_unverified`. Its encrypted response is kept for inspection and can be reopened after a restart without sending again. This is not a confirmed rejection; keep the original key.
++- **Quoted reply recovery keeps the original key.** The saved encrypted response can be checked after a restart without sending again. Only a reply matching the original sender, destination, client ID and quote subtype becomes `accepted`; missing or conflicting evidence stays `needs_review`. Acceptance does not prove that the recipient sees the correct quote or can open it.
+ - **Voice longer than 60 seconds is split** into equal notes. A partial result keeps the IDs of the notes that went out.
+ - **Closing the connection doesn't cancel anything.** Ctrl-C on the CLI or a dropped HTTP request leaves the daemon's work running.
+ - **Media writeback repair:** if a sent or downloaded file didn't make it into the profile's own folders, `wx jobs repair-writeback` finishes the job from files the daemon already has. It never downloads or sends anything.
+diff --git a/.changeset/correlate-native-quote-receipt.md b/.changeset/correlate-native-quote-receipt.md
+new file mode 100644
+--- /dev/null
++++ b/.changeset/correlate-native-quote-receipt.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Correlate native quote success responses with the saved sender, destination and client ID, requiring subtype 57 and an exact nonzero u64 server message ID. The strict parser uses a matching Linux response's field/wire evidence and rejects missing, repeated, malformed or conflicting required fields. Reparse sealed pending responses after restart without another send. Service acceptance remains separate from recipient quote correctness, navigation and phone delivery.

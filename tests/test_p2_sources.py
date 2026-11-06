@@ -131,6 +131,18 @@ def test_changed_avatar_and_voice_keep_old_content_versions(sources):
     assert s.store.get_profile_avatar(new_profile["avatar"]["avatar_ref"])["data"] == png("red")
     assert s.store.conn.execute("SELECT COUNT(*) FROM voice_assets").fetchone()[0] == 2
     assert s.store.conn.execute("SELECT COUNT(*) FROM avatar_assets").fetchone()[0] == 2
+
+
+def test_observed_group_sender_avatar_does_not_require_contact_entry(sources):
+    s = sources
+    sender = s.store.conn.execute("SELECT sender_id FROM messages LIMIT 1").fetchone()[0]
+    with sqlite3.connect(s.head) as db:
+        db.execute("INSERT INTO head_image VALUES(?,?,?,?)", (sender, "sender-version", png('red'), 100))
+    s.names.pop(sender, None)
+    result = collect(s)
+    assert not result['errors']
+    assert s.store.conn.execute("SELECT avatar_ref FROM profiles WHERE account_id=? AND subject_id=?", ('account', sender)).fetchone()[0]
+    assert s.store.conn.execute("SELECT COUNT(*) FROM avatar_assets").fetchone()[0] == 2
     assert s.store.get_status()["messages"] == 1
 
 

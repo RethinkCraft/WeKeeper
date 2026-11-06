@@ -6,6 +6,7 @@ is published. Contacts, stable sender identities, attachment metadata and
 bounded per-conversation pagination are kept for downstream development.
 """
 from contextvars import ContextVar
+from functools import lru_cache
 import hashlib
 import hmac as hmac_mod
 import json
@@ -329,6 +330,16 @@ def _hmac_check_pagekey(page_key: bytes, db_page1: bytes) -> bool:
         return False
 
 
+@lru_cache(maxsize=16)
+def _password_page_key(enc_key: bytes, salt: bytes, iterations: int) -> bytes:
+    """Cache bounded KDF work only; current page-1 authentication stays required.
+
+    The master key, database salt and KDF parameters are the cache identity.
+    No key or plaintext is persisted, and a cache hit is never authentication.
+    """
+    return hashlib.pbkdf2_hmac("sha512", enc_key, salt, iterations, dklen=32)
+
+
 def _effective_page_key(enc_key: bytes, db_page1: bytes) -> Optional[bytes]:
     """Return the actual AES page key for THIS db (or None if enc_key does not fit),
     validated by the page-1 HMAC. Handles both WeChat key schemes:
@@ -342,7 +353,7 @@ def _effective_page_key(enc_key: bytes, db_page1: bytes) -> Optional[bytes]:
     if _hmac_check_pagekey(enc_key, db_page1):
         return enc_key
     try:
-        derived = hashlib.pbkdf2_hmac("sha512", enc_key, db_page1[:16], _WECHAT_KDF_ITER, dklen=32)
+        derived = _password_page_key(bytes(enc_key), bytes(db_page1[:16]), _WECHAT_KDF_ITER)
         if _hmac_check_pagekey(derived, db_page1):
             return derived
     except Exception:
@@ -616,13 +627,22 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
 
 # ─── Database decryption ──────────────────────────────────────────────────────
 
-def _decrypt_db_v4(db_path: Path, enc_key: bytes, output_path: Path) -> bool:
+def _decrypt_db_v4(db_path: Path, enc_key: bytes, output_path: Path, *, timings=None) -> bool:
     """Snapshot the live DB family, then decrypt main DB and committed WAL."""
     from chatlog_keeper.core._snapshot import snapshot_db_family
+    from time import perf_counter
 
     try:
+        started = perf_counter()
         with snapshot_db_family(db_path) as snapshot:
-            return _decrypt_db_v4_snapshot(snapshot, enc_key, output_path)
+            if timings is not None:
+                timings['snapshot'] = perf_counter() - started
+            started = perf_counter()
+            try:
+                return _decrypt_db_v4_snapshot(snapshot, enc_key, output_path)
+            finally:
+                if timings is not None:
+                    timings['decrypt'] = perf_counter() - started
     except OSError as exc:
         logger.warning("Could not snapshot %s: %s", Path(db_path).name, exc)
         return False
@@ -639,6 +659,7 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
     Supports both raw-key mode and the password-mode master-key derivation.
     """
     PAGE_SZ = 4096
+    ZERO_PAGE = bytes(PAGE_SZ)
 
     temporary_output: Optional[Path] = None
     try:
@@ -692,7 +713,7 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
                     raise OSError("encrypted DB has a truncated trailing page")
                 page_no = pages + padding_pages + 1
                 if logical_pages is not None and page_no > logical_pages:
-                    if any(page):
+                    if page != ZERO_PAGE:
                         raise OSError("nonzero data beyond authenticated database size")
                     padding_pages += 1
                     continue

@@ -1,0 +1,18 @@
+# Use alongside collect --bot-mode; replace all three placeholders.
+[Unit]
+Description=WeKeeper auxiliary archive enrichment
+After=wechat-archive-collector.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart="@PYTHON@" -m chatlog_keeper.cli enrich --state-dir "@STATE_DIR@"
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

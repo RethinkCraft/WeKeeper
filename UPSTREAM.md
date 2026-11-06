@@ -1,6 +1,6 @@
 # Upstream and attribution
 
-WeKeeper 0.5.0 is maintained as a Linux WeChat archive and MCP project derived
+WeKeeper 0.7.0 is maintained as a Linux WeChat archive, MCP and optional dashboard project derived
 from [labazhou2024/chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper).
 The imported upstream baseline is commit
 [`2225294fd0761e10ce15540f21e7dbb2ac304c3c`](https://github.com/labazhou2024/chatlog-keeper/commit/2225294fd0761e10ce15540f21e7dbb2ac304c3c)
@@ -46,8 +46,16 @@ Linux CI and source/wheel build validation are added for this publication.
   note components, opt-in derived-text search, and a separately gated native
   conversion queue with current-cache proof and strict UI targeting.
 - Fifteen stdio tools: fourteen archive queries and one explicit native voice
-  request. The SDK remains optional; there is no HTTP service, model API,
-  vector database or external business store.
+  request. The SDK remains optional; base archive/MCP use needs no HTTP service,
+  model API, vector database or external business store.
+
+## Added optional dashboard behavior
+
+Version 0.6.0 adds allowlisted outgoing text and avatar-thumbnail synchronization,
+a separate FastAPI/SQLite cloud service, a React dashboard and persistent alerts.
+Local workers use independent Sign in with ChatGPT authorization for private analysis conversations. Version 0.7.0 removes scheduled summaries and the old UI bot, supports protocol bots and cloud management, and preserves existing schema 4/5 archives. Actual usage and official Codex quota
+retain distinct source labels. A separate opt-in worker fetches missing avatars
+from saved contact URLs; ordinary chat media remain local.
 
 Version 0.5.0 uses schema/parser 4. Its exact tested environment and incomplete
 media/type coverage are documented in [validation](docs/validation.md). Native
@@ -55,3 +63,7 @@ conversion is not generally enabled merely because the tool is registered.
 
 The repository does not include WeChat binaries, local environments, account
 databases, keys, chat/media samples, private reports or deployment backups.
+
+## Native protocol gateway
+
+The separately built native gateway is based on [thisnick/agent-wechat](https://github.com/thisnick/agent-wechat), pinned to commit `db60e29370c2cf47e4593c1717900d3c547207e0`. Its upstream MIT copyright is “2026 Nick Yu and contributors”. WeKeeper ships the ordered source patches and build lock, and does not include a WeChat account profile or a pre-authenticated gateway binary. The build preserves the upstream license in the prepared source tree; gateway redistribution must retain that upstream MIT notice as well as this project's existing attribution.

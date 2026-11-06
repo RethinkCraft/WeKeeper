@@ -1,0 +1,381 @@
+diff --git a/.changeset/native-quote-http-observations.md b/.changeset/native-quote-http-observations.md
+new file mode 100644
+index 0000000..cfe4d88
+--- /dev/null
++++ b/.changeset/native-quote-http-observations.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Split opt-in private quote HTTP timing into response-header and complete-body phases while retaining the existing parent span and correlation. Diagnostics omit endpoint, header, content, credential and raw-error values. The request, response budget, transport and retry behavior are unchanged.
+diff --git a/deploy/native/README.md b/deploy/native/README.md
+index b775c31..c36e215 100644
+--- a/deploy/native/README.md
++++ b/deploy/native/README.md
+@@ -105,7 +105,7 @@ JSON lines contain diagnostic command/key hashes, intent/attempt IDs, native/sim
+ 
+ The writer is bounded and never makes send workers wait for stdout. Check sequence gaps, `dropped_records`, missing end records and `incomplete` outcomes before using a trace. Logging failure or shutdown can lose records; absence is not zero latency or a successful send. Store spans include admission/open/transaction work through commit return, not just disk flush time. Parent spans overlap their children and command responses can overlap worker execution; do not sum them or add their percentiles. `raw_rpc` means response bytes returned, while `final_state_persist` records the local send-state result after its existing transaction. Neither proves a phone displayed the reply. This diagnostic does not pool sessions, change retries, write a new database or fsync logs.
+ 
+-Within a native quote `raw_rpc`, `rpc_session_connect` includes DNS/TCP setup and the complete pinned MMTLS handshake through its verified NOOP reply. Their child phases are `rpc_dns_tcp_connect` and `rpc_mmtls_handshake`. Separate phases cover quote protobuf preparation, the authenticated packet, shortlink framing, HTTP-client construction, `rpc_short_http` (request construction, response status and bounded body read), MMTLS reply decoding and authenticated reply decoding/cookie installation. These records use the same command, intent and attempt as their parent; nested durations are not additive. Only quote sends attach this observer. Heartbeat, synchronization, login, simulator operations and other existing callers do not emit these RPC phases.
++Within a native quote `raw_rpc`, `rpc_session_connect` includes DNS/TCP setup and the complete pinned MMTLS handshake through its verified NOOP reply. Their child phases are `rpc_dns_tcp_connect` and `rpc_mmtls_handshake`. Separate phases cover quote protobuf preparation, the authenticated packet, shortlink framing, HTTP-client construction, `rpc_short_http` (request construction, response status and bounded body read), MMTLS reply decoding and authenticated reply decoding/cookie installation. Within `rpc_short_http`, `rpc_short_http_headers` ends after the request returns response headers and its status is checked; `rpc_short_http_body` covers the unchanged bounded read of the complete response body. A send or status failure has no body phase. These records use the same command, intent and attempt as their parent; nested durations are not additive. Only quote sends attach this observer. Heartbeat, synchronization, login, simulator operations and other existing callers do not emit these RPC phases.
+ 
+ `server.user.toml` follows the Linux default `~/.config/agent-wechat/server/config.toml`. `server.toml` selects the explicit container locations:
+ 
+diff --git a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+index a94b5a8..59a9a67 100644
+--- a/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/quote_timing.rs
+@@ -49,6 +49,8 @@ pub(super) enum Stage {
+     RpcShortPacketPrepare,
+     RpcHttpClientPrepare,
+     RpcShortHttp,
++    RpcShortHttpHeaders,
++    RpcShortHttpBody,
+     RpcMmtlsReplyDecode,
+     RpcAuthenticatedReplyDecode,
+     ReceiptRetain,
+@@ -368,6 +370,8 @@ fn rpc_stage(phase: wechat_protocol::rpc_observation::Phase) -> Stage {
+         Phase::ShortPacketPrepare => Stage::RpcShortPacketPrepare,
+         Phase::HttpClientPrepare => Stage::RpcHttpClientPrepare,
+         Phase::ShortHttp => Stage::RpcShortHttp,
++        Phase::ShortHttpHeaders => Stage::RpcShortHttpHeaders,
++        Phase::ShortHttpBody => Stage::RpcShortHttpBody,
+         Phase::MmtlsReplyDecode => Stage::RpcMmtlsReplyDecode,
+         Phase::AuthenticatedReplyDecode => Stage::RpcAuthenticatedReplyDecode,
+     }
+@@ -499,6 +503,8 @@ mod tests {
+             Phase::ShortPacketPrepare,
+             Phase::HttpClientPrepare,
+             Phase::ShortHttp,
++            Phase::ShortHttpHeaders,
++            Phase::ShortHttpBody,
+             Phase::MmtlsReplyDecode,
+             Phase::AuthenticatedReplyDecode,
+         ] {
+@@ -509,7 +515,7 @@ mod tests {
+             .try_iter()
+             .map(|r| serde_json::to_value(r).unwrap())
+             .collect::<Vec<_>>();
+-        assert_eq!(rows.len(), 21);
++        assert_eq!(rows.len(), 25);
+         assert!(rows.iter().all(
+             |r| r["intent_id"] == id && r["command_id"].as_str() == trace.command_id.as_deref()
+         ));
+@@ -523,6 +529,14 @@ mod tests {
+         assert!(rows
+             .iter()
+             .any(|r| r["stage"] == "rpc_short_http" && r["edge"] == "end"));
++        for stage in ["rpc_short_http_headers", "rpc_short_http_body"] {
++            assert!(rows
++                .iter()
++                .any(|r| r["stage"] == stage && r["edge"] == "begin"));
++            assert!(rows
++                .iter()
++                .any(|r| r["stage"] == stage && r["edge"] == "end"));
++        }
+     }
+ 
+     #[test]
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs b/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs
+new file mode 100644
+index 0000000..226d779
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-protocol/src/http_observation_tests.rs
+@@ -0,0 +1,198 @@
++use super::*;
++use crate::rpc_observation::{Observer, Outcome, Phase};
++use std::{
++    io::{Read, Write},
++    net::{TcpListener, TcpStream},
++    sync::{
++        atomic::{AtomicUsize, Ordering},
++        mpsc::{self, Receiver, Sender},
++    },
++    thread,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Event {
++    Begin(Phase),
++    End(Phase, Outcome),
++}
++
++struct Recorder(Sender<Event>);
++impl Observer for Recorder {
++    fn begin(&self, phase: Phase) {
++        self.0.send(Event::Begin(phase)).unwrap();
++    }
++    fn end(&self, phase: Phase, _: Duration, outcome: Outcome) {
++        self.0.send(Event::End(phase, outcome)).unwrap();
++    }
++}
++
++fn next(events: &Receiver<Event>) -> Event {
++    events.recv_timeout(Duration::from_secs(3)).unwrap()
++}
++
++fn request(socket: &mut TcpStream) {
++    socket
++        .set_read_timeout(Some(Duration::from_secs(3)))
++        .unwrap();
++    let mut header = Vec::new();
++    while !header.ends_with(b"\r\n\r\n") {
++        let mut byte = [0; 1];
++        socket.read_exact(&mut byte).unwrap();
++        header.push(byte[0]);
++        assert!(header.len() < 16 * 1024);
++    }
++    assert!(header.starts_with(b"POST /synthetic HTTP/1.1\r\n"));
++}
++
++fn client() -> reqwest::blocking::Client {
++    reqwest::blocking::Client::builder()
++        .timeout(Duration::from_secs(3))
++        .redirect(reqwest::redirect::Policy::none())
++        .no_proxy()
++        .build()
++        .unwrap()
++}
++
++#[test]
++fn short_http_observation_separates_headers_from_a_paused_body() {
++    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++    let url = format!("http://{}/synthetic", listener.local_addr().unwrap());
++    let (seen, request_seen) = mpsc::channel();
++    let (headers, allow_headers) = mpsc::channel();
++    let (body, allow_body) = mpsc::channel();
++    let server = thread::spawn(move || {
++        let (mut socket, _) = listener.accept().unwrap();
++        request(&mut socket);
++        seen.send(()).unwrap();
++        allow_headers.recv_timeout(Duration::from_secs(3)).unwrap();
++        socket
++            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n")
++            .unwrap();
++        socket.flush().unwrap();
++        allow_body.recv_timeout(Duration::from_secs(3)).unwrap();
++        socket.write_all(b"synthetic").unwrap();
++    });
++    let (sender, events) = mpsc::channel();
++    let worker = thread::spawn(move || {
++        let observer = Recorder(sender);
++        let client = client();
++        short_http_observed(Some(&observer), || {
++            Ok(client.post(url).body(Vec::new()).send()?)
++        })
++    });
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttp));
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttpHeaders));
++    request_seen.recv_timeout(Duration::from_secs(3)).unwrap();
++    assert!(matches!(events.try_recv(), Err(mpsc::TryRecvError::Empty)));
++    headers.send(()).unwrap();
++    assert_eq!(
++        next(&events),
++        Event::End(Phase::ShortHttpHeaders, Outcome::Ok)
++    );
++    assert_eq!(next(&events), Event::Begin(Phase::ShortHttpBody));
++    assert!(matches!(events.try_recv(), Err(mpsc::TryRecvError::Empty)));
++    body.send(()).unwrap();
++    assert_eq!(next(&events), Event::End(Phase::ShortHttpBody, Outcome::Ok));
++    assert_eq!(next(&events), Event::End(Phase::ShortHttp, Outcome::Ok));
++    assert_eq!(worker.join().unwrap().unwrap(), b"synthetic");
++    assert!(events.try_recv().is_err());
++    server.join().unwrap();
++}
++
++#[test]
++fn short_http_observation_keeps_a_send_error_and_calls_the_action_once() {
++    let (sender, events) = mpsc::channel();
++    let observer = Recorder(sender);
++    let count = AtomicUsize::new(0);
++    let result = short_http_observed(Some(&observer), || {
++        count.fetch_add(1, Ordering::SeqCst);
++        anyhow::bail!("private synthetic send failure")
++    });
++    assert_eq!(count.load(Ordering::SeqCst), 1);
++    assert_eq!(
++        result.unwrap_err().to_string(),
++        "private synthetic send failure"
++    );
++    let rows: Vec<_> = events.try_iter().collect();
++    assert_eq!(
++        rows,
++        [
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++            Event::End(Phase::ShortHttpHeaders, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error)
++        ]
++    );
++    assert!(!format!("{rows:?}").contains("private synthetic send failure"));
++}
++
++fn static_response(wire: &'static [u8], observer: Option<&dyn Observer>) -> Result<Vec<u8>> {
++    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++    let url = format!("http://{}/synthetic", listener.local_addr().unwrap());
++    let server = thread::spawn(move || {
++        let (mut socket, _) = listener.accept().unwrap();
++        request(&mut socket);
++        socket.write_all(wire).unwrap();
++    });
++    let client = client();
++    let result = short_http_observed(observer, || Ok(client.post(url).body(Vec::new()).send()?));
++    server.join().unwrap();
++    result
++}
++
++#[test]
++fn short_http_observation_does_not_start_the_body_for_a_rejected_status() {
++    let (sender, events) = mpsc::channel();
++    let observer = Recorder(sender);
++    let result = static_response(
++        b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
++        Some(&observer),
++    );
++    assert_eq!(
++        result.unwrap_err().to_string(),
++        "Native shortlink HTTP status 503"
++    );
++    assert_eq!(
++        events.try_iter().collect::<Vec<_>>(),
++        [
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++            Event::End(Phase::ShortHttpHeaders, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error)
++        ]
++    );
++}
++
++#[test]
++fn short_http_observation_preserves_body_read_failure_and_pairs_both_spans() {
++    let (sender, events) = mpsc::channel();
++    let observer = Recorder(sender);
++    let result = static_response(
++        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nshort",
++        Some(&observer),
++    );
++    assert!(result.is_err());
++    assert_eq!(
++        events.try_iter().collect::<Vec<_>>(),
++        [
++            Event::Begin(Phase::ShortHttp),
++            Event::Begin(Phase::ShortHttpHeaders),
++            Event::End(Phase::ShortHttpHeaders, Outcome::Ok),
++            Event::Begin(Phase::ShortHttpBody),
++            Event::End(Phase::ShortHttpBody, Outcome::Error),
++            Event::End(Phase::ShortHttp, Outcome::Error)
++        ]
++    );
++}
++
++#[test]
++fn short_http_observation_disabled_keeps_the_complete_response() {
++    assert_eq!(
++        static_response(
++            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsynthetic",
++            None
++        )
++        .unwrap(),
++        b"synthetic"
++    );
++}
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+index 4fdc5ba..e9cfbe3 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/mmtls.rs
+@@ -752,8 +752,8 @@ pub(crate) fn short_exchange_observed(
+             .no_proxy()
+             .build()?)
+     })?;
+-    let bytes = observe_rpc(observer, RpcPhase::ShortHttp, || {
+-        let mut response = client
++    let bytes = short_http_observed(observer, || {
++        Ok(client
+             .post(format!(
+                 "http://{host}/mmtls/{}",
+                 hex::encode(random::<4>()?)
+@@ -765,27 +765,42 @@ pub(crate) fn short_exchange_observed(
+             .header("Cache-Control", "no-cache")
+             .header("Connection", "close")
+             .body(wire)
+-            .send()?;
+-        ensure!(
+-            response.status() == 200,
+-            "Native shortlink HTTP status {}",
+-            response.status().as_u16()
+-        );
+-        let mut bytes = Vec::new();
+-        response
+-            .by_ref()
+-            .take((crate::MAX_MESSAGE_BYTES + 1) as u64)
+-            .read_to_end(&mut bytes)?;
+-        ensure!(
+-            bytes.len() <= crate::MAX_MESSAGE_BYTES,
+-            "Shortlink receive budget exceeded"
+-        );
+-        Ok(bytes)
++            .send()?)
+     })?;
+     observe_rpc(observer, RpcPhase::MmtlsReplyDecode, || {
+         decode_short_reply(&bytes, session, &hello, &extensions)
+     })
+ }
++
++fn short_http_observed(
++    observer: Option<&dyn RpcObserver>,
++    send: impl FnOnce() -> Result<reqwest::blocking::Response>,
++) -> Result<Vec<u8>> {
++    observe_rpc(observer, RpcPhase::ShortHttp, || {
++        let mut response = observe_rpc(observer, RpcPhase::ShortHttpHeaders, || {
++            let response = send()?;
++            ensure!(
++                response.status() == 200,
++                "Native shortlink HTTP status {}",
++                response.status().as_u16()
++            );
++            Ok(response)
++        })?;
++        observe_rpc(observer, RpcPhase::ShortHttpBody, || {
++            let mut bytes = Vec::new();
++            response
++                .by_ref()
++                .take((crate::MAX_MESSAGE_BYTES + 1) as u64)
++                .read_to_end(&mut bytes)?;
++            ensure!(
++                bytes.len() <= crate::MAX_MESSAGE_BYTES,
++                "Shortlink receive budget exceeded"
++            );
++            Ok(bytes)
++        })
++    })
++}
++
+ fn early_hello(ticket: &Ticket) -> Result<(Vec<u8>, Vec<u8>)> {
+     ensure!(
+         ticket.nonce.len() == 12 && !ticket.opaque.is_empty(),
+@@ -906,6 +921,10 @@ fn decode_short_reply(
+     Ok(plain)
+ }
+ 
++#[cfg(test)]
++#[path = "http_observation_tests.rs"]
++mod http_observation_tests;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+index a2ddd60..9986d06 100644
+--- a/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
++++ b/packages/native-client-rust/crates/wechat-protocol/src/rpc_observation.rs
+@@ -12,6 +12,8 @@ pub enum Phase {
+     ShortPacketPrepare,
+     HttpClientPrepare,
+     ShortHttp,
++    ShortHttpHeaders,
++    ShortHttpBody,
+     MmtlsReplyDecode,
+     AuthenticatedReplyDecode,
+ }

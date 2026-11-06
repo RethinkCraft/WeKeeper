@@ -1,0 +1,1240 @@
+--- /dev/null
++++ b/.changeset/native-received-quote-admission.md
+@@ -0,0 +1,5 @@
++---
++"@agent-wechat/cli": patch
++---
++
++Allow sealed native-received quote intents to commit while an earlier send waits on the network. A queued result confirms local accepted identity and immutable source custody; the original single account worker still validates the current official profile and source before any submission. Insert-time ownership, logout epoch, accepted identity and source fences reject stale admissions without evicting a healthy sidecar connection. Profile-based quotes, mentions, ordinary text and protocol concurrency keep their existing paths.
+--- a/packages/native-client-rust/FEATURES.md
++++ b/packages/native-client-rust/FEATURES.md
+@@ -187,3 +187,16 @@
+ Native desktop listeners consume SSE for authenticated accounts on the selected hub. They require contact sync readiness and a known unmuted thread; history, outgoing/system/recall content, focused conversations and duplicate message IDs are suppressed. Linux native-window tests cover SSE reconnect, D-Bus notification-service delivery, click targets, disabled/unknown mute state and saved preferences. Installed macOS/Windows notification acceptance remains separate.
+ 
+ Desktop upgrades check GitHub Releases and verify version-bound package signatures with Tauri. Release tests verify real Tauri signatures, changed-byte/version rejection, final checksums and all-platform feed completeness. A Linux DEB was built, inspected and signed locally; native-window settings/channel persistence passed. Production signed/notarized platform releases and installation across two real release versions remain required acceptance. See `packages/desktop/README.md` and `RELEASING.md`.
++
++### Native received quote admission
++
++For native-received sources, a queued reply confirms that its sealed source and
++reply were saved under the currently accepted account identity. Queue admission
++can run while an earlier send waits for its network response. It does not read
++or publish official profile files. The existing single account worker still
++checks the current profile, authorization and source before submission. Logout,
++changed ownership or identity, and recalled or quarantined sources prevent a
++stale new admission. Profile-based quote and mention admission keep their prior
++paths. Offline synthetic tests cover overlap, cookie refresh, replay, restart
++and official-format identity/publication/salt failures; this optimization has no
++new live latency or recipient-validation claim.
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-core/src/native_send_admission.rs
+@@ -0,0 +1,478 @@
++//! Native-received queue admission never reads/publishes the official profile.
++//! The original account-gated worker remains the authority for actual sending.
++use super::*;
++use crate::{
++    native_ingress_message::{ReceivedDisposition, ReceivedMessageSnapshot},
++    quote_send::ResolvedQuote,
++    QuoteSourceReference, ReceivedQuoteReference,
++};
++use wechat_store::{
++    NativeQuoteSource, NativeSendDecision, NativeSendFence, NativeSendInsert, NativeSendSnapshot,
++};
++
++fn admitted<T>(decision: NativeSendDecision<T>) -> Result<T> {
++    match decision {
++        NativeSendDecision::Accepted(value) => Ok(value),
++        NativeSendDecision::Rejected(code) => bail!(code),
++    }
++}
++fn source<'a>(thread: &'a str, reference: &'a ReceivedQuoteReference) -> NativeQuoteSource<'a> {
++    NativeQuoteSource {
++        received_id: &reference.received_id,
++        thread_id: thread,
++        server_id: &reference.server_id,
++        source_sha256: &reference.source_sha256,
++    }
++}
++impl Core {
++    pub(super) fn native_send_admission_gate(&self, account: &str) -> Result<Arc<AsyncMutex<()>>> {
++        self.store.account(account)?;
++        let mut gates = self
++            .native_send_gates
++            .lock()
++            .map_err(|_| anyhow::anyhow!("account manager unavailable"))?;
++        Ok(gates
++            .entry(account.into())
++            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
++            .clone())
++    }
++    pub(super) fn native_send_snapshot(
++        &self,
++        account: &str,
++        thread: &str,
++        reference: &ReceivedQuoteReference,
++    ) -> Result<NativeSendSnapshot> {
++        QuoteSourceReference::Received(reference.clone()).validate()?;
++        anyhow::ensure!(self.owns_profile(account)?, "profile_ownership_required");
++        admitted(self.store.native_send_admission_snapshot(
++            account,
++            &self.ownership_generation,
++            source(thread, reference),
++        )?)
++    }
++    pub(super) fn native_send_state(
++        &self,
++        account: &str,
++        encrypted: &[u8],
++    ) -> Result<AccountState> {
++        let raw = self
++            .vault
++            .open_record(account, "account-state", encrypted)?;
++        let state: AccountState = serde_json::from_slice(&raw)
++            .map_err(|_| anyhow::anyhow!("invalid protected account state"))?;
++        state.validate()?;
++        Ok(state)
++    }
++    pub(super) fn resolve_native_send_quote(
++        &self,
++        account: &str,
++        thread: &str,
++        text: &str,
++        target: &QuoteSourceReference,
++        own: &str,
++        record: &wechat_store::NativeIngressRecord,
++    ) -> Result<ResolvedQuote> {
++        let QuoteSourceReference::Received(reference) = target else {
++            bail!("invalid_quote_reference");
++        };
++        let raw = self.vault.open_record(
++            account,
++            &format!("native-received:{}", reference.received_id),
++            &record.sealed_snapshot,
++        )?;
++        let snapshot: ReceivedMessageSnapshot = serde_json::from_slice(&raw)?;
++        anyhow::ensure!(
++            snapshot.schema_version == 1
++                && snapshot.account_id == account
++                && snapshot.own_username == own
++                && snapshot.thread_id.as_deref() == Some(thread)
++                && snapshot.server_id.as_deref() == Some(reference.server_id.as_str())
++                && snapshot.source_sha256 == reference.source_sha256
++                && snapshot.source_sha256 == record.source_sha256,
++            "quote_target_mismatch"
++        );
++        anyhow::ensure!(
++            record.disposition == "ready" && snapshot.disposition == ReceivedDisposition::Ready,
++            "quote_target_unavailable"
++        );
++        let quote = snapshot
++            .quote_reference
++            .context("quote_target_unavailable")?;
++        Ok(ResolvedQuote {
++            target: target.clone(),
++            xml: wechat_protocol::quote_send::quote_xml(own, text, &quote)?,
++        })
++    }
++    pub(super) fn create_native_send(
++        &self,
++        account: &str,
++        send: NativeSendInsert<'_>,
++        reference: &ReceivedQuoteReference,
++        snapshot: &NativeSendSnapshot,
++        original: &AccountState,
++    ) -> Result<(SendIntent, bool)> {
++        let thread = send.destination;
++        admitted(self.store.create_native_received_send(
++            account,
++            send,
++            NativeSendFence {
++                owner: &self.ownership_generation,
++                logout_epoch: snapshot.logout_epoch.as_deref(),
++                source: source(thread, reference),
++                sealed_snapshot: &snapshot.source.sealed_snapshot,
++            },
++            |cipher| {
++                let current = self.native_send_state(account, cipher)?;
++                Ok(current.uin == original.uin
++                    && current.own_username == original.own_username
++                    && current.device.device_id == original.device.device_id
++                    && current.device.device_type == original.device.device_type
++                    && current.device.client_version == original.device.client_version)
++            },
++        )?)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::path::{Path, PathBuf};
++    use std::sync::atomic::AtomicUsize;
++    use wechat_protocol::{
++        protobuf as p,
++        wire::{SyncBatch, SyncCommand},
++    };
++    const PASSWORD: &[u8] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++    struct Native {
++        calls: AtomicUsize,
++    }
++    impl crate::upstream::Upstream for Native {
++        fn kind(&self) -> crate::upstream::UpstreamKind {
++            crate::upstream::UpstreamKind::Native
++        }
++        fn send_quote_raw(
++            &self,
++            state: &mut AccountState,
++            destination: &str,
++            client_id: &str,
++            created_at: u32,
++            _content: &str,
++        ) -> Result<Vec<u8>> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            state.cookie = vec![2];
++            p::message(&[
++                p::bytes(1, &p::int32(1, 0)),
++                p::bytes(3, state.own_username.as_bytes()),
++                p::bytes(4, destination.as_bytes()),
++                p::uint(5, 17),
++                p::bytes(6, client_id.as_bytes()),
++                p::uint(7, u64::from(created_at) + 1),
++                p::uint(8, 57),
++                p::uint(9, 99),
++            ])
++        }
++    }
++    fn identity(profile: &Path, state: &AccountState) {
++        let frame = |v: &[u8]| {
++            assert!(v.len() < 128);
++            [vec![v.len() as u8], v.to_vec()].concat()
++        };
++        let mut plain = vec![0];
++        for (key, value) in [
++            ("mmkv_key_user_name", frame(state.own_username.as_bytes())),
++            ("mmkv_key_latest_login_uin", vec![state.uin as u8]),
++            ("key_wechat_device_id", frame(&state.device.device_id)),
++        ] {
++            plain.extend(frame(key.as_bytes()));
++            plain.extend(frame(&value));
++        }
++        let encrypted = openssl::symm::encrypt(
++            openssl::symm::Cipher::aes_128_cfb128(),
++            &[9; 16],
++            Some(&[3; 16]),
++            &plain,
++        )
++        .unwrap();
++        let mut metadata = vec![0; 112];
++        metadata[..4].copy_from_slice(&crc32fast::hash(&encrypted).to_le_bytes());
++        metadata[4..8].copy_from_slice(&4u32.to_le_bytes());
++        metadata[12..28].copy_from_slice(&[3; 16]);
++        metadata[28..32].copy_from_slice(&(encrypted.len() as u32).to_le_bytes());
++        std::fs::write(profile.join("identity"), [vec![0; 4], encrypted].concat()).unwrap();
++        std::fs::write(profile.join("identity.crc"), metadata).unwrap();
++    }
++    fn fixture() -> (
++        tempfile::TempDir,
++        Arc<Core>,
++        Arc<Native>,
++        PathBuf,
++        ReceivedQuoteReference,
++    ) {
++        let dir = tempfile::tempdir().unwrap();
++        let profile = dir
++            .path()
++            .join(wechat_profile::official_account_directory("synthetic_self", 1).unwrap());
++        let (_, keys, _) = wechat_profile::initialize_profile(&profile, PASSWORD).unwrap();
++        let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
++        store.attach("one", &profile, true).unwrap();
++        let native = Arc::new(Native {
++            calls: AtomicUsize::new(0),
++        });
++        let core = Core::with_upstream(store.clone(), None, native.clone()).unwrap();
++        let state = super::super::tests::state();
++        identity(&profile, &state);
++        core.bind_profile_identity("one", &profile.join("identity"), &[9; 16])
++            .unwrap();
++        let key_path = store.root.join("test-keys.json");
++        keys.write_new(&key_path).unwrap();
++        store.set_keys_file("one", &key_path).unwrap();
++        core.restore_credentials("one", &serde_json::to_vec(&state).unwrap())
++            .unwrap();
++        let mut verified = state.clone();
++        verified.database_password = PASSWORD.to_vec();
++        core.save_state("one", &verified).unwrap();
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        store
++            .mark_validated_if_active("one", &core.ownership_generation)
++            .unwrap();
++        let payload = p::message(&[
++            p::uint(1, 1),
++            p::bytes(2, &p::bytes(1, b"room@chatroom")),
++            p::bytes(3, &p::bytes(1, b"synthetic_self")),
++            p::uint(4, 1),
++            p::bytes(5, &p::bytes(1, b"member:\nquestion")),
++            p::uint(6, 0),
++            p::uint(7, 0),
++            p::bytes(8, &p::buffer(&[])),
++            p::uint(9, 1700000000),
++            p::bytes(10, b"<msgsource/>"),
++            p::uint(12, 17),
++        ])
++        .unwrap();
++        core.commit_native_ingress(
++            "one",
++            "fixture-batch",
++            &SyncBatch {
++                code: 0,
++                flags: 0,
++                cursor: p::uint(1, 1),
++                commands: vec![SyncCommand { id: 5, payload }],
++                continuation: false,
++            },
++            "live",
++        )
++        .unwrap();
++        let event = store
++            .events("one", 0, 100)
++            .unwrap()
++            .into_iter()
++            .find(|e| e.kind == "message.received")
++            .unwrap();
++        let id = event.data["receivedId"].as_str().unwrap();
++        let message = core.received_message("one", id).unwrap();
++        let reference = ReceivedQuoteReference {
++            received_id: id.into(),
++            server_id: "17".into(),
++            source_sha256: message["sourceSha256"].as_str().unwrap().into(),
++        };
++        (dir, core, native, profile, reference)
++    }
++    async fn state_is(core: &Core, id: &str, expected: &str) {
++        tokio::time::timeout(Duration::from_secs(10), async {
++            loop {
++                if core.store.send("one", id).unwrap().state == expected {
++                    break;
++                }
++                tokio::time::sleep(Duration::from_millis(5)).await;
++            }
++        })
++        .await
++        .unwrap();
++    }
++    #[tokio::test]
++    async fn local_admission_overlaps_official_identity_publication_and_worker_checks_restored_profile(
++    ) {
++        let (_dir, core, native, profile, reference) = fixture();
++        let guard = core.lock_account("one").await.unwrap();
++        std::fs::rename(
++            profile.join("identity"),
++            profile.join("identity.publishing"),
++        )
++        .unwrap();
++        let intent = tokio::time::timeout(
++            Duration::from_secs(2),
++            core.send_quoted_source_text(
++                "one",
++                "key",
++                "room@chatroom",
++                "reply",
++                QuoteSourceReference::Received(reference),
++            ),
++        )
++        .await
++        .unwrap()
++        .unwrap();
++        assert_eq!(intent.state, "queued");
++        assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++        std::fs::rename(
++            profile.join("identity.publishing"),
++            profile.join("identity"),
++        )
++        .unwrap();
++        drop(guard);
++        state_is(&core, &intent.id, "accepted").await;
++        assert_eq!(native.calls.load(Ordering::SeqCst), 1);
++    }
++    #[tokio::test]
++    async fn worker_rejects_changed_official_identity_before_any_wire_call() {
++        let (_dir, core, native, profile, reference) = fixture();
++        let guard = core.lock_account("one").await.unwrap();
++        let intent = core
++            .send_quoted_source_text(
++                "one",
++                "key",
++                "room@chatroom",
++                "reply",
++                QuoteSourceReference::Received(reference),
++            )
++            .await
++            .unwrap();
++        let mut changed = super::super::tests::state();
++        changed.device.device_id[1] = 2;
++        identity(&profile, &changed);
++        drop(guard);
++        state_is(&core, &intent.id, "failed").await;
++        assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++    }
++    #[tokio::test]
++    async fn worker_rejects_incomplete_identity_publication_before_any_wire_call() {
++        let (_dir, core, native, profile, reference) = fixture();
++        let guard = core.lock_account("one").await.unwrap();
++        let intent = core
++            .send_quoted_source_text(
++                "one",
++                "key",
++                "room@chatroom",
++                "reply",
++                QuoteSourceReference::Received(reference),
++            )
++            .await
++            .unwrap();
++        std::fs::rename(
++            profile.join("identity"),
++            profile.join("identity.publishing"),
++        )
++        .unwrap();
++        drop(guard);
++        state_is(&core, &intent.id, "failed").await;
++        assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++    }
++    #[tokio::test]
++    async fn worker_rejects_replaced_profile_salt_before_any_wire_call() {
++        use std::io::{Seek, SeekFrom, Write};
++        let (_dir, core, native, profile, reference) = fixture();
++        let guard = core.lock_account("one").await.unwrap();
++        let intent = core
++            .send_quoted_source_text(
++                "one",
++                "key",
++                "room@chatroom",
++                "reply",
++                QuoteSourceReference::Received(reference),
++            )
++            .await
++            .unwrap();
++        let path = profile.join("db_storage/message/message_0.db");
++        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
++        file.seek(SeekFrom::Start(0)).unwrap();
++        file.write_all(&[0x55; 16]).unwrap();
++        file.sync_all().unwrap();
++        drop(file);
++        drop(guard);
++        state_is(&core, &intent.id, "failed").await;
++        assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++    }
++    #[test]
++    fn atomic_core_guard_rejects_changed_uin_username_or_device() {
++        let (_dir, core, _native, _profile, reference) = fixture();
++        let snapshot = core
++            .native_send_snapshot("one", "room@chatroom", &reference)
++            .unwrap();
++        let original = core
++            .native_send_state("one", &snapshot.state_cipher)
++            .unwrap();
++        for mutation in ["uin", "username", "device"] {
++            let mut changed = original.clone();
++            match mutation {
++                "uin" => changed.uin = 2,
++                "username" => changed.own_username = "another_user".into(),
++                "device" => changed.device.device_id[1] = 2,
++                _ => unreachable!(),
++            };
++            let cipher = core
++                .vault
++                .seal(
++                    "one",
++                    "account-state",
++                    &serde_json::to_vec(&changed).unwrap(),
++                )
++                .unwrap();
++            core.store
++                .save_accepted_authorization("one", &cipher)
++                .unwrap();
++            let id = core
++                .store
++                .reserve_client_id("one", mutation, 7)
++                .unwrap()
++                .to_string();
++            let error = core
++                .create_native_send(
++                    "one",
++                    NativeSendInsert {
++                        key: mutation,
++                        destination: "room@chatroom",
++                        hash: "hash",
++                        encrypted: b"sealed",
++                        client_id: &id,
++                    },
++                    &reference,
++                    &snapshot,
++                    &original,
++                )
++                .unwrap_err();
++            assert_eq!(error.to_string(), "authorization_generation_changed");
++        }
++        assert!(core.store.queued_sends("one").unwrap().is_empty());
++    }
++    #[tokio::test]
++    async fn committed_queue_survives_a_legitimate_core_ownership_restart() {
++        let (_dir, core, native, _profile, reference) = fixture();
++        core.stopping.store(true, Ordering::SeqCst);
++        let intent = core
++            .send_quoted_source_text(
++                "one",
++                "restart-key",
++                "room@chatroom",
++                "frozen reply",
++                QuoteSourceReference::Received(reference),
++            )
++            .await
++            .unwrap();
++        let sealed = core.store.send_payload("one", &intent.id).unwrap();
++        tokio::time::sleep(Duration::from_millis(20)).await;
++        assert_eq!(core.store.send("one", &intent.id).unwrap().state, "queued");
++        assert_eq!(native.calls.load(Ordering::SeqCst), 0);
++        let old_owner = core.ownership_generation.clone();
++        let store = core.store.clone();
++        drop(core);
++        let restarted = Core::with_upstream(store.clone(), None, native.clone()).unwrap();
++        assert_ne!(old_owner, restarted.ownership_generation);
++        store
++            .mark_validated_if_active("one", &restarted.ownership_generation)
++            .unwrap();
++        restarted.perform_send("one", &intent.id).await.unwrap();
++        assert_eq!(store.send("one", &intent.id).unwrap().state, "accepted");
++        assert_eq!(store.send_payload("one", &intent.id).unwrap(), sealed);
++        assert_eq!(native.calls.load(Ordering::SeqCst), 1);
++    }
++}
+--- a/packages/native-client-rust/crates/wechat-core/src/runtime.rs
++++ b/packages/native-client-rust/crates/wechat-core/src/runtime.rs
+@@ -27,6 +27,8 @@
+ pub use official_profile::{OfficialProfileRequest, OfficialProfileSelection};
+ #[path = "native_ingress.rs"]
+ mod native_ingress;
++#[path = "native_send_admission.rs"]
++mod native_send_admission;
+ #[path = "profile_network.rs"]
+ mod profile_network;
+ #[path = "push.rs"]
+@@ -49,6 +51,7 @@
+ mod status_control;
+ #[path = "system_control.rs"]
+ mod system_control;
++use crate::QuoteSourceReference;
+ use anyhow::{bail, Context, Result};
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Value};
+@@ -112,6 +115,7 @@
+     pub(crate) bootstrap_leases: Mutex<std::collections::BTreeSet<String>>,
+     pub(crate) startup_profiles_recovered: AtomicBool,
+     pub(crate) gates: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
++    native_send_gates: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
+     pub(crate) media_gates: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
+     media_downloads: Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>,
+     media_download_limit: Arc<tokio::sync::Semaphore>,
+@@ -335,6 +339,7 @@
+                 startup_profiles_recovered: AtomicBool::new(false),
+                 ownership_generation: uuid::Uuid::new_v4().to_string(),
+                 gates: Mutex::new(BTreeMap::new()),
++                native_send_gates: Mutex::new(BTreeMap::new()),
+                 media_gates: Mutex::new(BTreeMap::new()),
+                 media_downloads: Mutex::new(BTreeMap::new()),
+                 media_download_limit: Arc::new(tokio::sync::Semaphore::new(4)),
+@@ -1356,7 +1361,23 @@
+             quote,
+             mentions,
+         } = options;
+-        let gate = self.gate(account)?;
++        // Only sealed native-received quotes have a pure local admission path.
++        // Their worker still owns the original account gate through all I/O.
++        let native_source = match &quote {
++            Some(QuoteSourceReference::Received(reference))
++                if share.is_none()
++                    && mentions.is_none()
++                    && self.upstream_kind() == crate::upstream::UpstreamKind::Native =>
++            {
++                Some(reference)
++            }
++            _ => None,
++        };
++        let gate = if native_source.is_some() {
++            self.native_send_admission_gate(account)?
++        } else {
++            self.gate(account)?
++        };
+         let _guard = if quote.is_some() || mentions.is_some() {
+             let wait = trace.span(TimingStage::QueueGateWait);
+             let guard = gate.lock().await;
+@@ -1392,11 +1413,17 @@
+             replay.finish(TimingOutcome::Ok);
+         }
+         let validation = trace.span(TimingStage::QueueAccountValidation);
+-        let state = self.account_state(account)?;
++        let (state, native_admission) = if let Some(reference) = native_source {
++            let snapshot = self.native_send_snapshot(account, destination, reference)?;
++            let state = self.native_send_state(account, &snapshot.state_cipher)?;
++            (state, Some(snapshot))
++        } else {
++            (self.account_state(account)?, None)
++        };
+         if self.media_job_by_key(account, key).is_ok() {
+             bail!("idempotency_conflict");
+         }
+-        if self.account_status(account)?["authenticated"] != true {
++        if native_admission.is_none() && self.account_status(account)?["authenticated"] != true {
+             bail!("auth_required");
+         }
+         if (share.is_none() && text.is_empty())
+@@ -1427,13 +1454,24 @@
+                 .as_ref()
+                 .map(|q| {
+                     trace.measure(TimingStage::SourceResolve, || {
+-                        self.resolve_quote_source(
+-                            account,
+-                            destination,
+-                            text,
+-                            q,
+-                            &state.own_username,
+-                        )
++                        if let Some(snapshot) = &native_admission {
++                            self.resolve_native_send_quote(
++                                account,
++                                destination,
++                                text,
++                                q,
++                                &state.own_username,
++                                &snapshot.source,
++                            )
++                        } else {
++                            self.resolve_quote_source(
++                                account,
++                                destination,
++                                text,
++                                q,
++                                &state.own_username,
++                            )
++                        }
+                     })
+                 })
+                 .transpose()?,
+@@ -1473,14 +1511,30 @@
+             .seal(account, "send-payload", &serde_json::to_vec(&payload)?)?;
+         preparation.finish(TimingOutcome::Ok);
+         let (intent, created) = trace.measure(TimingStage::IntentCreate, || {
+-            self.store.create_send(
+-                account,
+-                key,
+-                destination,
+-                &hash,
+-                &encrypted,
+-                &client_id.to_string(),
+-            )
++            if let (Some(snapshot), Some(reference)) = (&native_admission, native_source) {
++                self.create_native_send(
++                    account,
++                    wechat_store::NativeSendInsert {
++                        key,
++                        destination,
++                        hash: &hash,
++                        encrypted: &encrypted,
++                        client_id: &client_id.to_string(),
++                    },
++                    reference,
++                    snapshot,
++                    &state,
++                )
++            } else {
++                self.store.create_send(
++                    account,
++                    key,
++                    destination,
++                    &hash,
++                    &encrypted,
++                    &client_id.to_string(),
++                )
++            }
+         })?;
+         let trace = trace.bind(
+             &intent.id,
+--- a/packages/native-client-rust/crates/wechat-store/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-store/src/lib.rs
+@@ -13,6 +13,7 @@
+ mod media;
+ mod metadata;
+ mod native_ingress;
++mod native_send_admission;
+ mod operations;
+ mod outbox;
+ mod outgoing_recall;
+@@ -27,6 +28,7 @@
+ pub use group_mutations::*;
+ pub use media::*;
+ pub use native_ingress::*;
++pub use native_send_admission::*;
+ pub use operations::*;
+ pub use outgoing_recall::*;
+ pub use pagination::*;
+--- /dev/null
++++ b/packages/native-client-rust/crates/wechat-store/src/native_send_admission.rs
+@@ -0,0 +1,522 @@
++//! Local custody for sealed received-message quotes, fenced at the insert.
++//! Official profile validation and all network work remain in the send worker.
++use crate::*;
++use rusqlite::{OptionalExtension, Transaction};
++
++pub enum NativeSendDecision<T> {
++    Accepted(T),
++    Rejected(&'static str),
++}
++pub struct NativeQuoteSource<'a> {
++    pub received_id: &'a str,
++    pub thread_id: &'a str,
++    pub server_id: &'a str,
++    pub source_sha256: &'a str,
++}
++pub struct NativeSendSnapshot {
++    pub state_cipher: Vec<u8>,
++    pub logout_epoch: Option<Vec<u8>>,
++    pub source: NativeIngressRecord,
++}
++pub struct NativeSendInsert<'a> {
++    pub key: &'a str,
++    pub destination: &'a str,
++    pub hash: &'a str,
++    pub encrypted: &'a [u8],
++    pub client_id: &'a str,
++}
++pub struct NativeSendFence<'a> {
++    pub owner: &'a str,
++    pub logout_epoch: Option<&'a [u8]>,
++    pub source: NativeQuoteSource<'a>,
++    pub sealed_snapshot: &'a [u8],
++}
++
++fn value(tx: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>> {
++    Ok(tx
++        .query_row("SELECT value FROM runtime WHERE key=?1", [key], |r| {
++            r.get(0)
++        })
++        .optional()?)
++}
++fn accepted_state(tx: &Transaction<'_>, owner: &str) -> Result<Option<Vec<u8>>> {
++    let Some(cipher) = value(tx, "account-state")? else {
++        return Ok(None);
++    };
++    let generation = format!("{:x}", Sha256::digest(&cipher));
++    if value(tx, "logged-out")?.is_some()
++        || value(tx, "desired")?.as_deref() != Some(b"connected")
++        || value(tx, "validated-generation")?.as_deref() != Some(owner.as_bytes())
++        || value(tx, "saved-login-accepted-state-generation")?.as_deref()
++            != Some(generation.as_bytes())
++    {
++        return Ok(None);
++    }
++    Ok(Some(cipher))
++}
++fn source_record(
++    tx: &Transaction<'_>,
++    source: &NativeQuoteSource<'_>,
++) -> Result<Option<NativeIngressRecord>> {
++    Ok(tx.query_row(
++        "SELECT received_id,first_received_sequence,disposition,reason,source_sha256,sealed_snapshot FROM native_ingress_messages WHERE received_id=?1 AND thread_id=?2 AND server_id=?3 AND source_sha256=?4 AND disposition='ready'",
++        params![source.received_id,source.thread_id,source.server_id,source.source_sha256],
++        |r| Ok(NativeIngressRecord {received_id:r.get(0)?,first_received_sequence:r.get::<_,i64>(1)?.to_string(),disposition:r.get(2)?,reason:r.get(3)?,source_sha256:r.get(4)?,sealed_snapshot:r.get(5)?})
++    ).optional()?)
++}
++fn recalled(tx: &Transaction<'_>, source: &NativeQuoteSource<'_>) -> Result<bool> {
++    Ok(tx.query_row(
++        "SELECT EXISTS(SELECT 1 FROM message_recalls WHERE thread_id=?1 AND server_id=?2)",
++        params![source.thread_id, source.server_id],
++        |r| r.get(0),
++    )?)
++}
++
++impl Store {
++    /// The snapshot is local accepted identity, not proof that profile files are
++    /// currently readable. The original worker must still make that proof.
++    pub fn native_send_admission_snapshot(
++        &self,
++        account: &str,
++        owner: &str,
++        source: NativeQuoteSource<'_>,
++    ) -> Result<NativeSendDecision<NativeSendSnapshot>> {
++        self.control(account, |db| {
++            let tx = db.transaction()?;
++            let Some(state_cipher) = accepted_state(&tx, owner)? else {
++                return Ok(NativeSendDecision::Rejected("auth_required"));
++            };
++            let Some(record) = source_record(&tx, &source)? else {
++                return Ok(NativeSendDecision::Rejected("quote_target_unavailable"));
++            };
++            if recalled(&tx, &source)? {
++                return Ok(NativeSendDecision::Rejected("message_recalled"));
++            }
++            let logout_epoch = value(&tx, "logout-epoch")?;
++            Ok(NativeSendDecision::Accepted(NativeSendSnapshot {
++                state_cipher,
++                logout_epoch,
++                source: record,
++            }))
++        })
++    }
++
++    /// `same_identity` only decrypts and compares the current accepted identity;
++    /// it must not access Store, the profile, or a network. Cookie rotation is
++    /// permitted. Expected fence denials stay Ok inside control to retain its
++    /// admitted writer. Real integrity/SQL/family errors still fail normally.
++    pub fn create_native_received_send(
++        &self,
++        account: &str,
++        send: NativeSendInsert<'_>,
++        fence: NativeSendFence<'_>,
++        same_identity: impl FnOnce(&[u8]) -> Result<bool>,
++    ) -> Result<NativeSendDecision<(SendIntent, bool)>> {
++        self.control(account, |db| {
++            if send.key.is_empty()
++                || send.key.len() > 200
++                || send.destination.is_empty()
++                || send.destination.len() > 256
++            {
++                bail!("invalid send intent");
++            }
++            let tx = db.transaction()?;
++            let media_conflict: bool = tx.query_row(
++                "SELECT EXISTS(SELECT 1 FROM media_jobs WHERE idempotency_key=?1)",
++                [format!("send:{}", send.key)],
++                |r| r.get(0),
++            )?;
++            if media_conflict {
++                bail!("idempotency_conflict");
++            }
++            let existing: Option<(String, String)> = tx
++                .query_row(
++                    "SELECT id,payload_hash FROM outbox WHERE idempotency_key=?1",
++                    [send.key],
++                    |r| Ok((r.get(0)?, r.get(1)?)),
++                )
++                .optional()?;
++            // Replay precedes every fresh-admission fence, including logout.
++            if let Some((id, hash)) = existing {
++                if hash != send.hash {
++                    bail!("idempotency_conflict");
++                }
++                return Ok(NativeSendDecision::Accepted((
++                    crate::read_send(&tx, account, &id)?,
++                    false,
++                )));
++            }
++            let Some(cipher) = accepted_state(&tx, fence.owner)? else {
++                return Ok(NativeSendDecision::Rejected(
++                    "authorization_generation_changed",
++                ));
++            };
++            if value(&tx, "logout-epoch")?.as_deref() != fence.logout_epoch
++                || !same_identity(&cipher)?
++            {
++                return Ok(NativeSendDecision::Rejected(
++                    "authorization_generation_changed",
++                ));
++            }
++            if send.destination != fence.source.thread_id {
++                return Ok(NativeSendDecision::Rejected("quote_target_mismatch"));
++            }
++            let Some(source) = source_record(&tx, &fence.source)? else {
++                return Ok(NativeSendDecision::Rejected("quote_target_unavailable"));
++            };
++            if source.sealed_snapshot != fence.sealed_snapshot {
++                return Ok(NativeSendDecision::Rejected("quote_target_mismatch"));
++            }
++            if recalled(&tx, &fence.source)? {
++                return Ok(NativeSendDecision::Rejected("message_recalled"));
++            }
++            crate::client_ids::check_client_id(&tx, send.key, send.client_id)?;
++            let id = uuid::Uuid::new_v4().to_string();
++            let now = chrono::Utc::now().to_rfc3339();
++            tx.execute(
++                "INSERT INTO outbox VALUES(?1,?2,?3,?4,?5,'queued',?6,NULL,NULL,?7)",
++                params![
++                    id,
++                    send.key,
++                    send.hash,
++                    send.destination,
++                    send.encrypted,
++                    send.client_id,
++                    now
++                ],
++            )?;
++            let intent = crate::read_send(&tx, account, &id)?;
++            tx.execute(
++                "INSERT INTO events(kind,data_json,created_at)VALUES('send.updated',?1,?2)",
++                params![
++                    serde_json::to_string(&intent)?,
++                    chrono::Utc::now().to_rfc3339()
++                ],
++            )?;
++            crate::event_consumers::prune_events(&tx, tx.last_insert_rowid())?;
++            tx.commit()?;
++            Ok(NativeSendDecision::Accepted((intent, true)))
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn setup() -> (tempfile::TempDir, Arc<Store>) {
++        let dir = tempfile::tempdir().unwrap();
++        let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
++        store.create_account("one").unwrap();
++        drop(store.read_snapshot("one").unwrap());
++        store
++            .save_accepted_authorization("one", b"accepted-cookie-A")
++            .unwrap();
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        store.mark_validated_if_active("one", "owner").unwrap();
++        store
++            .stage_native_ingress(
++                "one",
++                NativeIngressBatch {
++                    batch_id: "fixture".into(),
++                    payload: Some(b"synthetic-batch".to_vec()),
++                    cursor: Some(b"synthetic-cursor".to_vec()),
++                    ownership_generation: "owner".into(),
++                    historical: false,
++                    caught_up: false,
++                    origin: "live".into(),
++                    messages: vec![NativeIngressMessageInput {
++                        received_id: "source".into(),
++                        command_index: 0,
++                        thread_id: Some("room".into()),
++                        server_id: Some("17".into()),
++                        disposition: "ready".into(),
++                        reason: None,
++                        source_sha256: "hash".into(),
++                        identity_fingerprint: "fingerprint".into(),
++                        sealed_snapshot: b"immutable-source".to_vec(),
++                    }],
++                    recalls: vec![],
++                },
++            )
++            .unwrap();
++        store.reserve_client_id("one", "key", 7).unwrap();
++        store.control("one",|db| {db.execute_batch("CREATE TEMP TABLE admission_canary(value); INSERT INTO admission_canary VALUES(7)")?;Ok(())}).unwrap();
++        (dir, store)
++    }
++    fn source() -> NativeQuoteSource<'static> {
++        NativeQuoteSource {
++            received_id: "source",
++            thread_id: "room",
++            server_id: "17",
++            source_sha256: "hash",
++        }
++    }
++    fn snapshot(store: &Store) -> NativeSendSnapshot {
++        match store
++            .native_send_admission_snapshot("one", "owner", source())
++            .unwrap()
++        {
++            NativeSendDecision::Accepted(s) => s,
++            NativeSendDecision::Rejected(e) => panic!("{e}"),
++        }
++    }
++    fn send() -> NativeSendInsert<'static> {
++        NativeSendInsert {
++            key: "key",
++            destination: "room",
++            hash: "payload-hash",
++            encrypted: b"sealed-payload",
++            client_id: "7",
++        }
++    }
++    fn fence(s: &NativeSendSnapshot) -> NativeSendFence<'_> {
++        NativeSendFence {
++            owner: "owner",
++            logout_epoch: s.logout_epoch.as_deref(),
++            source: source(),
++            sealed_snapshot: &s.source.sealed_snapshot,
++        }
++    }
++    fn canary(store: &Store) {
++        assert_eq!(
++            store
++                .control("one", |db| Ok(db.query_row(
++                    "SELECT value FROM admission_canary",
++                    [],
++                    |r| r.get::<_, i64>(0)
++                )?))
++                .unwrap(),
++            7
++        );
++    }
++    fn no_intent(store: &Store) {
++        assert_eq!(
++            store
++                .control("one", |db| Ok(db.query_row(
++                    "SELECT count(*) FROM outbox",
++                    [],
++                    |r| r.get::<_, i64>(0)
++                )?))
++                .unwrap(),
++            0
++        );
++        canary(store);
++    }
++    fn rejected<T>(decision: NativeSendDecision<T>) {
++        assert!(matches!(decision, NativeSendDecision::Rejected(_)));
++    }
++
++    #[test]
++    fn cookie_rotation_admits_under_same_identity_and_preserves_writer() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        store
++            .save_accepted_authorization("one", b"accepted-cookie-B")
++            .unwrap();
++        let decision = store
++            .create_native_received_send("one", send(), fence(&original), |cipher| {
++                Ok(cipher == b"accepted-cookie-B")
++            })
++            .unwrap();
++        let NativeSendDecision::Accepted((intent, created)) = decision else {
++            panic!("cookie-only rotation rejected");
++        };
++        assert!(created);
++        assert_eq!(intent.state, "queued");
++        canary(&store);
++    }
++    #[test]
++    fn expected_identity_denial_retains_the_admitted_connection() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        store
++            .save_accepted_authorization("one", b"accepted-new-identity")
++            .unwrap();
++        rejected(
++            store
++                .create_native_received_send("one", send(), fence(&original), |_| Ok(false))
++                .unwrap(),
++        );
++        no_intent(&store);
++    }
++    #[test]
++    fn lifecycle_changes_deny_old_snapshot_even_when_reconnected() {
++        for change in [
++            "logged-out",
++            "desired",
++            "validated-generation",
++            "unaccepted-state",
++            "accepted-marker",
++            "logout-epoch",
++        ] {
++            let (_dir, store) = setup();
++            let original = snapshot(&store);
++            match change {
++                "logged-out" => store.put_runtime("one", change, b"epoch").unwrap(),
++                "desired" => store.put_runtime("one", change, b"disconnected").unwrap(),
++                "validated-generation" => store.put_runtime("one", change, b"other-owner").unwrap(),
++                "unaccepted-state" => store
++                    .save_active_authorization("one", b"not-server-accepted")
++                    .unwrap(),
++                "accepted-marker" => store
++                    .put_runtime("one", "saved-login-accepted-state-generation", b"wrong")
++                    .unwrap(),
++                "logout-epoch" => store.put_runtime("one", change, b"new-epoch").unwrap(),
++                _ => unreachable!(),
++            }
++            rejected(
++                store
++                    .create_native_received_send("one", send(), fence(&original), |_| Ok(true))
++                    .unwrap(),
++            );
++            no_intent(&store);
++        }
++    }
++    #[test]
++    fn snapshot_refusal_is_typed_and_preserves_writer() {
++        let (_dir, store) = setup();
++        store
++            .put_runtime("one", "validated-generation", b"other-owner")
++            .unwrap();
++        rejected(
++            store
++                .native_send_admission_snapshot("one", "owner", source())
++                .unwrap(),
++        );
++        canary(&store);
++    }
++    fn logout(store: &Store) {
++        store
++            .begin_logout(
++                &Operation {
++                    id: "logout".into(),
++                    account_id: "one".into(),
++                    kind: "logout".into(),
++                    state: "queued".into(),
++                    result: serde_json::json!({}),
++                    created_at: "now".into(),
++                    updated_at: "now".into(),
++                },
++                b"epoch-new",
++            )
++            .unwrap();
++    }
++    #[test]
++    fn actual_logout_and_relogin_cannot_admit_a_late_old_epoch() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        logout(&store);
++        store.clear_runtime("one", "logged-out").unwrap();
++        store.put_runtime("one", "desired", b"connected").unwrap();
++        store.mark_validated_if_active("one", "owner").unwrap();
++        rejected(
++            store
++                .create_native_received_send("one", send(), fence(&original), |_| Ok(true))
++                .unwrap(),
++        );
++        no_intent(&store);
++        let current = snapshot(&store);
++        assert!(matches!(
++            store
++                .create_native_received_send("one", send(), fence(&current), |_| Ok(true))
++                .unwrap(),
++            NativeSendDecision::Accepted((_, true))
++        ));
++    }
++    #[test]
++    fn durable_send_survives_owner_change_and_replays_after_logout_without_revalidation() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        let NativeSendDecision::Accepted((first, true)) = store
++            .create_native_received_send("one", send(), fence(&original), |_| Ok(true))
++            .unwrap()
++        else {
++            panic!("not queued");
++        };
++        store
++            .put_runtime("one", "validated-generation", b"new-owner")
++            .unwrap();
++        assert_eq!(store.queued_sends("one").unwrap(), vec![first.id.clone()]);
++        logout(&store);
++        let NativeSendDecision::Accepted((replayed, false)) = store
++            .create_native_received_send("one", send(), fence(&original), |_| {
++                panic!("replay must not validate fresh auth")
++            })
++            .unwrap()
++        else {
++            panic!("not replayed");
++        };
++        assert_eq!(replayed.id, first.id);
++        assert_eq!(replayed.state, "needs_review");
++        canary(&store);
++    }
++    #[test]
++    fn changed_or_quarantined_source_and_recall_deny_before_insert() {
++        for change in ["quarantine", "thread", "server", "hash", "seal", "recall"] {
++            let (_dir, store) = setup();
++            let original = snapshot(&store);
++            store.control("one",|db| {
++                match change {
++                    "quarantine"=>db.execute("UPDATE native_ingress_messages SET disposition='quarantined'",[])?,
++                    "thread"=>db.execute("UPDATE native_ingress_messages SET thread_id='another'",[])?,
++                    "server"=>db.execute("UPDATE native_ingress_messages SET server_id='18'",[])?,
++                    "hash"=>db.execute("UPDATE native_ingress_messages SET source_sha256='changed'",[])?,
++                    "seal"=>db.execute("UPDATE native_ingress_messages SET sealed_snapshot=?1",[b"changed".as_slice()])?,
++                    "recall"=>db.execute("INSERT INTO message_recalls(thread_id,server_id,observed_at,origin) VALUES('room','17','now','fixture')",[])?,
++                    _=>unreachable!()
++                };Ok(())
++            }).unwrap();
++            rejected(
++                store
++                    .create_native_received_send("one", send(), fence(&original), |_| Ok(true))
++                    .unwrap(),
++            );
++            no_intent(&store);
++        }
++    }
++    #[test]
++    fn conflicting_replay_and_client_id_still_fail() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        store
++            .create_native_received_send("one", send(), fence(&original), |_| Ok(true))
++            .unwrap();
++        let mut conflict = send();
++        conflict.hash = "different";
++        assert_eq!(
++            store
++                .create_native_received_send("one", conflict, fence(&original), |_| Ok(true))
++                .err()
++                .unwrap()
++                .to_string(),
++            "idempotency_conflict"
++        );
++        let mut other = send();
++        other.key = "other";
++        assert_eq!(
++            store
++                .create_native_received_send("one", other, fence(&original), |_| Ok(true))
++                .err()
++                .unwrap()
++                .to_string(),
++            "client_id_conflict"
++        );
++    }
++    #[test]
++    fn replaced_control_family_is_refused_without_writing_replacement() {
++        let (_dir, store) = setup();
++        let original = snapshot(&store);
++        let path = store
++            .account_dir("one")
++            .unwrap()
++            .join("agent/control.sqlite");
++        std::fs::rename(&path, path.with_file_name("original.sqlite")).unwrap();
++        std::fs::write(&path, b"replacement-family").unwrap();
++        assert!(store
++            .create_native_received_send("one", send(), fence(&original), |_| panic!(
++                "family must be checked first"
++            ))
++            .is_err());
++        assert_eq!(std::fs::read(&path).unwrap(), b"replacement-family");
++    }
++}
+
+--- a/packages/native-client-rust/crates/wechat-api/src/lib.rs
++++ b/packages/native-client-rust/crates/wechat-api/src/lib.rs
+@@ -161,6 +161,8 @@
+             "mention_member_unavailable",
+             "mention_group_membership_unavailable",
+             "mention_all_permission_unavailable",
++            "authorization_generation_changed",
++            "profile_ownership_required",
+         ] {
+             if message == code {
+                 return Self(StatusCode::CONFLICT, code);
+@@ -1560,6 +1562,25 @@
+             assert_eq!(actual, code);
+         }
+     }
++    #[test]
++    fn native_admission_rejections_keep_definite_conflict_codes() {
++        for code in [
++            "authorization_generation_changed",
++            "profile_ownership_required",
++        ] {
++            let ApiError(status, actual) = ApiError::from(anyhow::anyhow!(code));
++            assert_eq!(status, StatusCode::CONFLICT);
++            assert_eq!(actual, code);
++        }
++        for message in [
++            "synthetic_unexpected_failure",
++            "authorization_generation_changed_suffix",
++        ] {
++            let ApiError(status, code) = ApiError::from(anyhow::anyhow!(message));
++            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
++            assert_eq!(code, "operation_failed");
++        }
++    }
+     fn setup() -> (tempfile::TempDir, Arc<Core>, Router) {
+         let t = tempfile::tempdir().unwrap();
+         let store = Arc::new(Store::open(&t.path().join("data")).unwrap());
